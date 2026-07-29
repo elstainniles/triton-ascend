@@ -96,6 +96,76 @@ materializeIndexOperand(const OpFoldResult &operand,
   return castIntegerLike(builder, loc, value, builder.getIndexType());
 }
 
+static Type getOpFoldResultType(const OpFoldResult &operand) {
+  if (auto value = dyn_cast<Value>(operand))
+    return value.getType();
+  if (auto attribute = dyn_cast<Attribute>(operand)) {
+    if (auto typedAttribute = dyn_cast<TypedAttr>(attribute))
+      return typedAttribute.getType();
+  }
+  return Type();
+}
+
+static bool isSupportedScalarIntegerType(Type type) {
+  return type && (type.isIndex() || type.isSignlessInteger());
+}
+
+static FailureOr<Type>
+resolveIntegerResultType(const OpFoldResult &lhs, const OpFoldResult &rhs,
+                         Type requestedType) {
+  Type lhsType = getOpFoldResultType(lhs);
+  Type rhsType = getOpFoldResultType(rhs);
+  if (!isSupportedScalarIntegerType(lhsType) ||
+      !isSupportedScalarIntegerType(rhsType) ||
+      (requestedType && !isSupportedScalarIntegerType(requestedType)))
+    return failure();
+
+  if (requestedType)
+    return requestedType;
+  if (lhsType == rhsType)
+    return lhsType;
+
+  // Index has no fixed IR-level width, so it does not participate in default
+  // widening against ordinary integers.
+  auto lhsInteger = dyn_cast<IntegerType>(lhsType);
+  auto rhsInteger = dyn_cast<IntegerType>(rhsType);
+  if (!lhsInteger || !rhsInteger ||
+      lhsInteger.getWidth() == rhsInteger.getWidth())
+    return failure();
+  return lhsInteger.getWidth() > rhsInteger.getWidth() ? lhsType : rhsType;
+}
+
+static FailureOr<OpFoldResult>
+castIntegerFoldResult(const OpFoldResult &operand, Type targetType,
+                      Location loc, OpBuilder &builder) {
+  if (std::optional<int64_t> constant = getConstantOfAttr(operand))
+    return OpFoldResult(builder.getIntegerAttr(targetType, *constant));
+
+  auto value = dyn_cast<Value>(operand);
+  if (!value)
+    return failure();
+  FailureOr<Value> converted =
+      castIntegerLike(builder, loc, value, targetType);
+  if (failed(converted))
+    return failure();
+  return OpFoldResult(*converted);
+}
+
+static FailureOr<Value>
+materializeIntegerOperand(const OpFoldResult &operand,
+                          std::optional<int64_t> constant, Type targetType,
+                          Location loc, OpBuilder &builder) {
+  if (constant)
+    return builder
+        .create<arith::ConstantOp>(
+            loc, builder.getIntegerAttr(targetType, *constant))
+        .getResult();
+  auto value = dyn_cast<Value>(operand);
+  if (!value)
+    return failure();
+  return castIntegerLike(builder, loc, value, targetType);
+}
+
 namespace ConverterUtils {
 
 std::optional<int64_t>
@@ -1031,20 +1101,34 @@ castIntegerLike(OpBuilder &builder, Location loc, Value value, Type targetType,
 
 // TODO: imply these function below
 OpFoldResult addOpFoldResult(const OpFoldResult &lhs, const OpFoldResult &rhs,
-                             const Location &loc, OpBuilder &b) {
+                             const Location &loc, OpBuilder &b,
+                             Type resultType) {
+  FailureOr<Type> resolvedType =
+      resolveIntegerResultType(lhs, rhs, resultType);
+  if (failed(resolvedType))
+    return OpFoldResult();
+
   auto lhsInt = getConstantOfAttr(lhs);
   auto rhsInt = getConstantOfAttr(rhs);
 
   if (lhsInt && rhsInt)
-    return b.getIndexAttr(lhsInt.value() + rhsInt.value());
+    return b.getIntegerAttr(*resolvedType, *lhsInt + *rhsInt);
 
-  if (!lhsInt && rhsInt && rhsInt.value() == 0)
-    return lhs;
-  if (!rhsInt && lhsInt && lhsInt.value() == 0)
-    return rhs;
+  if (!lhsInt && rhsInt && *rhsInt == 0) {
+    FailureOr<OpFoldResult> result =
+        castIntegerFoldResult(lhs, *resolvedType, loc, b);
+    return succeeded(result) ? *result : OpFoldResult();
+  }
+  if (!rhsInt && lhsInt && *lhsInt == 0) {
+    FailureOr<OpFoldResult> result =
+        castIntegerFoldResult(rhs, *resolvedType, loc, b);
+    return succeeded(result) ? *result : OpFoldResult();
+  }
 
-  FailureOr<Value> lhsValue = materializeIndexOperand(lhs, lhsInt, loc, b);
-  FailureOr<Value> rhsValue = materializeIndexOperand(rhs, rhsInt, loc, b);
+  FailureOr<Value> lhsValue =
+      materializeIntegerOperand(lhs, lhsInt, *resolvedType, loc, b);
+  FailureOr<Value> rhsValue =
+      materializeIntegerOperand(rhs, rhsInt, *resolvedType, loc, b);
   if (failed(lhsValue) || failed(rhsValue))
     return OpFoldResult();
 
@@ -1071,28 +1155,42 @@ OpFoldResult subOpFoldResult(const OpFoldResult &lhs, const OpFoldResult &rhs,
 }
 
 OpFoldResult mulOpFoldResult(const OpFoldResult &lhs, const OpFoldResult &rhs,
-                             const Location &loc, OpBuilder &b) {
+                             const Location &loc, OpBuilder &b,
+                             Type resultType) {
+  FailureOr<Type> resolvedType =
+      resolveIntegerResultType(lhs, rhs, resultType);
+  if (failed(resolvedType))
+    return OpFoldResult();
+
   auto lhsInt = getConstantOfAttr(lhs);
   auto rhsInt = getConstantOfAttr(rhs);
 
   if (lhsInt && rhsInt)
-    return b.getIndexAttr(lhsInt.value() * rhsInt.value());
+    return b.getIntegerAttr(*resolvedType, *lhsInt * *rhsInt);
 
   if (lhsInt) {
-    if (lhsInt.value() == 0)
-      return lhs;
-    if (lhsInt.value() == 1)
-      return rhs;
+    if (*lhsInt == 0)
+      return b.getIntegerAttr(*resolvedType, 0);
+    if (*lhsInt == 1) {
+      FailureOr<OpFoldResult> result =
+          castIntegerFoldResult(rhs, *resolvedType, loc, b);
+      return succeeded(result) ? *result : OpFoldResult();
+    }
   }
   if (rhsInt) {
-    if (rhsInt.value() == 0)
-      return rhs;
-    if (rhsInt.value() == 1)
-      return lhs;
+    if (*rhsInt == 0)
+      return b.getIntegerAttr(*resolvedType, 0);
+    if (*rhsInt == 1) {
+      FailureOr<OpFoldResult> result =
+          castIntegerFoldResult(lhs, *resolvedType, loc, b);
+      return succeeded(result) ? *result : OpFoldResult();
+    }
   }
 
-  FailureOr<Value> lhsValue = materializeIndexOperand(lhs, lhsInt, loc, b);
-  FailureOr<Value> rhsValue = materializeIndexOperand(rhs, rhsInt, loc, b);
+  FailureOr<Value> lhsValue =
+      materializeIntegerOperand(lhs, lhsInt, *resolvedType, loc, b);
+  FailureOr<Value> rhsValue =
+      materializeIntegerOperand(rhs, rhsInt, *resolvedType, loc, b);
   if (failed(lhsValue) || failed(rhsValue))
     return OpFoldResult();
 

@@ -25,7 +25,6 @@
 #include "TritonControlFlowOpt/ControlFlowRewrite.h"
 #include "Utils/Utils.h"
 
-#include "mlir/Dialect/Arith/IR/Arith.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
 
 #include "llvm/ADT/STLExtras.h"
@@ -80,16 +79,6 @@ static bool hasValidLayout(const AnalyzedValue &value) {
   return succeeded(rank) && value.components.size() == 3 * *rank &&
          value.invariants.size() == 1 && value.attributes.size() == 1 &&
          isa<DenseI32ArrayAttr>(value.attributes.front());
-}
-
-static Value createAdd(OpBuilder &builder, Location loc, Value lhs, Value rhs) {
-  if (!lhs || !rhs)
-    return nullptr;
-  FailureOr<Value> convertedRhs =
-      castIntegerLike(builder, loc, rhs, lhs.getType());
-  if (failed(convertedRhs))
-    return nullptr;
-  return builder.create<arith::AddIOp>(loc, lhs, *convertedRhs);
 }
 
 class BlockPtrPolicy final : public ControlFlowRewritePolicy {
@@ -296,9 +285,13 @@ public:
     builder.setInsertionPoint(advance);
     for (auto [dim, delta] : llvm::enumerate(advance.getOffsets())) {
       unsigned component = 2 * *rank + dim;
-      Value offset =
-          createAdd(builder, advance.getLoc(), result->components[component],
-                    context.remap(delta));
+      Value currentOffset = result->components[component];
+      Value remappedDelta = context.remap(delta);
+      if (!remappedDelta)
+        return failure();
+      Value offset = dyn_cast<Value>(addOpFoldResult(
+          currentOffset, remappedDelta, advance.getLoc(), builder,
+          currentOffset.getType()));
       if (!offset)
         return failure();
       result->components[component] = offset;

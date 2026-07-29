@@ -212,14 +212,19 @@ FailureOr<Value>
 castIntegerLike(OpBuilder &builder, Location loc, Value value, Type targetType,
                 IntegerExtensionKind extension = IntegerExtensionKind::Signed);
 
+/// Without an explicit result type, preserve equal types and widen signless
+/// integers. Mixed index/integer operands require an explicit result type.
 OpFoldResult addOpFoldResult(const OpFoldResult &lhs, const OpFoldResult &rhs,
-                             const Location &loc, OpBuilder &b);
+                             const Location &loc, OpBuilder &b,
+                             Type resultType = {});
 
 OpFoldResult subOpFoldResult(const OpFoldResult &lhs, const OpFoldResult &rhs,
                              const Location &loc, OpBuilder &b);
 
+/// Uses the same result-type rules as addOpFoldResult.
 OpFoldResult mulOpFoldResult(const OpFoldResult &lhs, const OpFoldResult &rhs,
-                             const Location &loc, OpBuilder &b);
+                             const Location &loc, OpBuilder &b,
+                             Type resultType = {});
 
 OpFoldResult divOpFoldResult(const OpFoldResult &lhs, const OpFoldResult &rhs,
                              const Location &loc, OpBuilder &b);
