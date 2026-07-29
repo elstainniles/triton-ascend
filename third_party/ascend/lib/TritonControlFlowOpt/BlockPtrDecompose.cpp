@@ -81,19 +81,6 @@ static bool hasValidLayout(const AnalyzedValue &value) {
          isa<DenseI32ArrayAttr>(value.attributes.front());
 }
 
-/// Returns the offset positions in the concrete block-pointer descriptor.
-/// This helper is used only by the optional IV closed-form materialization.
-static FailureOr<SmallVector<unsigned>>
-getBlockPtrOffsetComponents(const DecomposedValue &value) {
-  if (!hasValidLayout(value))
-    return failure();
-  unsigned rank = *getRank(value);
-  SmallVector<unsigned> indices;
-  for (unsigned dim = 0; dim < rank; ++dim)
-    indices.push_back(2 * rank + dim);
-  return indices;
-}
-
 static Value castIntegerLike(OpBuilder &builder, Location loc, Value value,
                              Type targetType) {
   // Offset arithmetic may combine index, i32 and i64 values. Normalize the
@@ -124,34 +111,6 @@ static Value createAdd(OpBuilder &builder, Location loc, Value lhs, Value rhs) {
   if (!rhs)
     return nullptr;
   return builder.create<arith::AddIOp>(loc, lhs, rhs);
-}
-
-static Value createMul(OpBuilder &builder, Location loc, Value lhs, Value rhs) {
-  if (!lhs || !rhs)
-    return nullptr;
-  rhs = castIntegerLike(builder, loc, rhs, lhs.getType());
-  if (!rhs)
-    return nullptr;
-  return builder.create<arith::MulIOp>(loc, lhs, rhs);
-}
-
-static bool isConstantIndex(Value value, int64_t expected) {
-  auto constant = value.getDefiningOp<arith::ConstantIndexOp>();
-  return constant && constant.value() == expected;
-}
-
-static bool isDefinedOutside(Operation *scope, Value value) {
-  // Closed-form IV reconstruction is valid only when the per-iteration delta
-  // is loop invariant. Both captured SSA values and enclosing block arguments
-  // satisfy that requirement.
-  if (Operation *defOp = value.getDefiningOp())
-    return !scope->isAncestor(defOp);
-
-  auto blockArg = dyn_cast<BlockArgument>(value);
-  if (!blockArg)
-    return false;
-  Operation *owner = blockArg.getOwner()->getParentOp();
-  return owner != scope && (!owner || !scope->isAncestor(owner));
 }
 
 class BlockPtrPolicy final : public ControlFlowRewritePolicy {
@@ -382,67 +341,6 @@ public:
         ValueRange(value.components).take_front(rank),
         ValueRange(value.components).slice(rank, rank),
         ValueRange(value.components).take_back(rank), order);
-  }
-
-  FailureOr<SmallVector<Value>>
-  matchForInductionDeltas(scf::ForOp forOp, const DecomposedValue &initial,
-                          unsigned iterArgIndex,
-                          Value yieldOperand) const override {
-    // Recognize the narrow closed form:
-    //   offset(iv) = initial_offset + iv * invariant_delta
-    // for loops whose IV is also their zero-based iteration count.
-    if (!hasValidLayout(initial) ||
-        !isConstantIndex(forOp.getLowerBound(), 0) ||
-        !isConstantIndex(forOp.getStep(), 1))
-      return failure();
-
-    auto advance = yieldOperand.getDefiningOp<triton::AdvanceOp>();
-    if (!advance || advance.getPtr() != forOp.getRegionIterArgs()[iterArgIndex])
-      return failure();
-
-    unsigned rank = *getRank(initial);
-    if (advance.getOffsets().size() != rank)
-      return failure();
-
-    SmallVector<Value> deltas;
-    for (auto [dim, delta] : llvm::enumerate(advance.getOffsets())) {
-      Value initialOffset = initial.components[2 * rank + dim];
-      if ((!initialOffset.getType().isIndex() &&
-           !isa<IntegerType>(initialOffset.getType())) ||
-          (!delta.getType().isIndex() && !isa<IntegerType>(delta.getType())) ||
-          !isDefinedOutside(forOp, delta))
-        return failure();
-      deltas.push_back(delta);
-    }
-    return deltas;
-  }
-
-  FailureOr<DecomposedValue>
-  applyForInductionDeltas(const DecomposedValue &initial,
-                          ArrayRef<Value> deltas, Value inductionVar,
-                          const ControlFlowRewriteContext &context,
-                          OpBuilder &builder, Location loc) const override {
-    FailureOr<SmallVector<unsigned>> indices =
-        getBlockPtrOffsetComponents(initial);
-    if (failed(indices) || indices->size() != deltas.size())
-      return failure();
-
-    // This is an optional reconstruction optimization only. Failure falls back
-    // to the offset values carried explicitly by the rewritten loop.
-    DecomposedValue result = initial;
-    for (auto [component, delta] : llvm::zip(*indices, deltas)) {
-      Type type = result.components[component].getType();
-      Value iv = castIntegerLike(builder, loc, inductionVar, type);
-      Value typedDelta =
-          castIntegerLike(builder, loc, context.remap(delta), type);
-      Value scaled = createMul(builder, loc, iv, typedDelta);
-      Value offset =
-          createAdd(builder, loc, result.components[component], scaled);
-      if (!iv || !typedDelta || !scaled || !offset)
-        return failure();
-      result.components[component] = offset;
-    }
-    return result;
   }
 };
 

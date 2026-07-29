@@ -16,6 +16,7 @@ add_triton_library(TritonControlFlowOpt
   MLIRIR
   MLIRPass
   MLIRSCFDialect
+  MLIRSideEffectInterfaces
   MLIRSupport
   TritonIR
 )

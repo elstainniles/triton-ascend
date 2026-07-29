@@ -1,4 +1,8 @@
 // RUN: triton-opt --triton-control-flow-opt --split-input-file %s | FileCheck %s
+// RUN: triton-opt --triton-control-flow-opt --split-input-file %s | FileCheck %s --check-prefix=NO-ADVANCE
+
+// NO-ADVANCE: module
+// NO-ADVANCE-NOT: tt.advance
 
 module {
   tt.func public @for_block_ptr_dynamic_step(%base: !tt.ptr<f16>, %ub: index) -> !tt.ptr<tensor<32xf16>> {
@@ -29,7 +33,7 @@ module {
 // -----
 
 module {
-  tt.func public @for_block_ptr_invariant_step_closed_form(%base: !tt.ptr<f16>, %ub: index, %stride: i32) -> tensor<32xf16> {
+  tt.func public @for_block_ptr_invariant_delta_carried(%base: !tt.ptr<f16>, %ub: index, %stride: i32) -> tensor<32xf16> {
     %c0_i32 = arith.constant 0 : i32
     %c1_i64 = arith.constant 1 : i64
     %c32_i64 = arith.constant 32 : i64
@@ -47,18 +51,127 @@ module {
   }
 }
 
-// CHECK-LABEL: tt.func public @for_block_ptr_invariant_step_closed_form
-// CHECK:       %[[FOR:[^:]+]]:2 = scf.for %[[IV:[^ ]+]] =
+// CHECK-LABEL: tt.func public @for_block_ptr_invariant_delta_carried
+// CHECK:       %[[FOR:[^:]+]]:2 = scf.for
 // CHECK-SAME:  {{.*}} iter_args(%{{.*}} = %{{.*}}, %{{.*}} = %{{.*}}) -> (i32, tensor<32xf16>) {
-// CHECK:         %[[IV_I32:.*]] = arith.index_cast %[[IV]] : index to i32
-// CHECK:         %[[SCALED:.*]] = arith.muli %[[IV_I32]], %{{.*}} : i32
-// CHECK:         %[[CURRENT:.*]] = arith.addi %{{.*}}, %[[SCALED]] : i32
-// CHECK:         %[[NEXT:.*]] = arith.addi %[[CURRENT]], %{{.*}} : i32
+// CHECK-NOT:     arith.index_cast
+// CHECK-NOT:     arith.muli
+// CHECK:         %[[NEXT:.*]] = arith.addi %{{.*}}, %{{.*}} : i32
 // CHECK:         %[[LOAD_PTR:.*]] = tt.make_tensor_ptr %{{.*}}, [%{{.*}}], [%{{.*}}], [%[[NEXT]]] {order = array<i32: 0>} : <tensor<32xf16>>
 // CHECK:         %[[LOADED:.*]] = tt.load %[[LOAD_PTR]] : !tt.ptr<tensor<32xf16>>
 // CHECK:         scf.yield %[[NEXT]], %[[LOADED]] : i32, tensor<32xf16>
 // CHECK:       }
 // CHECK:       tt.return %[[FOR]]#1 : tensor<32xf16>
+
+// -----
+
+module {
+  tt.func public @for_block_ptr_dynamic_bounds_and_step(%base: !tt.ptr<f16>, %lb: index, %ub: index, %step: index, %delta: i32) -> !tt.ptr<tensor<32xf16>> {
+    %c0_i32 = arith.constant 0 : i32
+    %c1_i64 = arith.constant 1 : i64
+    %c32_i64 = arith.constant 32 : i64
+    %ptr0 = tt.make_tensor_ptr %base, [%c32_i64], [%c1_i64], [%c0_i32] {order = array<i32: 0>} : !tt.ptr<tensor<32xf16>>
+    %final = scf.for %iv = %lb to %ub step %step iter_args(%ptr = %ptr0) -> (!tt.ptr<tensor<32xf16>>) {
+      %next = tt.advance %ptr, [%delta] : !tt.ptr<tensor<32xf16>>
+      scf.yield %next : !tt.ptr<tensor<32xf16>>
+    }
+    tt.return %final : !tt.ptr<tensor<32xf16>>
+  }
+}
+
+// CHECK-LABEL: tt.func public @for_block_ptr_dynamic_bounds_and_step
+// CHECK:       %[[FOR:.*]] = scf.for {{.*}} iter_args(%[[OFF:.*]] = %{{.*}}) -> (i32) {
+// CHECK-NOT:     arith.muli
+// CHECK:         %[[NEXT:.*]] = arith.addi %[[OFF]], %{{.*}} : i32
+// CHECK:         scf.yield %[[NEXT]] : i32
+// CHECK:       }
+// CHECK:       tt.make_tensor_ptr %{{.*}}, [%{{.*}}], [%{{.*}}], [%[[FOR]]] {order = array<i32: 0>} : <tensor<32xf16>>
+
+// -----
+
+module {
+  tt.func public @for_block_ptr_iter_arg_delta(%base: !tt.ptr<f16>, %ub: index) -> !tt.ptr<tensor<32xf16>> {
+    %c0_i32 = arith.constant 0 : i32
+    %c1_i32 = arith.constant 1 : i32
+    %c1_i64 = arith.constant 1 : i64
+    %c32_i64 = arith.constant 32 : i64
+    %c0 = arith.constant 0 : index
+    %c1 = arith.constant 1 : index
+    %ptr0 = tt.make_tensor_ptr %base, [%c32_i64], [%c1_i64], [%c0_i32] {order = array<i32: 0>} : !tt.ptr<tensor<32xf16>>
+    %res:2 = scf.for %iv = %c0 to %ub step %c1 iter_args(%ptr = %ptr0, %delta = %c1_i32) -> (!tt.ptr<tensor<32xf16>>, i32) {
+      %next_ptr = tt.advance %ptr, [%delta] : !tt.ptr<tensor<32xf16>>
+      %next_delta = arith.addi %delta, %c1_i32 : i32
+      scf.yield %next_ptr, %next_delta : !tt.ptr<tensor<32xf16>>, i32
+    }
+    tt.return %res#0 : !tt.ptr<tensor<32xf16>>
+  }
+}
+
+// CHECK-LABEL: tt.func public @for_block_ptr_iter_arg_delta
+// CHECK:       %[[FOR:.*]]:2 = scf.for {{.*}} iter_args(%[[OFF:.*]] = %{{.*}}, %[[DELTA:.*]] = %{{.*}}) -> (i32, i32) {
+// CHECK:         %[[NEXT_PTR:.*]] = arith.addi %[[OFF]], %[[DELTA]] : i32
+// CHECK:         %[[NEXT_DELTA:.*]] = arith.addi %[[DELTA]], %{{.*}} : i32
+// CHECK:         scf.yield %[[NEXT_PTR]], %[[NEXT_DELTA]] : i32, i32
+// CHECK:       }
+// CHECK:       tt.make_tensor_ptr %{{.*}}, [%{{.*}}], [%{{.*}}], [%[[FOR]]#0] {order = array<i32: 0>} : <tensor<32xf16>>
+
+// -----
+
+module {
+  tt.func public @for_block_ptr_multidim_delta(%base: !tt.ptr<f16>) -> !tt.ptr<tensor<16x32xf16>> {
+    %c0_i32 = arith.constant 0 : i32
+    %c1_i32 = arith.constant 1 : i32
+    %c2_i32 = arith.constant 2 : i32
+    %c3_i32 = arith.constant 3 : i32
+    %c1_i64 = arith.constant 1 : i64
+    %c16_i64 = arith.constant 16 : i64
+    %c32_i64 = arith.constant 32 : i64
+    %c0 = arith.constant 0 : index
+    %c4 = arith.constant 4 : index
+    %c1 = arith.constant 1 : index
+    %ptr0 = tt.make_tensor_ptr %base, [%c16_i64, %c32_i64], [%c32_i64, %c1_i64], [%c2_i32, %c3_i32] {order = array<i32: 1, 0>} : !tt.ptr<tensor<16x32xf16>>
+    %final = scf.for %iv = %c0 to %c4 step %c1 iter_args(%ptr = %ptr0) -> (!tt.ptr<tensor<16x32xf16>>) {
+      %next = tt.advance %ptr, [%c1_i32, %c2_i32] : !tt.ptr<tensor<16x32xf16>>
+      scf.yield %next : !tt.ptr<tensor<16x32xf16>>
+    }
+    tt.return %final : !tt.ptr<tensor<16x32xf16>>
+  }
+}
+
+// CHECK-LABEL: tt.func public @for_block_ptr_multidim_delta
+// CHECK:       %[[FOR:.*]]:2 = scf.for {{.*}} iter_args(%[[OFF0:.*]] = %{{.*}}, %[[OFF1:.*]] = %{{.*}}) -> (i32, i32) {
+// CHECK:         %[[NEXT0:.*]] = arith.addi %[[OFF0]], %{{.*}} : i32
+// CHECK:         %[[NEXT1:.*]] = arith.addi %[[OFF1]], %{{.*}} : i32
+// CHECK:         scf.yield %[[NEXT0]], %[[NEXT1]] : i32, i32
+// CHECK:       }
+// CHECK:       tt.make_tensor_ptr %{{.*}}, [%{{.*}}, %{{.*}}], [%{{.*}}, %{{.*}}], [%[[FOR]]#0, %[[FOR]]#1] {order = array<i32: 1, 0>} : <tensor<16x32xf16>>
+
+// -----
+
+module {
+  tt.func public @for_block_ptr_zero_trip(%base: !tt.ptr<f16>) -> !tt.ptr<tensor<32xf16>> {
+    %c0_i32 = arith.constant 0 : i32
+    %c1_i32 = arith.constant 1 : i32
+    %c1_i64 = arith.constant 1 : i64
+    %c32_i64 = arith.constant 32 : i64
+    %c0 = arith.constant 0 : index
+    %c4 = arith.constant 4 : index
+    %c1 = arith.constant 1 : index
+    %ptr0 = tt.make_tensor_ptr %base, [%c32_i64], [%c1_i64], [%c0_i32] {order = array<i32: 0>} : !tt.ptr<tensor<32xf16>>
+    %final = scf.for %iv = %c4 to %c0 step %c1 iter_args(%ptr = %ptr0) -> (!tt.ptr<tensor<32xf16>>) {
+      %next = tt.advance %ptr, [%c1_i32] : !tt.ptr<tensor<32xf16>>
+      scf.yield %next : !tt.ptr<tensor<32xf16>>
+    }
+    tt.return %final : !tt.ptr<tensor<32xf16>>
+  }
+}
+
+// CHECK-LABEL: tt.func public @for_block_ptr_zero_trip
+// CHECK:       %[[FOR:.*]] = scf.for {{.*}} iter_args(%[[OFF:.*]] = %{{.*}}) -> (i32) {
+// CHECK:         %[[NEXT:.*]] = arith.addi %[[OFF]], %{{.*}} : i32
+// CHECK:         scf.yield %[[NEXT]] : i32
+// CHECK:       }
+// CHECK:       tt.make_tensor_ptr %{{.*}}, [%{{.*}}], [%{{.*}}], [%[[FOR]]] {order = array<i32: 0>} : <tensor<32xf16>>
 
 // -----
 

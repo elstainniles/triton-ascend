@@ -25,7 +25,6 @@
 
 #include "TritonControlFlowOpt/ControlFlowAnalysis.h"
 
-#include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/IRMapping.h"
@@ -87,20 +86,6 @@ public:
 
   virtual Value recompose(const DecomposedValue &value, OpBuilder &builder,
                           Location loc) const = 0;
-
-  /// Optional block-pointer closed form used for zero-based unit-step loops.
-  virtual FailureOr<SmallVector<Value>>
-  matchForInductionDeltas(scf::ForOp, const DecomposedValue &, unsigned,
-                          Value) const {
-    return failure();
-  }
-
-  virtual FailureOr<DecomposedValue>
-  applyForInductionDeltas(const DecomposedValue &, ArrayRef<Value>, Value,
-                          const ControlFlowRewriteContext &, OpBuilder &,
-                          Location) const {
-    return failure();
-  }
 };
 
 /// Rewrites supported SCF operations from outermost to innermost.

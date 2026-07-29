@@ -27,6 +27,7 @@
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/IRMapping.h"
 #include "mlir/IR/PatternMatch.h"
+#include "mlir/Interfaces/SideEffectInterfaces.h"
 
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/STLExtras.h"
@@ -99,8 +100,6 @@ struct LoopPointerInfo {
   SmallVector<Type> componentTypes;
   // Positions occupied by those components in the replacement operation.
   SmallVector<unsigned> newIndices;
-  // Optional closed-form deltas recognized by the block-pointer policy.
-  SmallVector<Value> ivDeltas;
 };
 
 struct IfPointerInfo {
@@ -278,10 +277,13 @@ static LogicalResult materializePointerResult(Operation &originalOp,
   OpBuilder::InsertionGuard guard(builder);
   builder.setInsertionPointAfter(clonedOp);
 
+  bool decomposedAllResults = clonedOp->getNumResults() != 0;
   for (auto [oldResult, clonedResult] :
        llvm::zip(originalOp.getResults(), clonedOp->getResults())) {
-    if (!env.policy.isDecompositionTarget(oldResult))
+    if (!env.policy.isDecompositionTarget(oldResult)) {
+      decomposedAllResults = false;
       continue;
+    }
 
     FailureOr<DecomposedValue> info =
         decompose(clonedResult, env, builder, oldResult.getLoc());
@@ -293,6 +295,12 @@ static LogicalResult materializePointerResult(Operation &originalOp,
       return failure();
     recordDecomposition(oldResult, *info, rebuilt, env);
   }
+
+  // The replacement is recorded in the SSA mapping, so a side-effect-free
+  // clone whose every result was decomposed is redundant once it has no users.
+  if (decomposedAllResults && clonedOp->use_empty() &&
+      isMemoryEffectFree(clonedOp))
+    clonedOp->erase();
 
   return success();
 }
@@ -347,16 +355,7 @@ static LogicalResult rewriteForOp(scf::ForOp forOp, OpBuilder &builder,
                                 slot.componentTypes, builder, forOp.getLoc())))
       return failure();
     pointerInfos.push_back(LoopPointerInfo{
-        idx, *initInfo, slot.componentIndices, slot.componentTypes, {}, {}});
-  }
-
-  // Closed-form IV reconstruction is optional and never changes the analyzed
-  // loop signature. If matching fails, explicit carried components are used.
-  for (LoopPointerInfo &info : pointerInfos) {
-    FailureOr<SmallVector<Value>> deltas = env.policy.matchForInductionDeltas(
-        forOp, info.initInfo, info.oldIndex, yieldOp.getOperand(info.oldIndex));
-    if (succeeded(deltas))
-      info.ivDeltas = *deltas;
+        idx, *initInfo, slot.componentIndices, slot.componentTypes, {}});
   }
 
   SmallVector<Value> newInitArgs;
@@ -395,14 +394,6 @@ static LogicalResult rewriteForOp(scf::ForOp forOp, OpBuilder &builder,
               values.push_back(args[newIndex]);
             FailureOr<DecomposedValue> argInfo = withComponentValues(
                 info->initInfo, info->componentIndices, values);
-            FailureOr<DecomposedValue> closedFormInfo =
-                env.policy.applyForInductionDeltas(
-                    info->initInfo, info->ivDeltas, iv,
-                    ControlFlowRewriteContext(bodyEnv.valueMapping,
-                                              bodyEnv.decomposedValues),
-                    bodyBuilder, loc);
-            if (succeeded(closedFormInfo))
-              argInfo = *closedFormInfo;
             if (failed(argInfo)) {
               bodyOk = false;
               continue;
@@ -512,7 +503,7 @@ static LogicalResult rewriteWhileOp(scf::WhileOp whileOp, OpBuilder &builder,
                                      whileOp.getLoc())))
       return failure();
     pointerInfos.push_back(LoopPointerInfo{
-        idx, *initInfo, slot.componentIndices, slot.componentTypes, {}, {}});
+        idx, *initInfo, slot.componentIndices, slot.componentTypes, {}});
   }
 
   // Expand inits and result types in lockstep. oldToNewStart keeps untouched
