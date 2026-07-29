@@ -203,6 +203,15 @@ bool isTensorPtrType(Type type);
 
 class OpBuilder;
 
+enum class IntegerExtensionKind {
+  Signed,
+  Unsigned,
+};
+
+FailureOr<Value>
+castIntegerLike(OpBuilder &builder, Location loc, Value value, Type targetType,
+                IntegerExtensionKind extension = IntegerExtensionKind::Signed);
+
 OpFoldResult addOpFoldResult(const OpFoldResult &lhs, const OpFoldResult &rhs,
                              const Location &loc, OpBuilder &b);
 
@@ -257,8 +266,6 @@ Value materializeValue(OpBuilder &builder, Location loc, OpFoldResult ofr);
 bool isZero(const OpFoldResult ofr);
 
 bool isOne(const OpFoldResult ofr);
-
-Value convertToIndexIfNeeded(Value intValue, const Location &loc, OpBuilder &b);
 
 RankedTensorType getExtractSlicedType(ArrayRef<OpFoldResult> shape,
                                       const llvm::SmallBitVector &droppedDims,

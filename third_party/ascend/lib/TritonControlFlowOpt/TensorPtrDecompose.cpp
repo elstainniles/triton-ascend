@@ -23,6 +23,7 @@
 #include "TritonControlFlowOpt/TensorPtrDecompose.h"
 
 #include "TritonControlFlowOpt/ControlFlowRewrite.h"
+#include "Utils/Utils.h"
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
@@ -125,29 +126,6 @@ static Value createZeroOffsets(OpBuilder &builder, Location loc,
   return builder.create<arith::ConstantOp>(loc, zero);
 }
 
-/// Converts an offsets tensor to the element width selected by schema analysis.
-static Value castOffsets(OpBuilder &builder, Location loc, Value value,
-                         Type targetType) {
-  if (!value || value.getType() == targetType)
-    return value;
-
-  auto sourceTensor = dyn_cast<RankedTensorType>(value.getType());
-  auto targetTensor = dyn_cast<RankedTensorType>(targetType);
-  if (!sourceTensor || !targetTensor ||
-      sourceTensor.getShape() != targetTensor.getShape() ||
-      sourceTensor.getEncoding() != targetTensor.getEncoding())
-    return nullptr;
-  auto sourceElement = dyn_cast<IntegerType>(sourceTensor.getElementType());
-  auto targetElement = dyn_cast<IntegerType>(targetTensor.getElementType());
-  if (!sourceElement || !targetElement)
-    return nullptr;
-  if (sourceElement.getWidth() < targetElement.getWidth())
-    return builder.create<arith::ExtSIOp>(loc, targetType, value);
-  if (sourceElement.getWidth() > targetElement.getWidth())
-    return builder.create<arith::TruncIOp>(loc, targetType, value);
-  return nullptr;
-}
-
 /// Computes the common type used by an offset addition or SCF merge.
 ///
 /// Complete offsets are always integer tensors with the pointer tensor's shape
@@ -181,12 +159,13 @@ static Value createOffsetsAdd(OpBuilder &builder, Location loc, Value lhs,
   FailureOr<Type> type = getWiderOffsetsType(lhs.getType(), rhs.getType());
   if (failed(type))
     return nullptr;
-  // Both operands must exactly match the arith.addi result type.
-  lhs = castOffsets(builder, loc, lhs, *type);
-  rhs = castOffsets(builder, loc, rhs, *type);
-  if (!lhs || !rhs)
+  FailureOr<Value> convertedLhs =
+      castIntegerLike(builder, loc, lhs, *type);
+  FailureOr<Value> convertedRhs =
+      castIntegerLike(builder, loc, rhs, *type);
+  if (failed(convertedLhs) || failed(convertedRhs))
     return nullptr;
-  return builder.create<arith::AddIOp>(loc, lhs, rhs);
+  return builder.create<arith::AddIOp>(loc, *convertedLhs, *convertedRhs);
 }
 
 /// Tensor-pointer semantics plugged into the shared control-flow machinery.

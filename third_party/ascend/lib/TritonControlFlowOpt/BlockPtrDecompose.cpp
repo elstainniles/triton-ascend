@@ -23,6 +23,7 @@
 #include "TritonControlFlowOpt/BlockPtrDecompose.h"
 
 #include "TritonControlFlowOpt/ControlFlowRewrite.h"
+#include "Utils/Utils.h"
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
@@ -81,36 +82,14 @@ static bool hasValidLayout(const AnalyzedValue &value) {
          isa<DenseI32ArrayAttr>(value.attributes.front());
 }
 
-static Value castIntegerLike(OpBuilder &builder, Location loc, Value value,
-                             Type targetType) {
-  // Offset arithmetic may combine index, i32 and i64 values. Normalize the
-  // right-hand values to the component type selected by analysis.
-  if (!value || value.getType() == targetType)
-    return value;
-
-  Type sourceType = value.getType();
-  if ((sourceType.isIndex() && isa<IntegerType>(targetType)) ||
-      (isa<IntegerType>(sourceType) && targetType.isIndex()))
-    return builder.create<arith::IndexCastOp>(loc, targetType, value);
-
-  auto sourceInt = dyn_cast<IntegerType>(sourceType);
-  auto targetInt = dyn_cast<IntegerType>(targetType);
-  if (!sourceInt || !targetInt)
-    return nullptr;
-  if (sourceInt.getWidth() < targetInt.getWidth())
-    return builder.create<arith::ExtSIOp>(loc, targetType, value);
-  if (sourceInt.getWidth() > targetInt.getWidth())
-    return builder.create<arith::TruncIOp>(loc, targetType, value);
-  return value;
-}
-
 static Value createAdd(OpBuilder &builder, Location loc, Value lhs, Value rhs) {
   if (!lhs || !rhs)
     return nullptr;
-  rhs = castIntegerLike(builder, loc, rhs, lhs.getType());
-  if (!rhs)
+  FailureOr<Value> convertedRhs =
+      castIntegerLike(builder, loc, rhs, lhs.getType());
+  if (failed(convertedRhs))
     return nullptr;
-  return builder.create<arith::AddIOp>(loc, lhs, rhs);
+  return builder.create<arith::AddIOp>(loc, lhs, *convertedRhs);
 }
 
 class BlockPtrPolicy final : public ControlFlowRewritePolicy {

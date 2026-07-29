@@ -84,6 +84,18 @@ static std::optional<int64_t> getConstantOfAttr(const OpFoldResult &arg) {
   return std::nullopt;
 }
 
+static FailureOr<Value>
+materializeIndexOperand(const OpFoldResult &operand,
+                        std::optional<int64_t> constant, Location loc,
+                        OpBuilder &builder) {
+  if (constant)
+    return createConstIndexValueOp(loc, builder, *constant);
+  auto value = dyn_cast<Value>(operand);
+  if (!value)
+    return failure();
+  return castIntegerLike(builder, loc, value, builder.getIndexType());
+}
+
 namespace ConverterUtils {
 
 std::optional<int64_t>
@@ -962,6 +974,61 @@ bool isTensorPtrType(Type type) {
 
 } // namespace triton
 
+FailureOr<Value>
+castIntegerLike(OpBuilder &builder, Location loc, Value value, Type targetType,
+                IntegerExtensionKind extension) {
+  if (!value || !targetType)
+    return failure();
+
+  Type sourceType = value.getType();
+  if (sourceType == targetType)
+    return value;
+
+  if ((sourceType.isIndex() && isa<IntegerType>(targetType)) ||
+      (isa<IntegerType>(sourceType) && targetType.isIndex())) {
+    if (extension == IntegerExtensionKind::Unsigned)
+      return builder
+          .create<arith::IndexCastUIOp>(loc, targetType, value)
+          .getResult();
+    return builder.create<arith::IndexCastOp>(loc, targetType, value)
+        .getResult();
+  }
+
+  auto extendOrTruncate =
+      [&](unsigned sourceWidth, unsigned targetWidth) -> FailureOr<Value> {
+    if (sourceWidth < targetWidth) {
+      if (extension == IntegerExtensionKind::Unsigned)
+        return builder.create<arith::ExtUIOp>(loc, targetType, value)
+            .getResult();
+      return builder.create<arith::ExtSIOp>(loc, targetType, value).getResult();
+    }
+    if (sourceWidth > targetWidth)
+      return builder.create<arith::TruncIOp>(loc, targetType, value).getResult();
+    return failure();
+  };
+
+  auto sourceInteger = dyn_cast<IntegerType>(sourceType);
+  auto targetInteger = dyn_cast<IntegerType>(targetType);
+  if (sourceInteger && targetInteger)
+    return extendOrTruncate(sourceInteger.getWidth(), targetInteger.getWidth());
+
+  auto sourceTensor = dyn_cast<RankedTensorType>(sourceType);
+  auto targetTensor = dyn_cast<RankedTensorType>(targetType);
+  if (!sourceTensor || !targetTensor ||
+      sourceTensor.getShape() != targetTensor.getShape() ||
+      sourceTensor.getEncoding() != targetTensor.getEncoding())
+    return failure();
+
+  auto sourceElement =
+      dyn_cast<IntegerType>(sourceTensor.getElementType());
+  auto targetElement =
+      dyn_cast<IntegerType>(targetTensor.getElementType());
+  if (!sourceElement || !targetElement)
+    return failure();
+
+  return extendOrTruncate(sourceElement.getWidth(), targetElement.getWidth());
+}
+
 // TODO: imply these function below
 OpFoldResult addOpFoldResult(const OpFoldResult &lhs, const OpFoldResult &rhs,
                              const Location &loc, OpBuilder &b) {
@@ -976,23 +1043,12 @@ OpFoldResult addOpFoldResult(const OpFoldResult &lhs, const OpFoldResult &rhs,
   if (!rhsInt && lhsInt && lhsInt.value() == 0)
     return rhs;
 
-  auto lhsValue = dyn_cast<Value>(lhs);
-  if (lhsInt) {
-    lhsValue = createConstIndexValueOp(loc, b, lhsInt.value());
-  } else {
-    lhsValue = convertToIndexIfNeeded(lhsValue, loc, b);
-    assert(isa<IndexType>(lhsValue.getType()));
-  }
+  FailureOr<Value> lhsValue = materializeIndexOperand(lhs, lhsInt, loc, b);
+  FailureOr<Value> rhsValue = materializeIndexOperand(rhs, rhsInt, loc, b);
+  if (failed(lhsValue) || failed(rhsValue))
+    return OpFoldResult();
 
-  auto rhsValue = dyn_cast<Value>(rhs);
-  if (rhsInt) {
-    rhsValue = createConstIndexValueOp(loc, b, rhsInt.value());
-  } else {
-    lhsValue = convertToIndexIfNeeded(lhsValue, loc, b);
-    assert(isa<IndexType>(lhsValue.getType()));
-  }
-
-  return b.create<arith::AddIOp>(loc, lhsValue, rhsValue).getResult();
+  return b.create<arith::AddIOp>(loc, *lhsValue, *rhsValue).getResult();
 }
 
 OpFoldResult subOpFoldResult(const OpFoldResult &lhs, const OpFoldResult &rhs,
@@ -1006,22 +1062,12 @@ OpFoldResult subOpFoldResult(const OpFoldResult &lhs, const OpFoldResult &rhs,
   if (!lhsInt && rhsInt && rhsInt.value() == 0)
     return lhs;
 
-  auto lhsValue = dyn_cast<Value>(lhs), rhsValue = dyn_cast<Value>(rhs);
-  if (lhsInt) {
-    lhsValue = createConstIndexValueOp(loc, b, lhsInt.value());
-  } else {
-    lhsValue = convertToIndexIfNeeded(lhsValue, loc, b);
-    assert(isa<IndexType>(lhsValue.getType()));
-  }
+  FailureOr<Value> lhsValue = materializeIndexOperand(lhs, lhsInt, loc, b);
+  FailureOr<Value> rhsValue = materializeIndexOperand(rhs, rhsInt, loc, b);
+  if (failed(lhsValue) || failed(rhsValue))
+    return OpFoldResult();
 
-  if (rhsInt) {
-    rhsValue = createConstIndexValueOp(loc, b, rhsInt.value());
-  } else {
-    lhsValue = convertToIndexIfNeeded(lhsValue, loc, b);
-    assert(isa<IndexType>(lhsValue.getType()));
-  }
-
-  return b.create<arith::SubIOp>(loc, lhsValue, rhsValue).getResult();
+  return b.create<arith::SubIOp>(loc, *lhsValue, *rhsValue).getResult();
 }
 
 OpFoldResult mulOpFoldResult(const OpFoldResult &lhs, const OpFoldResult &rhs,
@@ -1045,22 +1091,12 @@ OpFoldResult mulOpFoldResult(const OpFoldResult &lhs, const OpFoldResult &rhs,
       return lhs;
   }
 
-  auto lhsValue = dyn_cast<Value>(lhs), rhsValue = dyn_cast<Value>(rhs);
-  if (lhsInt) {
-    lhsValue = createConstIndexValueOp(loc, b, lhsInt.value());
-  } else {
-    lhsValue = convertToIndexIfNeeded(lhsValue, loc, b);
-    assert(isa<IndexType>(lhsValue.getType()));
-  }
+  FailureOr<Value> lhsValue = materializeIndexOperand(lhs, lhsInt, loc, b);
+  FailureOr<Value> rhsValue = materializeIndexOperand(rhs, rhsInt, loc, b);
+  if (failed(lhsValue) || failed(rhsValue))
+    return OpFoldResult();
 
-  if (rhsInt) {
-    rhsValue = createConstIndexValueOp(loc, b, rhsInt.value());
-  } else {
-    lhsValue = convertToIndexIfNeeded(lhsValue, loc, b);
-    assert(isa<IndexType>(lhsValue.getType()));
-  }
-
-  return b.create<arith::MulIOp>(loc, lhsValue, rhsValue).getResult();
+  return b.create<arith::MulIOp>(loc, *lhsValue, *rhsValue).getResult();
 }
 
 OpFoldResult divOpFoldResult(const OpFoldResult &lhs, const OpFoldResult &rhs,
@@ -1086,22 +1122,12 @@ OpFoldResult divOpFoldResult(const OpFoldResult &lhs, const OpFoldResult &rhs,
       return lhs;
   }
 
-  auto lhsValue = dyn_cast<Value>(lhs), rhsValue = dyn_cast<Value>(rhs);
-  if (lhsInt) {
-    lhsValue = createConstIndexValueOp(loc, b, lhsInt.value());
-  } else {
-    lhsValue = convertToIndexIfNeeded(lhsValue, loc, b);
-    assert(isa<IndexType>(lhsValue.getType()));
-  }
+  FailureOr<Value> lhsValue = materializeIndexOperand(lhs, lhsInt, loc, b);
+  FailureOr<Value> rhsValue = materializeIndexOperand(rhs, rhsInt, loc, b);
+  if (failed(lhsValue) || failed(rhsValue))
+    return OpFoldResult();
 
-  if (rhsInt) {
-    rhsValue = createConstIndexValueOp(loc, b, rhsInt.value());
-  } else {
-    lhsValue = convertToIndexIfNeeded(lhsValue, loc, b);
-    assert(isa<IndexType>(lhsValue.getType()));
-  }
-
-  return b.create<arith::DivSIOp>(loc, lhsValue, rhsValue).getResult();
+  return b.create<arith::DivSIOp>(loc, *lhsValue, *rhsValue).getResult();
 }
 
 OpFoldResult remOpFoldResult(const OpFoldResult &lhs, const OpFoldResult &rhs,
@@ -1122,22 +1148,12 @@ OpFoldResult remOpFoldResult(const OpFoldResult &lhs, const OpFoldResult &rhs,
       return lhs;
   }
 
-  auto lhsValue = dyn_cast<Value>(lhs), rhsValue = dyn_cast<Value>(rhs);
-  if (lhsInt) {
-    lhsValue = createConstIndexValueOp(loc, b, lhsInt.value());
-  } else {
-    lhsValue = convertToIndexIfNeeded(lhsValue, loc, b);
-    assert(isa<IndexType>(lhsValue.getType()));
-  }
+  FailureOr<Value> lhsValue = materializeIndexOperand(lhs, lhsInt, loc, b);
+  FailureOr<Value> rhsValue = materializeIndexOperand(rhs, rhsInt, loc, b);
+  if (failed(lhsValue) || failed(rhsValue))
+    return OpFoldResult();
 
-  if (rhsInt) {
-    rhsValue = createConstIndexValueOp(loc, b, rhsInt.value());
-  } else {
-    lhsValue = convertToIndexIfNeeded(lhsValue, loc, b);
-    assert(isa<IndexType>(lhsValue.getType()));
-  }
-
-  return b.create<arith::RemSIOp>(loc, lhsValue, rhsValue).getResult();
+  return b.create<arith::RemSIOp>(loc, *lhsValue, *rhsValue).getResult();
 }
 
 OpFoldResult minOpFoldResult(const OpFoldResult &lhs, const OpFoldResult &rhs,
@@ -1147,22 +1163,12 @@ OpFoldResult minOpFoldResult(const OpFoldResult &lhs, const OpFoldResult &rhs,
   if (lhsInt && rhsInt)
     return b.getIndexAttr(std::min(lhsInt.value(), rhsInt.value()));
 
-  auto lhsValue = dyn_cast<Value>(lhs), rhsValue = dyn_cast<Value>(rhs);
-  if (lhsInt) {
-    lhsValue = createConstIndexValueOp(loc, b, lhsInt.value());
-  } else {
-    lhsValue = convertToIndexIfNeeded(lhsValue, loc, b);
-    assert(isa<IndexType>(lhsValue.getType()));
-  }
+  FailureOr<Value> lhsValue = materializeIndexOperand(lhs, lhsInt, loc, b);
+  FailureOr<Value> rhsValue = materializeIndexOperand(rhs, rhsInt, loc, b);
+  if (failed(lhsValue) || failed(rhsValue))
+    return OpFoldResult();
 
-  if (rhsInt) {
-    rhsValue = createConstIndexValueOp(loc, b, rhsInt.value());
-  } else {
-    lhsValue = convertToIndexIfNeeded(lhsValue, loc, b);
-    assert(isa<IndexType>(lhsValue.getType()));
-  }
-
-  return b.create<arith::MinSIOp>(loc, lhsValue, rhsValue).getResult();
+  return b.create<arith::MinSIOp>(loc, *lhsValue, *rhsValue).getResult();
 }
 
 OpFoldResult maxOpFoldResult(const OpFoldResult &lhs, const OpFoldResult &rhs,
@@ -1172,22 +1178,12 @@ OpFoldResult maxOpFoldResult(const OpFoldResult &lhs, const OpFoldResult &rhs,
   if (lhsInt && rhsInt)
     return b.getIndexAttr(std::max(lhsInt.value(), rhsInt.value()));
 
-  auto lhsValue = dyn_cast<Value>(lhs), rhsValue = dyn_cast<Value>(rhs);
-  if (lhsInt) {
-    lhsValue = createConstIndexValueOp(loc, b, lhsInt.value());
-  } else {
-    lhsValue = convertToIndexIfNeeded(lhsValue, loc, b);
-    assert(isa<IndexType>(lhsValue.getType()));
-  }
+  FailureOr<Value> lhsValue = materializeIndexOperand(lhs, lhsInt, loc, b);
+  FailureOr<Value> rhsValue = materializeIndexOperand(rhs, rhsInt, loc, b);
+  if (failed(lhsValue) || failed(rhsValue))
+    return OpFoldResult();
 
-  if (rhsInt) {
-    rhsValue = createConstIndexValueOp(loc, b, rhsInt.value());
-  } else {
-    rhsValue = convertToIndexIfNeeded(rhsValue, loc, b);
-    assert(isa<IndexType>(rhsValue.getType()));
-  }
-
-  return b.create<arith::MaxSIOp>(loc, lhsValue, rhsValue).getResult();
+  return b.create<arith::MaxSIOp>(loc, *lhsValue, *rhsValue).getResult();
 }
 
 void addReduceWithIndexAttr(ReduceWithIndexParams params,
@@ -1345,19 +1341,19 @@ OpFoldResult getOpFoldResultOfLayoutInfo(Value value, OpBuilder &builder) {
     return constantFold;
   }
 
-  if (!isa<IntegerType>(value.getType()))
+  Type sourceType = value.getType();
+  if (!sourceType.isIndex() && !isa<IntegerType>(sourceType))
     llvm_unreachable("Illegal data type when parse block data layout info");
 
-  if (!isa<IndexType>(value.getType())) {
-    if (value.getType().isInteger(/*width*/ 1))
-      value = builder.create<arith::IndexCastUIOp>(
-          value.getLoc(), builder.getIndexType(), value);
-    else
-      value = builder.create<arith::IndexCastOp>(value.getLoc(),
-                                                 builder.getIndexType(), value);
-  }
-
-  return value;
+  IntegerExtensionKind extension = sourceType.isInteger(/*width=*/1)
+                                       ? IntegerExtensionKind::Unsigned
+                                       : IntegerExtensionKind::Signed;
+  FailureOr<Value> converted =
+      castIntegerLike(builder, value.getLoc(), value, builder.getIndexType(),
+                      extension);
+  if (failed(converted))
+    llvm_unreachable("Failed to convert block data layout info to index");
+  return *converted;
 }
 
 // Specialize the Typeless Value (Zero, Min, Max) into a mlir TypedAttr
@@ -1558,16 +1554,6 @@ bool isZero(const OpFoldResult ofr) {
 bool isOne(const OpFoldResult ofr) {
   auto staticOfr = getIntAttr(ofr);
   return staticOfr.has_value() && staticOfr.value() == 1;
-}
-
-Value convertToIndexIfNeeded(Value input, const Location &loc, OpBuilder &b) {
-  auto inputType = input.getType();
-  if (auto intType = dyn_cast<IntegerType>(inputType)) {
-    if (intType.isInteger(32) || intType.isInteger(64)) {
-      return b.create<arith::IndexCastOp>(loc, b.getIndexType(), input);
-    }
-  }
-  return input;
 }
 
 RankedTensorType getExtractSlicedType(ArrayRef<OpFoldResult> shape,

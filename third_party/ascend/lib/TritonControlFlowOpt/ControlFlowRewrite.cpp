@@ -21,8 +21,8 @@
  */
 
 #include "TritonControlFlowOpt/ControlFlowRewrite.h"
+#include "Utils/Utils.h"
 
-#include "mlir/Dialect/Arith/IR/Arith.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/IRMapping.h"
@@ -154,44 +154,6 @@ withComponentValues(DecomposedValue info, ArrayRef<unsigned> indices,
   return info;
 }
 
-static Value castComponent(OpBuilder &builder, Location loc, Value value,
-                           Type targetType) {
-  // Analysis chooses one joined integer width for each transferred component.
-  // Materialization inserts the corresponding scalar or tensor integer cast.
-  if (!value || value.getType() == targetType)
-    return value;
-
-  Type sourceType = value.getType();
-  if ((sourceType.isIndex() && isa<IntegerType>(targetType)) ||
-      (isa<IntegerType>(sourceType) && targetType.isIndex()))
-    return builder.create<arith::IndexCastOp>(loc, targetType, value);
-
-  auto sourceInteger = dyn_cast<IntegerType>(sourceType);
-  auto targetInteger = dyn_cast<IntegerType>(targetType);
-  if (sourceInteger && targetInteger) {
-    if (sourceInteger.getWidth() < targetInteger.getWidth())
-      return builder.create<arith::ExtSIOp>(loc, targetType, value);
-    if (sourceInteger.getWidth() > targetInteger.getWidth())
-      return builder.create<arith::TruncIOp>(loc, targetType, value);
-    return value;
-  }
-
-  auto sourceTensor = dyn_cast<RankedTensorType>(sourceType);
-  auto targetTensor = dyn_cast<RankedTensorType>(targetType);
-  if (!sourceTensor || !targetTensor ||
-      sourceTensor.getShape() != targetTensor.getShape())
-    return nullptr;
-  auto sourceElement = dyn_cast<IntegerType>(sourceTensor.getElementType());
-  auto targetElement = dyn_cast<IntegerType>(targetTensor.getElementType());
-  if (!sourceElement || !targetElement)
-    return nullptr;
-  if (sourceElement.getWidth() < targetElement.getWidth())
-    return builder.create<arith::ExtSIOp>(loc, targetType, value);
-  if (sourceElement.getWidth() > targetElement.getWidth())
-    return builder.create<arith::TruncIOp>(loc, targetType, value);
-  return value;
-}
-
 static LogicalResult castPlannedComponents(DecomposedValue &value,
                                            ArrayRef<unsigned> componentIndices,
                                            ArrayRef<Type> componentTypes,
@@ -201,11 +163,11 @@ static LogicalResult castPlannedComponents(DecomposedValue &value,
   for (auto [index, type] : llvm::zip(componentIndices, componentTypes)) {
     if (index >= value.components.size())
       return failure();
-    Value component =
-        castComponent(builder, loc, value.components[index], type);
-    if (!component)
+    FailureOr<Value> component =
+        castIntegerLike(builder, loc, value.components[index], type);
+    if (failed(component))
       return failure();
-    value.components[index] = component;
+    value.components[index] = *component;
   }
   return success();
 }
