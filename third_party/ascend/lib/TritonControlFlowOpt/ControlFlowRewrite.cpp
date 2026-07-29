@@ -266,20 +266,20 @@ static SmallVector<Value> collectWhileComponents(const LoopPointerInfo &info,
 static LogicalResult rewriteControlFlowOp(Operation *op, OpBuilder &builder,
                                           RewriteEnv &env);
 
-static LogicalResult materializePointerResult(Operation &bodyOp,
+static LogicalResult materializePointerResult(Operation &originalOp,
                                               Operation *clonedOp,
                                               OpBuilder &builder,
                                               RewriteEnv &env) {
   // Each policy decides which pointer-producing operations need their exact
   // components recorded immediately after cloning.
-  if (!env.policy.shouldDecomposeOperation(&bodyOp))
+  if (!env.policy.shouldDecomposeOperation(&originalOp))
     return success();
 
   OpBuilder::InsertionGuard guard(builder);
   builder.setInsertionPointAfter(clonedOp);
 
   for (auto [oldResult, clonedResult] :
-       llvm::zip(bodyOp.getResults(), clonedOp->getResults())) {
+       llvm::zip(originalOp.getResults(), clonedOp->getResults())) {
     if (!env.policy.isDecompositionTarget(oldResult))
       continue;
 
@@ -302,19 +302,19 @@ static LogicalResult rewriteBodyOps(Block *oldBlock, OpBuilder &builder,
   // Process operations in program order. Nested control flow is rewritten
   // recursively with the same policy; ordinary operations are cloned through
   // the current SSA mapping.
-  for (Operation &bodyOp : oldBlock->without_terminator()) {
-    if (isa<scf::ForOp, scf::WhileOp, scf::IfOp>(bodyOp)) {
-      const ControlFlowOpAnalysis *analysis = env.plan.lookup(&bodyOp);
+  for (Operation &originalOp : oldBlock->without_terminator()) {
+    if (isa<scf::ForOp, scf::WhileOp, scf::IfOp>(originalOp)) {
+      const ControlFlowOpAnalysis *analysis = env.plan.lookup(&originalOp);
       if (!analysis)
         return failure();
       if (analysis->needsRewrite()) {
-        if (failed(rewriteControlFlowOp(&bodyOp, builder, env)))
+        if (failed(rewriteControlFlowOp(&originalOp, builder, env)))
           return failure();
         continue;
       }
     }
-    Operation *clonedOp = builder.clone(bodyOp, env.valueMapping);
-    if (failed(materializePointerResult(bodyOp, clonedOp, builder, env)))
+    Operation *clonedOp = builder.clone(originalOp, env.valueMapping);
+    if (failed(materializePointerResult(originalOp, clonedOp, builder, env)))
       return failure();
   }
   return success();
