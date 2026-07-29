@@ -21,6 +21,7 @@
  */
 
 #include "TritonControlFlowOpt/CFGStructuring.h"
+#include "Utils/Utils.h"
 
 #include "mlir/Dialect/ControlFlow/IR/ControlFlowOps.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
@@ -239,36 +240,6 @@ static FailureOr<scf::IfOp> buildStructuredIf(cf::CondBranchOp condBr,
   return ifOp;
 }
 
-static bool haveSameTypes(ValueRange lhs, ValueRange rhs) {
-  if (lhs.size() != rhs.size())
-    return false;
-  for (auto [lhsValue, rhsValue] : llvm::zip(lhs, rhs)) {
-    if (lhsValue.getType() != rhsValue.getType())
-      return false;
-  }
-  return true;
-}
-
-static bool haveSameTypes(ValueRange values, ArrayRef<Type> types) {
-  if (values.size() != types.size())
-    return false;
-  for (auto [value, type] : llvm::zip(values, types)) {
-    if (value.getType() != type)
-      return false;
-  }
-  return true;
-}
-
-static bool haveSameTypes(ArrayRef<Type> lhs, ArrayRef<Type> rhs) {
-  if (lhs.size() != rhs.size())
-    return false;
-  for (auto [lhsType, rhsType] : llvm::zip(lhs, rhs)) {
-    if (lhsType != rhsType)
-      return false;
-  }
-  return true;
-}
-
 static Operation *createReturnLike(OpBuilder &builder, Location loc,
                                    Operation *sampleReturn,
                                    ValueRange operands) {
@@ -319,7 +290,7 @@ collectReturnPathTypes(Block *block, SmallPtrSetImpl<Block *> &visiting) {
     visiting.erase(block);
     if (failed(thenTypes) || failed(elseTypes))
       return failure();
-    if (!haveSameTypes(*thenTypes, *elseTypes)) {
+    if (!haveSameTypes(TypeRange{*thenTypes}, TypeRange{*elseTypes})) {
       condBr.emitError("terminal branch return types do not match");
       return failure();
     }
@@ -391,7 +362,7 @@ buildClonedTerminalTerminator(Operation *term, OpBuilder &builder,
         collectReturnPathTypes(condBr.getFalseDest(), elseVisiting);
     if (failed(thenTypes) || failed(elseTypes))
       return failure();
-    if (!haveSameTypes(*thenTypes, *elseTypes)) {
+    if (!haveSameTypes(TypeRange{*thenTypes}, TypeRange{*elseTypes})) {
       condBr.emitError("terminal branch return types do not match");
       return failure();
     }
@@ -415,7 +386,8 @@ buildClonedTerminalTerminator(Operation *term, OpBuilder &builder,
           condBr.getTrueDest(), incoming, builder, mapping, visiting);
       if (failed(thenReturn))
         return failure();
-      if (!haveSameTypes(*thenReturn, *thenTypes)) {
+      if (!haveSameTypes(TypeRange{ValueRange{*thenReturn}},
+                         TypeRange{*thenTypes})) {
         condBr.emitError("then terminal branch returns incompatible values");
         return failure();
       }
@@ -437,7 +409,8 @@ buildClonedTerminalTerminator(Operation *term, OpBuilder &builder,
           condBr.getFalseDest(), incoming, builder, mapping, visiting);
       if (failed(elseReturn))
         return failure();
-      if (!haveSameTypes(*elseReturn, *thenTypes)) {
+      if (!haveSameTypes(TypeRange{ValueRange{*elseReturn}},
+                         TypeRange{*thenTypes})) {
         condBr.emitError("else terminal branch returns incompatible values");
         return failure();
       }
@@ -549,7 +522,7 @@ static FailureOr<scf::IfOp> buildTerminalValueIf(cf::CondBranchOp condBr,
       collectReturnPathTypes(condBr.getFalseDest(), elseVisiting);
   if (failed(thenTypes) || failed(elseTypes))
     return failure();
-  if (!haveSameTypes(*thenTypes, *elseTypes)) {
+  if (!haveSameTypes(TypeRange{*thenTypes}, TypeRange{*elseTypes})) {
     condBr.emitError("terminal branch return types do not match");
     return failure();
   }
@@ -570,7 +543,8 @@ static FailureOr<scf::IfOp> buildTerminalValueIf(cf::CondBranchOp condBr,
         condBr.getTrueDest(), condBr.getTrueDestOperands(), builder);
     if (failed(thenReturn))
       return failure();
-    if (!haveSameTypes(thenReturn->operands, *thenTypes)) {
+    if (!haveSameTypes(TypeRange{ValueRange{thenReturn->operands}},
+                       TypeRange{*thenTypes})) {
       condBr.emitError("then terminal branch returns incompatible values");
       return failure();
     }
@@ -590,7 +564,8 @@ static FailureOr<scf::IfOp> buildTerminalValueIf(cf::CondBranchOp condBr,
         condBr.getFalseDest(), condBr.getFalseDestOperands(), builder);
     if (failed(elseReturn))
       return failure();
-    if (!haveSameTypes(elseReturn->operands, *thenTypes)) {
+    if (!haveSameTypes(TypeRange{ValueRange{elseReturn->operands}},
+                       TypeRange{*thenTypes})) {
       condBr.emitError("else terminal branch returns incompatible values");
       return failure();
     }

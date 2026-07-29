@@ -31,6 +31,7 @@
 #include "mlir/IR/OpDefinition.h"
 #include "mlir/IR/Operation.h"
 #include "mlir/IR/PatternMatch.h"
+#include "mlir/IR/TypeRange.h"
 #include "mlir/Transforms/DialectConversion.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
 #include "llvm/ADT/ArrayRef.h"
@@ -207,6 +208,9 @@ enum class IntegerExtensionKind {
   Signed,
   Unsigned,
 };
+
+/// Returns true when both ranges have identical ordered type signatures.
+bool haveSameTypes(TypeRange lhs, TypeRange rhs);
 
 FailureOr<Value>
 castIntegerLike(OpBuilder &builder, Location loc, Value value, Type targetType,
