@@ -47,8 +47,10 @@ namespace {
 ///
 /// Keep rank/layout checks local to this file: the generic control-flow
 /// machinery intentionally does not know the descriptor format of a policy.
-static FailureOr<unsigned> getRank(const DecomposedValue &value) {
-  auto pointerType = dyn_cast<triton::PointerType>(value.originalType);
+// Extracts the block-pointer rank from the original type shared by analysis
+// and rewrite states. Invalid pointer and pointee types fail consistently.
+static FailureOr<unsigned> getRank(Type originalType) {
+  auto pointerType = dyn_cast<triton::PointerType>(originalType);
   if (!pointerType)
     return failure();
   auto tensorType = dyn_cast<RankedTensorType>(pointerType.getPointeeType());
@@ -57,28 +59,14 @@ static FailureOr<unsigned> getRank(const DecomposedValue &value) {
   return tensorType.getRank();
 }
 
-static FailureOr<unsigned> getRank(const AnalyzedValue &value) {
-  auto pointerType = dyn_cast<triton::PointerType>(value.originalType);
-  if (!pointerType)
-    return failure();
-  auto tensorType = dyn_cast<RankedTensorType>(pointerType.getPointeeType());
-  if (!tensorType)
-    return failure();
-  return tensorType.getRank();
-}
-
-static bool hasValidLayout(const DecomposedValue &value) {
-  FailureOr<unsigned> rank = getRank(value);
-  return succeeded(rank) && value.components.size() == 3 * *rank &&
-         value.invariants.size() == 1 && value.attributes.size() == 1 &&
-         isa<DenseI32ArrayAttr>(value.attributes.front());
-}
-
-static bool hasValidLayout(const AnalyzedValue &value) {
-  FailureOr<unsigned> rank = getRank(value);
-  return succeeded(rank) && value.components.size() == 3 * *rank &&
-         value.invariants.size() == 1 && value.attributes.size() == 1 &&
-         isa<DenseI32ArrayAttr>(value.attributes.front());
+// Validates the common block-pointer schema for either state representation.
+// Their component element types differ, but this check only needs field sizes.
+template <typename StateT>
+static bool hasValidLayout(const StateT &state) {
+  FailureOr<unsigned> rank = getRank(state.originalType);
+  return succeeded(rank) && state.components.size() == 3 * *rank &&
+         state.invariants.size() == 1 && state.attributes.size() == 1 &&
+         isa<DenseI32ArrayAttr>(state.attributes.front());
 }
 
 class BlockPtrPolicy final : public ControlFlowRewritePolicy {
@@ -133,7 +121,7 @@ public:
     FailureOr<AnalyzedValue> result = context.analyzeValue(advance.getPtr());
     if (failed(result) || !hasValidLayout(*result))
       return failure();
-    unsigned rank = *getRank(*result);
+    unsigned rank = *getRank(result->originalType);
     if (advance.getOffsets().size() != rank)
       return failure();
     for (unsigned dimension = 0; dimension < rank; ++dimension) {
@@ -149,7 +137,7 @@ public:
   getLoopCandidateComponents(const AnalyzedValue &value) const override {
     if (!hasValidLayout(value))
       return failure();
-    unsigned rank = *getRank(value);
+    unsigned rank = *getRank(value.originalType);
     SmallVector<unsigned> indices;
     // Only the final rank entries (offsets) are legal loop-carried state in the
     // current block-pointer model.
@@ -172,7 +160,7 @@ public:
         initial.attributes != next.attributes)
       return failure();
 
-    unsigned rank = *getRank(initial);
+    unsigned rank = *getRank(initial.originalType);
     // The current implementation does not expand shape or stride iter_args.
     // Reject a loop that changes either instead of silently reconstructing a
     // descriptor with stale values.
@@ -275,7 +263,7 @@ public:
         decompose(advance.getPtr(), context, builder, loc);
     if (failed(result) || !hasValidLayout(*result))
       return failure();
-    FailureOr<unsigned> rank = getRank(*result);
+    FailureOr<unsigned> rank = getRank(result->originalType);
     if (advance.getOffsets().size() != *rank)
       return failure();
 
@@ -306,7 +294,7 @@ public:
     // control-flow boundary so ordinary users remain untouched.
     if (!hasValidLayout(value))
       return nullptr;
-    unsigned rank = *getRank(value);
+    unsigned rank = *getRank(value.originalType);
     auto order = cast<DenseI32ArrayAttr>(value.attributes.front());
     return builder.create<triton::MakeTensorPtrOp>(
         loc, value.originalType, value.invariants.front(),
