@@ -229,20 +229,30 @@ static SmallVector<Value> getComponentValues(const DecomposedValue &info,
   return values;
 }
 
+// Returns a copy of decomposition with selected component values replaced.
+// componentIndices and replacements are paired by position. The replacement
+// fails if the ranges have different sizes, an index is out of bounds, or a
+// replacement changes the component type; the input object remains unchanged.
+//
+// Example:
+//   decomposition.components = [shape, stride, originalOffset]
+//   componentIndices = [2], replacements = [nextOffset]
+//   result.components = [shape, stride, nextOffset]
 static FailureOr<DecomposedValue>
-withComponentValues(DecomposedValue info, ArrayRef<unsigned> indices,
-                    ArrayRef<Value> values) {
-  // Start from one branch/init descriptor and replace only the components that
-  // crossed the boundary. Invariants never enter the generic SCF signature.
-  if (indices.size() != values.size())
+withReplacedComponents(DecomposedValue decomposition,
+                       ArrayRef<unsigned> componentIndices,
+                       ArrayRef<Value> replacements) {
+  if (componentIndices.size() != replacements.size())
     return failure();
-  for (auto [index, value] : llvm::zip(indices, values)) {
-    if (index >= info.components.size() ||
-        info.components[index].getType() != value.getType())
+  for (auto [componentIndex, replacement] :
+       llvm::zip(componentIndices, replacements)) {
+    if (componentIndex >= decomposition.components.size() ||
+        decomposition.components[componentIndex].getType() !=
+            replacement.getType())
       return failure();
-    info.components[index] = value;
+    decomposition.components[componentIndex] = replacement;
   }
-  return info;
+  return decomposition;
 }
 
 static LogicalResult castPlannedComponents(DecomposedValue &value,
@@ -445,7 +455,7 @@ static LogicalResult rewriteForOp(scf::ForOp forOp, OpBuilder &builder,
             SmallVector<Value> values;
             for (unsigned newIndex : info->newIndices)
               values.push_back(args[newIndex]);
-            FailureOr<DecomposedValue> argInfo = withComponentValues(
+            FailureOr<DecomposedValue> argInfo = withReplacedComponents(
                 info->initInfo, info->componentIndices, values);
             if (failed(argInfo)) {
               bodyOk = false;
@@ -503,7 +513,7 @@ static LogicalResult rewriteForOp(scf::ForOp forOp, OpBuilder &builder,
   // to the corresponding expanded-result index.
   for (auto [idx, oldResult] : llvm::enumerate(forOp.getResults())) {
     if (const LoopPointerInfo *info = findLoopInfo(pointerInfos, idx)) {
-      FailureOr<DecomposedValue> resultInfo = withComponentValues(
+      FailureOr<DecomposedValue> resultInfo = withReplacedComponents(
           info->initInfo, info->componentIndices,
           collectForComponents(*info, newForOp, /*useResults=*/true));
       if (failed(resultInfo)) {
@@ -592,7 +602,7 @@ static LogicalResult rewriteWhileOp(scf::WhileOp whileOp, OpBuilder &builder,
             SmallVector<Value> values;
             for (unsigned newIndex : info->newIndices)
               values.push_back(args[newIndex]);
-            FailureOr<DecomposedValue> argInfo = withComponentValues(
+            FailureOr<DecomposedValue> argInfo = withReplacedComponents(
                 info->initInfo, info->componentIndices, values);
             if (failed(argInfo)) {
               bodyOk = false;
@@ -651,7 +661,7 @@ static LogicalResult rewriteWhileOp(scf::WhileOp whileOp, OpBuilder &builder,
             SmallVector<Value> values;
             for (unsigned newIndex : info->newIndices)
               values.push_back(args[newIndex]);
-            FailureOr<DecomposedValue> argInfo = withComponentValues(
+            FailureOr<DecomposedValue> argInfo = withReplacedComponents(
                 info->initInfo, info->componentIndices, values);
             if (failed(argInfo)) {
               bodyOk = false;
@@ -706,7 +716,7 @@ static LogicalResult rewriteWhileOp(scf::WhileOp whileOp, OpBuilder &builder,
   builder.setInsertionPointAfter(newWhileOp);
   for (auto [idx, oldResult] : llvm::enumerate(whileOp.getResults())) {
     if (const LoopPointerInfo *info = findLoopInfo(pointerInfos, idx)) {
-      FailureOr<DecomposedValue> resultInfo = withComponentValues(
+      FailureOr<DecomposedValue> resultInfo = withReplacedComponents(
           info->initInfo, info->componentIndices,
           collectWhileComponents(*info, newWhileOp, /*useResults=*/true,
                                  /*useAfterArgs=*/false));
@@ -867,7 +877,7 @@ static LogicalResult rewriteIfOp(scf::IfOp ifOp, OpBuilder &builder,
       SmallVector<Value> componentValues;
       for (unsigned i = 0; i < info->componentIndices.size(); ++i)
         componentValues.push_back(newIfOp.getResult(newResultIndex++));
-      FailureOr<DecomposedValue> resultInfo = withComponentValues(
+      FailureOr<DecomposedValue> resultInfo = withReplacedComponents(
           *info->thenInfo, info->componentIndices, componentValues);
       if (failed(resultInfo)) {
         newIfOp.erase();
