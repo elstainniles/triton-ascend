@@ -31,6 +31,7 @@
 
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/STLExtras.h"
+#include "llvm/ADT/SmallDenseSet.h"
 #include "llvm/ADT/SmallVector.h"
 
 #include <optional>
@@ -218,14 +219,23 @@ struct IfPointerInfo {
   std::optional<DecomposedValue> thenInfo;
 };
 
-static SmallVector<Value> getComponentValues(const DecomposedValue &info,
-                                             ArrayRef<unsigned> indices) {
-  // Callers validate the policy-provided indices before reaching this helper.
-  // Preserve their order because it is also the replacement signature order.
+// Copies the values selected by indices into a new owning vector while
+// preserving their input order. Indices must be unique and in bounds; this
+// function reports failure instead of deduplicating or accessing invalid input.
+// `sourceValues` is only borrowed while this function executes.
+//
+// Example: sourceValues = [shape, stride, offset] and indices = [2, 0, 1]
+// produce [offset, shape, stride]. Indices [2, 0, 2] produce failure.
+static FailureOr<SmallVector<Value>>
+gatherValues(ValueRange sourceValues, ArrayRef<unsigned> indices) {
   SmallVector<Value> values;
   values.reserve(indices.size());
-  for (unsigned index : indices)
-    values.push_back(info.components[index]);
+  llvm::SmallDenseSet<unsigned> seenIndices;
+  for (unsigned index : indices) {
+    if (index >= sourceValues.size() || !seenIndices.insert(index).second)
+      return failure();
+    values.push_back(sourceValues[index]);
+  }
   return values;
 }
 
@@ -294,36 +304,6 @@ static auto findPointerInfoByOldIndex(InfoRange &pointerInfos,
       return &info;
   }
   return nullptr;
-}
-
-static SmallVector<Value> collectForComponents(const LoopPointerInfo &info,
-                                               scf::ForOp forOp,
-                                               bool useResults) {
-  // `newIndices` is shared by init operands, region arguments and results of an
-  // scf.for, so choosing the source is sufficient to recover the descriptor.
-  SmallVector<Value> values;
-  for (unsigned newIndex : info.newIndices)
-    values.push_back(useResults ? forOp.getResult(newIndex)
-                                : forOp.getRegionIterArgs()[newIndex]);
-  return values;
-}
-
-static SmallVector<Value> collectWhileComponents(const LoopPointerInfo &info,
-                                                 scf::WhileOp whileOp,
-                                                 bool useResults,
-                                                 bool useAfterArgs) {
-  // scf.while has two region-argument lists in addition to its results; all
-  // three use the same expanded positional schema.
-  SmallVector<Value> values;
-  for (unsigned newIndex : info.newIndices) {
-    if (useResults)
-      values.push_back(whileOp.getResult(newIndex));
-    else if (useAfterArgs)
-      values.push_back(whileOp.getAfterArguments()[newIndex]);
-    else
-      values.push_back(whileOp.getBeforeArguments()[newIndex]);
-  }
-  return values;
 }
 
 static LogicalResult rewriteControlFlowOp(Operation *op, OpBuilder &builder,
@@ -430,8 +410,11 @@ static LogicalResult rewriteForOp(scf::ForOp forOp, OpBuilder &builder,
     oldToNewStart[idx] = newInitArgs.size();
     if (LoopPointerInfo *info =
         findPointerInfoByOldIndex(pointerInfos, idx)) {
-      for (Value component :
-           getComponentValues(info->initInfo, info->componentIndices)) {
+      FailureOr<SmallVector<Value>> initComponents =
+          gatherValues(info->initInfo.components, info->componentIndices);
+      if (failed(initComponents))
+        return failure();
+      for (Value component : *initComponents) {
         info->newIndices.push_back(newInitArgs.size());
         newInitArgs.push_back(component);
       }
@@ -455,11 +438,15 @@ static LogicalResult rewriteForOp(scf::ForOp forOp, OpBuilder &builder,
         for (auto [idx, oldArg] : llvm::enumerate(forOp.getRegionIterArgs())) {
           if (const LoopPointerInfo *info =
               findPointerInfoByOldIndex(pointerInfos, idx)) {
-            SmallVector<Value> values;
-            for (unsigned newIndex : info->newIndices)
-              values.push_back(args[newIndex]);
+            FailureOr<SmallVector<Value>> carriedComponentValues =
+                gatherValues(args, info->newIndices);
+            if (failed(carriedComponentValues)) {
+              bodyOk = false;
+              continue;
+            }
             FailureOr<DecomposedValue> argInfo = withReplacedComponents(
-                info->initInfo, info->componentIndices, values);
+                info->initInfo, info->componentIndices,
+                *carriedComponentValues);
             if (failed(argInfo)) {
               bodyOk = false;
               continue;
@@ -495,9 +482,16 @@ static LogicalResult rewriteForOp(scf::ForOp forOp, OpBuilder &builder,
                 newYieldOperands.push_back(args[newIndex]);
               continue;
             }
-            for (Value component :
-                 getComponentValues(*nextInfo, info->componentIndices))
-              newYieldOperands.push_back(component);
+            FailureOr<SmallVector<Value>> nextComponents =
+                gatherValues(nextInfo->components, info->componentIndices);
+            if (failed(nextComponents)) {
+              bodyOk = false;
+              for (unsigned newIndex : info->newIndices)
+                newYieldOperands.push_back(args[newIndex]);
+              continue;
+            }
+            newYieldOperands.append(nextComponents->begin(),
+                                    nextComponents->end());
             continue;
           }
           newYieldOperands.push_back(bodyEnv.remap(oldOperand));
@@ -518,9 +512,14 @@ static LogicalResult rewriteForOp(scf::ForOp forOp, OpBuilder &builder,
   for (auto [idx, oldResult] : llvm::enumerate(forOp.getResults())) {
     if (const LoopPointerInfo *info =
         findPointerInfoByOldIndex(pointerInfos, idx)) {
+      FailureOr<SmallVector<Value>> resultComponents =
+          gatherValues(newForOp.getResults(), info->newIndices);
+      if (failed(resultComponents)) {
+        newForOp.erase();
+        return failure();
+      }
       FailureOr<DecomposedValue> resultInfo = withReplacedComponents(
-          info->initInfo, info->componentIndices,
-          collectForComponents(*info, newForOp, /*useResults=*/true));
+          info->initInfo, info->componentIndices, *resultComponents);
       if (failed(resultInfo)) {
         newForOp.erase();
         return failure();
@@ -583,8 +582,11 @@ static LogicalResult rewriteWhileOp(scf::WhileOp whileOp, OpBuilder &builder,
     oldToNewStart[idx] = newInits.size();
     if (LoopPointerInfo *info =
         findPointerInfoByOldIndex(pointerInfos, idx)) {
-      for (Value component :
-           getComponentValues(info->initInfo, info->componentIndices)) {
+      FailureOr<SmallVector<Value>> initComponents =
+          gatherValues(info->initInfo.components, info->componentIndices);
+      if (failed(initComponents))
+        return failure();
+      for (Value component : *initComponents) {
         info->newIndices.push_back(newInits.size());
         newInits.push_back(component);
         newResultTypes.push_back(component.getType());
@@ -606,11 +608,15 @@ static LogicalResult rewriteWhileOp(scf::WhileOp whileOp, OpBuilder &builder,
              llvm::enumerate(whileOp.getBeforeArguments())) {
           if (const LoopPointerInfo *info =
               findPointerInfoByOldIndex(pointerInfos, idx)) {
-            SmallVector<Value> values;
-            for (unsigned newIndex : info->newIndices)
-              values.push_back(args[newIndex]);
+            FailureOr<SmallVector<Value>> carriedComponentValues =
+                gatherValues(args, info->newIndices);
+            if (failed(carriedComponentValues)) {
+              bodyOk = false;
+              continue;
+            }
             FailureOr<DecomposedValue> argInfo = withReplacedComponents(
-                info->initInfo, info->componentIndices, values);
+                info->initInfo, info->componentIndices,
+                *carriedComponentValues);
             if (failed(argInfo)) {
               bodyOk = false;
               continue;
@@ -646,9 +652,16 @@ static LogicalResult rewriteWhileOp(scf::WhileOp whileOp, OpBuilder &builder,
                 newConditionArgs.push_back(args[newIndex]);
               continue;
             }
-            for (Value component :
-                 getComponentValues(*conditionInfo, info->componentIndices))
-              newConditionArgs.push_back(component);
+            FailureOr<SmallVector<Value>> conditionComponents = gatherValues(
+                conditionInfo->components, info->componentIndices);
+            if (failed(conditionComponents)) {
+              bodyOk = false;
+              for (unsigned newIndex : info->newIndices)
+                newConditionArgs.push_back(args[newIndex]);
+              continue;
+            }
+            newConditionArgs.append(conditionComponents->begin(),
+                                    conditionComponents->end());
             continue;
           }
           newConditionArgs.push_back(beforeEnv.remap(oldArg));
@@ -667,11 +680,15 @@ static LogicalResult rewriteWhileOp(scf::WhileOp whileOp, OpBuilder &builder,
              llvm::enumerate(whileOp.getAfterArguments())) {
           if (const LoopPointerInfo *info =
               findPointerInfoByOldIndex(pointerInfos, idx)) {
-            SmallVector<Value> values;
-            for (unsigned newIndex : info->newIndices)
-              values.push_back(args[newIndex]);
+            FailureOr<SmallVector<Value>> carriedComponentValues =
+                gatherValues(args, info->newIndices);
+            if (failed(carriedComponentValues)) {
+              bodyOk = false;
+              continue;
+            }
             FailureOr<DecomposedValue> argInfo = withReplacedComponents(
-                info->initInfo, info->componentIndices, values);
+                info->initInfo, info->componentIndices,
+                *carriedComponentValues);
             if (failed(argInfo)) {
               bodyOk = false;
               continue;
@@ -706,9 +723,16 @@ static LogicalResult rewriteWhileOp(scf::WhileOp whileOp, OpBuilder &builder,
                 newYieldOperands.push_back(args[newIndex]);
               continue;
             }
-            for (Value component :
-                 getComponentValues(*nextInfo, info->componentIndices))
-              newYieldOperands.push_back(component);
+            FailureOr<SmallVector<Value>> nextComponents =
+                gatherValues(nextInfo->components, info->componentIndices);
+            if (failed(nextComponents)) {
+              bodyOk = false;
+              for (unsigned newIndex : info->newIndices)
+                newYieldOperands.push_back(args[newIndex]);
+              continue;
+            }
+            newYieldOperands.append(nextComponents->begin(),
+                                    nextComponents->end());
             continue;
           }
           newYieldOperands.push_back(afterEnv.remap(oldOperand));
@@ -727,10 +751,14 @@ static LogicalResult rewriteWhileOp(scf::WhileOp whileOp, OpBuilder &builder,
   for (auto [idx, oldResult] : llvm::enumerate(whileOp.getResults())) {
     if (const LoopPointerInfo *info =
         findPointerInfoByOldIndex(pointerInfos, idx)) {
+      FailureOr<SmallVector<Value>> resultComponents =
+          gatherValues(newWhileOp.getResults(), info->newIndices);
+      if (failed(resultComponents)) {
+        newWhileOp.erase();
+        return failure();
+      }
       FailureOr<DecomposedValue> resultInfo = withReplacedComponents(
-          info->initInfo, info->componentIndices,
-          collectWhileComponents(*info, newWhileOp, /*useResults=*/true,
-                                 /*useAfterArgs=*/false));
+          info->initInfo, info->componentIndices, *resultComponents);
       if (failed(resultInfo)) {
         newWhileOp.erase();
         return failure();
@@ -812,9 +840,11 @@ static LogicalResult rewriteIfOp(scf::IfOp ifOp, OpBuilder &builder,
           return failure();
         if (isThen)
           info->thenInfo = *branchInfo;
-        SmallVector<Value> values =
-            getComponentValues(*branchInfo, info->componentIndices);
-        newYieldOperands.append(values.begin(), values.end());
+        FailureOr<SmallVector<Value>> values =
+            gatherValues(branchInfo->components, info->componentIndices);
+        if (failed(values))
+          return failure();
+        newYieldOperands.append(values->begin(), values->end());
         continue;
       }
       newYieldOperands.push_back(branchEnv.remap(oldOperand));
