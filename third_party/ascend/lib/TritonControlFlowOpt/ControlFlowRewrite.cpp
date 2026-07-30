@@ -71,10 +71,119 @@ namespace {
 // Per-rewrite state and generic component manipulation
 //===----------------------------------------------------------------------===//
 
+/// Carries everything needed to translate values from one original
+/// control-flow path into its replacement path.
+///
+/// valueMapping answers which new SSA value replaces an old SSA value.
+/// decomposedValues remembers the policy-specific pieces of an old pointer.
+/// policy defines what those pieces mean and how to rebuild the pointer,
+/// while plan says which loop/if operands must be expanded into such pieces.
+///
+/// For example, after a block-pointer loop argument is expanded into scalar
+/// offsets, a region-local environment can contain:
+/// valueMapping:      %old_ptr_arg -> %rebuilt_ptr
+/// decomposedValues:  %old_ptr_arg -> {
+///   components = [%shape0, %stride0, %new_offset0],
+///   invariants = [%base], attributes = [order]
+/// }
+/// Operations cloned into that region use the mapping, while pointer
+/// decomposition uses the stored components.
 struct RewriteEnv {
+  /// Starts a rewrite path with no old-to-new mappings or decomposed values.
+  /// The referenced policy and analysis plan are shared by child environments;
+  /// only the two mutable state tables above are copied for each nested region.
+  ///
+  /// For example, the top-level environment may enter a rewritten scf.for.
+  /// The loop body copies it, then adds mappings from the old body arguments to
+  /// the new body arguments without changing the state of sibling regions:
+  /// RewriteEnv env(blockPtrPolicy, rewritePlan);
+  /// RewriteEnv bodyEnv = env;
+  /// bodyEnv.valueMapping.map(oldBodyArg, newBodyArg);
   RewriteEnv(const ControlFlowRewritePolicy &policy,
              const ControlFlowRewritePlan &plan)
       : policy(policy), plan(plan) {}
+
+  /// Gives a decomposition policy read-only access to this path's two state
+  /// tables. The context can resolve an old SSA value to its replacement and
+  /// retrieve a previously stored DecomposedValue; it does not own or copy
+  /// either table and therefore must not outlive this environment.
+  ///
+  /// For example, while the block-pointer policy decomposes this operation,
+  /// it needs both the replacement delta and the saved state of the input:
+  /// %next = tt.advance %old_ptr, [%old_delta]
+  ///
+  /// valueMapping:      %old_delta -> %new_delta
+  /// decomposedValues:  %old_ptr   -> ptrInfo
+  ///
+  /// auto context = bodyEnv.getRewriteContext();
+  /// context.remap(oldDelta); // The Value for %new_delta.
+  /// context.lookup(oldPtr);  // A pointer to ptrInfo.
+  ControlFlowRewriteContext getRewriteContext() const {
+    return ControlFlowRewriteContext(valueMapping, decomposedValues);
+  }
+
+  /// Translates one SSA value referenced by the original IR into the value that
+  /// must be used in the replacement IR. It queries valueMapping; a value
+  /// defined outside the rewritten area is already valid and is returned
+  /// unchanged when the table has no entry.
+  ///
+  /// This prevents a newly built operation from referring back to a block
+  /// argument or result owned by the old region. For example:
+  /// valueMapping:  %old_iter_arg -> %new_iter_arg
+  ///
+  /// // Original: scf.yield %old_iter_arg, %outer_value
+  /// newYieldOperands = {
+  ///   bodyEnv.remap(oldIterArg), // The Value for %new_iter_arg.
+  ///   bodyEnv.remap(outerValue)  // The unchanged %outer_value.
+  /// };
+  /// The returned values are then used as operands of the replacement yield.
+  Value remap(Value value) const { return getRewriteContext().remap(value); }
+
+  /// Asks the active policy to express one high-level SSA value as the runtime
+  /// components that may cross an expanded scf.for, scf.while, or scf.if
+  /// boundary. value is the original pointer-like SSA value. The policy
+  /// receives the current rewrite context so it can reuse a known decomposition
+  /// and remap operands to the replacement IR. It may use builder and loc
+  /// to insert scalar address arithmetic at the correct rewrite position.
+  ///
+  /// For the block-pointer policy, decomposing an advance conceptually changes
+  /// only its offset components; base, shape, strides, and order are preserved:
+  /// %next = tt.advance %ptr, [%delta0, %delta1]
+  ///
+  /// decomposeValue(%next) -> DecomposedValue {
+  ///   components = [%shape0, %shape1, %stride0, %stride1,
+  ///                 %offset0 + %delta0, %offset1 + %delta1],
+  ///   invariants = [%base], attributes = [order]
+  /// }
+  /// The caller can put selected components into a new control-flow signature
+  /// or pass the whole descriptor to policy.recompose(). Unsupported values
+  /// or inconsistent component layouts return failure.
+  FailureOr<DecomposedValue>
+  decomposeValue(Value value, OpBuilder &builder, Location loc) const {
+    return policy.decompose(value, getRewriteContext(), builder, loc);
+  }
+
+  /// Records both ways in which later rewriting must understand an original
+  /// value. oldValue is the key from the original IR, info is its
+  /// component descriptor, and rebuiltValue is the pointer-like SSA value
+  /// created in the replacement IR. Pointer-aware code reads info from
+  /// decomposedValues; ordinary cloned users read rebuiltValue through
+  /// valueMapping.
+  ///
+  /// For example, after rebuilding an expanded loop argument:
+  /// %rebuilt_ptr = tt.make_tensor_ptr %base, ... %new_offset ...
+  /// bodyEnv.recordDecomposition(oldPtrArg, ptrInfo, rebuiltPtr);
+  ///
+  /// // An ordinary cloned tt.load receives %rebuilt_ptr.
+  /// bodyEnv.remap(oldPtrArg);
+  ///
+  /// // A later tt.advance/yield reuses the flattened ptrInfo directly.
+  /// bodyEnv.getRewriteContext().lookup(oldPtrArg);
+  void recordDecomposition(Value oldValue, const DecomposedValue &info,
+                           Value rebuiltValue) {
+    decomposedValues[oldValue] = info;
+    valueMapping.map(oldValue, rebuiltValue);
+  }
 
   // Maps values from the original region to values in the replacement region.
   IRMapping valueMapping;
@@ -108,24 +217,6 @@ struct IfPointerInfo {
   SmallVector<Type> componentTypes;
   std::optional<DecomposedValue> thenInfo;
 };
-
-static Value remapValue(Value value, const RewriteEnv &env) {
-  return ControlFlowRewriteContext(env.valueMapping, env.decomposedValues)
-      .remap(value);
-}
-
-static FailureOr<DecomposedValue> decompose(Value value, const RewriteEnv &env,
-                                            OpBuilder &builder, Location loc) {
-  return env.policy.decompose(
-      value, ControlFlowRewriteContext(env.valueMapping, env.decomposedValues),
-      builder, loc);
-}
-
-static void recordDecomposition(Value oldValue, const DecomposedValue &info,
-                                Value rebuiltValue, RewriteEnv &env) {
-  env.decomposedValues[oldValue] = info;
-  env.valueMapping.map(oldValue, rebuiltValue);
-}
 
 static SmallVector<Value> getComponentValues(const DecomposedValue &info,
                                              ArrayRef<unsigned> indices) {
@@ -248,14 +339,14 @@ static LogicalResult materializePointerResult(Operation &originalOp,
     }
 
     FailureOr<DecomposedValue> info =
-        decompose(clonedResult, env, builder, oldResult.getLoc());
+        env.decomposeValue(clonedResult, builder, oldResult.getLoc());
     if (failed(info))
       return failure();
 
     Value rebuilt = env.policy.recompose(*info, builder, oldResult.getLoc());
     if (!rebuilt)
       return failure();
-    recordDecomposition(oldResult, *info, rebuilt, env);
+    env.recordDecomposition(oldResult, *info, rebuilt);
   }
 
   // The replacement is recorded in the SSA mapping, so a side-effect-free
@@ -311,7 +402,7 @@ static LogicalResult rewriteForOp(scf::ForOp forOp, OpBuilder &builder,
       return failure();
 
     FailureOr<DecomposedValue> initInfo =
-        decompose(forOp.getInitArgs()[idx], env, builder, forOp.getLoc());
+        env.decomposeValue(forOp.getInitArgs()[idx], builder, forOp.getLoc());
     if (failed(initInfo) || failed(castPlannedComponents(
                                 *initInfo, slot.componentIndices,
                                 slot.componentTypes, builder, forOp.getLoc())))
@@ -334,13 +425,13 @@ static LogicalResult rewriteForOp(scf::ForOp forOp, OpBuilder &builder,
       }
       continue;
     }
-    newInitArgs.push_back(remapValue(initArg, env));
+    newInitArgs.push_back(env.remap(initArg));
   }
 
   bool bodyOk = true;
   auto newForOp = builder.create<scf::ForOp>(
-      forOp.getLoc(), remapValue(forOp.getLowerBound(), env),
-      remapValue(forOp.getUpperBound(), env), remapValue(forOp.getStep(), env),
+      forOp.getLoc(), env.remap(forOp.getLowerBound()),
+      env.remap(forOp.getUpperBound()), env.remap(forOp.getStep()),
       newInitArgs,
       [&](OpBuilder &bodyBuilder, Location loc, Value iv, ValueRange args) {
         RewriteEnv bodyEnv = env;
@@ -365,7 +456,7 @@ static LogicalResult rewriteForOp(scf::ForOp forOp, OpBuilder &builder,
               bodyOk = false;
               continue;
             }
-            recordDecomposition(oldArg, *argInfo, rebuilt, bodyEnv);
+            bodyEnv.recordDecomposition(oldArg, *argInfo, rebuilt);
             continue;
           }
           bodyEnv.valueMapping.map(oldArg, args[oldToNewStart[idx]]);
@@ -379,8 +470,8 @@ static LogicalResult rewriteForOp(scf::ForOp forOp, OpBuilder &builder,
         // the read-only loop analysis.
         for (auto [idx, oldOperand] : llvm::enumerate(yieldOp.getOperands())) {
           if (const LoopPointerInfo *info = findLoopInfo(pointerInfos, idx)) {
-            FailureOr<DecomposedValue> nextInfo =
-                decompose(oldOperand, bodyEnv, bodyBuilder, yieldOp.getLoc());
+            FailureOr<DecomposedValue> nextInfo = bodyEnv.decomposeValue(
+                oldOperand, bodyBuilder, yieldOp.getLoc());
             if (failed(nextInfo) ||
                 failed(castPlannedComponents(*nextInfo, info->componentIndices,
                                              info->componentTypes, bodyBuilder,
@@ -395,7 +486,7 @@ static LogicalResult rewriteForOp(scf::ForOp forOp, OpBuilder &builder,
               newYieldOperands.push_back(component);
             continue;
           }
-          newYieldOperands.push_back(remapValue(oldOperand, bodyEnv));
+          newYieldOperands.push_back(bodyEnv.remap(oldOperand));
         }
 
         bodyBuilder.create<scf::YieldOp>(yieldOp.getLoc(), newYieldOperands);
@@ -425,7 +516,7 @@ static LogicalResult rewriteForOp(scf::ForOp forOp, OpBuilder &builder,
         newForOp.erase();
         return failure();
       }
-      recordDecomposition(oldResult, *resultInfo, rebuilt, env);
+      env.recordDecomposition(oldResult, *resultInfo, rebuilt);
       continue;
     }
     env.valueMapping.map(oldResult, newForOp.getResult(oldToNewStart[idx]));
@@ -458,7 +549,7 @@ static LogicalResult rewriteWhileOp(scf::WhileOp whileOp, OpBuilder &builder,
       return failure();
 
     FailureOr<DecomposedValue> initInfo =
-        decompose(whileOp.getInits()[idx], env, builder, whileOp.getLoc());
+        env.decomposeValue(whileOp.getInits()[idx], builder, whileOp.getLoc());
     if (failed(initInfo) ||
         failed(castPlannedComponents(*initInfo, slot.componentIndices,
                                      slot.componentTypes, builder,
@@ -484,7 +575,7 @@ static LogicalResult rewriteWhileOp(scf::WhileOp whileOp, OpBuilder &builder,
       }
       continue;
     }
-    newInits.push_back(remapValue(initArg, env));
+    newInits.push_back(env.remap(initArg));
     newResultTypes.push_back(whileOp.getResult(idx).getType());
   }
 
@@ -512,7 +603,7 @@ static LogicalResult rewriteWhileOp(scf::WhileOp whileOp, OpBuilder &builder,
               bodyOk = false;
               continue;
             }
-            recordDecomposition(oldArg, *argInfo, rebuilt, beforeEnv);
+            beforeEnv.recordDecomposition(oldArg, *argInfo, rebuilt);
             continue;
           }
           beforeEnv.valueMapping.map(oldArg, args[oldToNewStart[idx]]);
@@ -526,7 +617,8 @@ static LogicalResult rewriteWhileOp(scf::WhileOp whileOp, OpBuilder &builder,
         for (auto [idx, oldArg] : llvm::enumerate(conditionOp.getArgs())) {
           if (const LoopPointerInfo *info = findLoopInfo(pointerInfos, idx)) {
             FailureOr<DecomposedValue> conditionInfo =
-                decompose(oldArg, beforeEnv, bodyBuilder, conditionOp.getLoc());
+                beforeEnv.decomposeValue(oldArg, bodyBuilder,
+                                         conditionOp.getLoc());
             if (failed(conditionInfo) ||
                 failed(castPlannedComponents(
                     *conditionInfo, info->componentIndices,
@@ -541,12 +633,12 @@ static LogicalResult rewriteWhileOp(scf::WhileOp whileOp, OpBuilder &builder,
               newConditionArgs.push_back(component);
             continue;
           }
-          newConditionArgs.push_back(remapValue(oldArg, beforeEnv));
+          newConditionArgs.push_back(beforeEnv.remap(oldArg));
         }
 
         bodyBuilder.create<scf::ConditionOp>(
             conditionOp.getLoc(),
-            remapValue(conditionOp.getCondition(), beforeEnv),
+            beforeEnv.remap(conditionOp.getCondition()),
             newConditionArgs);
       },
       [&](OpBuilder &bodyBuilder, Location loc, ValueRange args) {
@@ -570,7 +662,7 @@ static LogicalResult rewriteWhileOp(scf::WhileOp whileOp, OpBuilder &builder,
               bodyOk = false;
               continue;
             }
-            recordDecomposition(oldArg, *argInfo, rebuilt, afterEnv);
+            afterEnv.recordDecomposition(oldArg, *argInfo, rebuilt);
             continue;
           }
           afterEnv.valueMapping.map(oldArg, args[oldToNewStart[idx]]);
@@ -583,8 +675,8 @@ static LogicalResult rewriteWhileOp(scf::WhileOp whileOp, OpBuilder &builder,
         SmallVector<Value> newYieldOperands;
         for (auto [idx, oldOperand] : llvm::enumerate(yieldOp.getOperands())) {
           if (const LoopPointerInfo *info = findLoopInfo(pointerInfos, idx)) {
-            FailureOr<DecomposedValue> nextInfo =
-                decompose(oldOperand, afterEnv, bodyBuilder, yieldOp.getLoc());
+            FailureOr<DecomposedValue> nextInfo = afterEnv.decomposeValue(
+                oldOperand, bodyBuilder, yieldOp.getLoc());
             if (failed(nextInfo) ||
                 failed(castPlannedComponents(*nextInfo, info->componentIndices,
                                              info->componentTypes, bodyBuilder,
@@ -599,7 +691,7 @@ static LogicalResult rewriteWhileOp(scf::WhileOp whileOp, OpBuilder &builder,
               newYieldOperands.push_back(component);
             continue;
           }
-          newYieldOperands.push_back(remapValue(oldOperand, afterEnv));
+          newYieldOperands.push_back(afterEnv.remap(oldOperand));
         }
 
         bodyBuilder.create<scf::YieldOp>(yieldOp.getLoc(), newYieldOperands);
@@ -628,7 +720,7 @@ static LogicalResult rewriteWhileOp(scf::WhileOp whileOp, OpBuilder &builder,
         newWhileOp.erase();
         return failure();
       }
-      recordDecomposition(oldResult, *resultInfo, rebuilt, env);
+      env.recordDecomposition(oldResult, *resultInfo, rebuilt);
       continue;
     }
     env.valueMapping.map(oldResult, newWhileOp.getResult(oldToNewStart[idx]));
@@ -706,8 +798,8 @@ static LogicalResult rewriteIfOp(scf::IfOp ifOp, OpBuilder &builder,
     SmallVector<Value> newYieldOperands;
     for (auto [idx, oldOperand] : llvm::enumerate(oldYield.getOperands())) {
       if (IfPointerInfo *info = findIfInfo(pointerInfos, idx)) {
-        FailureOr<DecomposedValue> branchInfo =
-            decompose(oldOperand, branchEnv, branchBuilder, oldYield.getLoc());
+        FailureOr<DecomposedValue> branchInfo = branchEnv.decomposeValue(
+            oldOperand, branchBuilder, oldYield.getLoc());
         if (failed(branchInfo) ||
             failed(castPlannedComponents(*branchInfo, info->componentIndices,
                                          info->componentTypes, branchBuilder,
@@ -720,7 +812,7 @@ static LogicalResult rewriteIfOp(scf::IfOp ifOp, OpBuilder &builder,
         newYieldOperands.append(values.begin(), values.end());
         continue;
       }
-      newYieldOperands.push_back(remapValue(oldOperand, branchEnv));
+      newYieldOperands.push_back(branchEnv.remap(oldOperand));
     }
     branchBuilder.create<scf::YieldOp>(oldYield.getLoc(), newYieldOperands);
     return success();
@@ -730,7 +822,7 @@ static LogicalResult rewriteIfOp(scf::IfOp ifOp, OpBuilder &builder,
   // new region with independent mappings.
   auto newIfOp =
       builder.create<scf::IfOp>(ifOp.getLoc(), newResultTypes,
-                                remapValue(ifOp.getCondition(), env), hasElse);
+                                env.remap(ifOp.getCondition()), hasElse);
   newIfOp->setAttrs(ifOp->getAttrs());
 
   // The then region always exists, including for a result-less one-arm if.
@@ -787,7 +879,7 @@ static LogicalResult rewriteIfOp(scf::IfOp ifOp, OpBuilder &builder,
         newIfOp.erase();
         return failure();
       }
-      recordDecomposition(oldResult, *resultInfo, rebuilt, env);
+      env.recordDecomposition(oldResult, *resultInfo, rebuilt);
       continue;
     }
     env.valueMapping.map(oldResult, newIfOp.getResult(newResultIndex++));
@@ -817,9 +909,9 @@ collectReplacements(Operation *op, const RewriteEnv &env) {
   SmallVector<Value> replacements;
   replacements.reserve(op->getNumResults());
   for (Value result : op->getResults()) {
-    // Unlike remapValue(), replacement collection must not fall back to the
-    // original result. Such a fallback would hide an unhandled result slot and
-    // ask replaceOp to replace a value with itself.
+    // Unlike RewriteEnv::remap(), replacement collection must not fall back to
+    // the original result. Such a fallback would hide an unhandled result slot
+    // and ask replaceOp to replace a value with itself.
     Value replacement = env.valueMapping.lookupOrNull(result);
     if (!replacement)
       return failure();
