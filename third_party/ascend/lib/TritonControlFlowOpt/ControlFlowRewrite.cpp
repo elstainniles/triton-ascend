@@ -408,6 +408,131 @@ static LogicalResult bindLoopRegionArguments(
   return allArgumentsBound ? success() : failure();
 }
 
+// Rewrites one original loop terminator operand list to the expanded signature
+// used by the replacement loop. Ordinary operands remain one value and are
+// remapped through `regionEnv`. A pointer operand is decomposed, normalized to
+// the component types frozen by analysis, and expanded into the components
+// selected by its `LoopPointerInfo`.
+//
+// Example:
+//   oldOperands = [%next_ptr, %sum]
+//   pointerInfo = {
+//     oldIndex = 0, componentIndices = [4, 5], newIndices = [0, 1]
+//   }
+//   currentRegionArguments = [%current_offset0, %current_offset1, %sum_arg]
+//
+// A valid `%next_ptr` decomposition produces
+// `[%next_offset0, %next_offset1, %mapped_sum]`. If pointer decomposition or
+// component normalization fails, the output instead uses
+// `[%current_offset0, %current_offset1, %mapped_sum]`. The fallback keeps the
+// temporary scf.yield/scf.condition structurally complete until the enclosing
+// failed loop rewrite erases it.
+//
+// The output vector is separate from the LogicalResult intentionally. The
+// function visits every old operand and fills all available fallback positions
+// even after a pointer failure, then reports whether every pointer succeeded.
+static LogicalResult rewriteLoopTerminatorOperands(
+    ValueRange oldOperands, ValueRange currentRegionArguments,
+    ArrayRef<LoopPointerInfo> pointerInfos, OpBuilder &builder, Location loc,
+    RewriteEnv &regionEnv, SmallVectorImpl<Value> &newOperands) {
+  bool allOperandsValid = true;
+  newOperands.clear();
+  newOperands.reserve(currentRegionArguments.size());
+
+  auto appendFallbackComponents = [&](const LoopPointerInfo &pointerInfo) {
+    for (unsigned newIndex : pointerInfo.newIndices)
+      newOperands.push_back(currentRegionArguments[newIndex]);
+  };
+
+  for (auto [oldIndex, oldOperand] : llvm::enumerate(oldOperands)) {
+    const LoopPointerInfo *pointerInfo =
+        findPointerInfoByOldIndex(pointerInfos, oldIndex);
+    if (!pointerInfo) {
+      newOperands.push_back(regionEnv.remap(oldOperand));
+      continue;
+    }
+
+    FailureOr<DecomposedValue> nextInfo =
+        regionEnv.decomposeValue(oldOperand, builder, loc);
+    if (failed(nextInfo) ||
+        failed(castPlannedComponents(
+            *nextInfo, pointerInfo->componentIndices,
+            pointerInfo->componentTypes, builder, loc))) {
+      allOperandsValid = false;
+      appendFallbackComponents(*pointerInfo);
+      continue;
+    }
+
+    FailureOr<SmallVector<Value>> carriedComponentValues = gatherValues(
+        nextInfo->components, pointerInfo->componentIndices);
+    if (failed(carriedComponentValues)) {
+      allOperandsValid = false;
+      appendFallbackComponents(*pointerInfo);
+      continue;
+    }
+    newOperands.append(carriedComponentValues->begin(),
+                       carriedComponentValues->end());
+  }
+
+  return allOperandsValid ? success() : failure();
+}
+
+// Rebuilds and records every result produced by a replacement loop. Ordinary
+// results still occupy one position and are mapped through `oldToNewStart`.
+// A pointer result occupies the positions listed in its `LoopPointerInfo`; the
+// function gathers those components, writes them into the initial descriptor,
+// recomposes the complete pointer, and records both its SSA mapping and current
+// decomposition in `env`.
+//
+// Example:
+//   oldResults = [%old_sum, %old_ptr, %old_flag]
+//   newResults = [%new_sum, %offset0, %offset1, %new_flag]
+//   pointerInfo = {
+//     oldIndex = 1, componentIndices = [4, 5], newIndices = [1, 2]
+//   }
+//   oldToNewStart = [0, 1, 3]
+//
+// The function maps `%old_sum -> %new_sum` and `%old_flag -> %new_flag`. It
+// inserts `%offset0` and `%offset1` into the pointer descriptor, rebuilds
+// `%old_ptr`, and records `%old_ptr -> %rebuilt_ptr` plus that decomposition.
+//
+// The caller must set the builder insertion point after the replacement loop,
+// so any rebuilt pointer dominates later operations. On failure this function
+// returns immediately; the caller still owns and erases the replacement loop.
+static LogicalResult rebuildAndMapLoopResults(
+    ValueRange oldResults, ValueRange newResults,
+    ArrayRef<LoopPointerInfo> pointerInfos,
+    ArrayRef<unsigned> oldToNewStart, OpBuilder &builder, RewriteEnv &env) {
+  for (auto [oldIndex, oldResult] : llvm::enumerate(oldResults)) {
+    const LoopPointerInfo *pointerInfo =
+        findPointerInfoByOldIndex(pointerInfos, oldIndex);
+    if (!pointerInfo) {
+      env.valueMapping.map(oldResult, newResults[oldToNewStart[oldIndex]]);
+      continue;
+    }
+
+    FailureOr<SmallVector<Value>> resultComponentValues =
+        gatherValues(newResults, pointerInfo->newIndices);
+    if (failed(resultComponentValues))
+      return failure();
+
+    FailureOr<DecomposedValue> resultInfo = withReplacedComponents(
+        pointerInfo->initInfo, pointerInfo->componentIndices,
+        *resultComponentValues);
+    if (failed(resultInfo))
+      return failure();
+
+    Value rebuiltPointer =
+        env.policy.recompose(*resultInfo, builder, oldResult.getLoc());
+    if (!rebuiltPointer)
+      return failure();
+
+    env.recordDecomposition(oldResult, *resultInfo, rebuiltPointer);
+  }
+
+  return success();
+}
+
 static LogicalResult rewriteControlFlowOp(Operation *op, OpBuilder &builder,
                                           RewriteEnv &env);
 
@@ -545,36 +670,11 @@ static LogicalResult rewriteForOp(scf::ForOp forOp, OpBuilder &builder,
           bodyOk = false;
 
         SmallVector<Value> newYieldOperands;
-        // Decompose yielded pointers back into the component order selected by
-        // the read-only loop analysis.
-        for (auto [idx, oldOperand] : llvm::enumerate(yieldOp.getOperands())) {
-          if (const LoopPointerInfo *info =
-              findPointerInfoByOldIndex(pointerInfos, idx)) {
-            FailureOr<DecomposedValue> nextInfo = bodyEnv.decomposeValue(
-                oldOperand, bodyBuilder, yieldOp.getLoc());
-            if (failed(nextInfo) ||
-                failed(castPlannedComponents(*nextInfo, info->componentIndices,
-                                             info->componentTypes, bodyBuilder,
-                                             yieldOp.getLoc()))) {
-              bodyOk = false;
-              for (unsigned newIndex : info->newIndices)
-                newYieldOperands.push_back(newRegionArgs[newIndex]);
-              continue;
-            }
-            FailureOr<SmallVector<Value>> nextComponents =
-                gatherValues(nextInfo->components, info->componentIndices);
-            if (failed(nextComponents)) {
-              bodyOk = false;
-              for (unsigned newIndex : info->newIndices)
-                newYieldOperands.push_back(newRegionArgs[newIndex]);
-              continue;
-            }
-            newYieldOperands.append(nextComponents->begin(),
-                                    nextComponents->end());
-            continue;
-          }
-          newYieldOperands.push_back(bodyEnv.remap(oldOperand));
-        }
+        if (failed(rewriteLoopTerminatorOperands(
+                yieldOp.getOperands(), newRegionArgs, pointerInfos,
+                bodyBuilder, yieldOp.getLoc(), bodyEnv,
+                newYieldOperands)))
+          bodyOk = false;
 
         bodyBuilder.create<scf::YieldOp>(yieldOp.getLoc(), newYieldOperands);
       });
@@ -586,33 +686,11 @@ static LogicalResult rewriteForOp(scf::ForOp forOp, OpBuilder &builder,
   }
 
   builder.setInsertionPointAfter(newForOp);
-  // Rebuild pointer results after the new loop and map every untouched result
-  // to the corresponding expanded-result index.
-  for (auto [idx, oldResult] : llvm::enumerate(forOp.getResults())) {
-    if (const LoopPointerInfo *info =
-        findPointerInfoByOldIndex(pointerInfos, idx)) {
-      FailureOr<SmallVector<Value>> resultComponents =
-          gatherValues(newForOp.getResults(), info->newIndices);
-      if (failed(resultComponents)) {
-        newForOp.erase();
-        return failure();
-      }
-      FailureOr<DecomposedValue> resultInfo = withReplacedComponents(
-          info->initInfo, info->componentIndices, *resultComponents);
-      if (failed(resultInfo)) {
-        newForOp.erase();
-        return failure();
-      }
-      Value rebuilt =
-          env.policy.recompose(*resultInfo, builder, oldResult.getLoc());
-      if (!rebuilt) {
-        newForOp.erase();
-        return failure();
-      }
-      env.recordDecomposition(oldResult, *resultInfo, rebuilt);
-      continue;
-    }
-    env.valueMapping.map(oldResult, newForOp.getResult(oldToNewStart[idx]));
+  if (failed(rebuildAndMapLoopResults(
+          forOp.getResults(), newForOp.getResults(), pointerInfos,
+          oldToNewStart, builder, env))) {
+    newForOp.erase();
+    return failure();
   }
 
   return success();
@@ -693,35 +771,11 @@ static LogicalResult rewriteWhileOp(scf::WhileOp whileOp, OpBuilder &builder,
           bodyOk = false;
 
         SmallVector<Value> newConditionArgs;
-        for (auto [idx, oldArg] : llvm::enumerate(conditionOp.getArgs())) {
-          if (const LoopPointerInfo *info =
-              findPointerInfoByOldIndex(pointerInfos, idx)) {
-            FailureOr<DecomposedValue> conditionInfo =
-                beforeEnv.decomposeValue(oldArg, bodyBuilder,
-                                         conditionOp.getLoc());
-            if (failed(conditionInfo) ||
-                failed(castPlannedComponents(
-                    *conditionInfo, info->componentIndices,
-                    info->componentTypes, bodyBuilder, conditionOp.getLoc()))) {
-              bodyOk = false;
-              for (unsigned newIndex : info->newIndices)
-                newConditionArgs.push_back(newRegionArgs[newIndex]);
-              continue;
-            }
-            FailureOr<SmallVector<Value>> conditionComponents = gatherValues(
-                conditionInfo->components, info->componentIndices);
-            if (failed(conditionComponents)) {
-              bodyOk = false;
-              for (unsigned newIndex : info->newIndices)
-                newConditionArgs.push_back(newRegionArgs[newIndex]);
-              continue;
-            }
-            newConditionArgs.append(conditionComponents->begin(),
-                                    conditionComponents->end());
-            continue;
-          }
-          newConditionArgs.push_back(beforeEnv.remap(oldArg));
-        }
+        if (failed(rewriteLoopTerminatorOperands(
+                conditionOp.getArgs(), newRegionArgs, pointerInfos,
+                bodyBuilder, conditionOp.getLoc(), beforeEnv,
+                newConditionArgs)))
+          bodyOk = false;
 
         bodyBuilder.create<scf::ConditionOp>(
             conditionOp.getLoc(),
@@ -742,34 +796,11 @@ static LogicalResult rewriteWhileOp(scf::WhileOp whileOp, OpBuilder &builder,
           bodyOk = false;
 
         SmallVector<Value> newYieldOperands;
-        for (auto [idx, oldOperand] : llvm::enumerate(yieldOp.getOperands())) {
-          if (const LoopPointerInfo *info =
-              findPointerInfoByOldIndex(pointerInfos, idx)) {
-            FailureOr<DecomposedValue> nextInfo = afterEnv.decomposeValue(
-                oldOperand, bodyBuilder, yieldOp.getLoc());
-            if (failed(nextInfo) ||
-                failed(castPlannedComponents(*nextInfo, info->componentIndices,
-                                             info->componentTypes, bodyBuilder,
-                                             yieldOp.getLoc()))) {
-              bodyOk = false;
-              for (unsigned newIndex : info->newIndices)
-                newYieldOperands.push_back(newRegionArgs[newIndex]);
-              continue;
-            }
-            FailureOr<SmallVector<Value>> nextComponents =
-                gatherValues(nextInfo->components, info->componentIndices);
-            if (failed(nextComponents)) {
-              bodyOk = false;
-              for (unsigned newIndex : info->newIndices)
-                newYieldOperands.push_back(newRegionArgs[newIndex]);
-              continue;
-            }
-            newYieldOperands.append(nextComponents->begin(),
-                                    nextComponents->end());
-            continue;
-          }
-          newYieldOperands.push_back(afterEnv.remap(oldOperand));
-        }
+        if (failed(rewriteLoopTerminatorOperands(
+                yieldOp.getOperands(), newRegionArgs, pointerInfos,
+                bodyBuilder, yieldOp.getLoc(), afterEnv,
+                newYieldOperands)))
+          bodyOk = false;
 
         bodyBuilder.create<scf::YieldOp>(yieldOp.getLoc(), newYieldOperands);
       });
@@ -781,31 +812,11 @@ static LogicalResult rewriteWhileOp(scf::WhileOp whileOp, OpBuilder &builder,
   }
 
   builder.setInsertionPointAfter(newWhileOp);
-  for (auto [idx, oldResult] : llvm::enumerate(whileOp.getResults())) {
-    if (const LoopPointerInfo *info =
-        findPointerInfoByOldIndex(pointerInfos, idx)) {
-      FailureOr<SmallVector<Value>> resultComponents =
-          gatherValues(newWhileOp.getResults(), info->newIndices);
-      if (failed(resultComponents)) {
-        newWhileOp.erase();
-        return failure();
-      }
-      FailureOr<DecomposedValue> resultInfo = withReplacedComponents(
-          info->initInfo, info->componentIndices, *resultComponents);
-      if (failed(resultInfo)) {
-        newWhileOp.erase();
-        return failure();
-      }
-      Value rebuilt =
-          env.policy.recompose(*resultInfo, builder, oldResult.getLoc());
-      if (!rebuilt) {
-        newWhileOp.erase();
-        return failure();
-      }
-      env.recordDecomposition(oldResult, *resultInfo, rebuilt);
-      continue;
-    }
-    env.valueMapping.map(oldResult, newWhileOp.getResult(oldToNewStart[idx]));
+  if (failed(rebuildAndMapLoopResults(
+          whileOp.getResults(), newWhileOp.getResults(), pointerInfos,
+          oldToNewStart, builder, env))) {
+    newWhileOp.erase();
+    return failure();
   }
 
   return success();
