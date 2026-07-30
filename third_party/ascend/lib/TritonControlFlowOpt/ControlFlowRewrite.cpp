@@ -306,6 +306,108 @@ static auto findPointerInfoByOldIndex(InfoRange &pointerInfos,
   return nullptr;
 }
 
+// A replacement loop carries selected scalar or tensor descriptor components
+// instead of the original pointer iter-argument. Operations cloned from the
+// original body still expect one pointer-typed block argument, so this function
+// reconstructs that pointer at the replacement region entry.
+// `pointerInfo.newIndices` selects the current component values from
+// `newRegionArguments`, while
+// `pointerInfo.componentIndices` identifies the descriptor fields that those
+// values replace. The untouched fields come from `pointerInfo.initInfo`.
+//
+// On success, this function updates both parts of `regionEnv`: remapping the
+// old region argument produces the rebuilt pointer, and looking up its
+// decomposition returns the descriptor containing the current components.
+// Operations cloned later in the same region can therefore use the complete
+// pointer or its flattened state without referring to the old loop block.
+//
+// Example:
+//   oldRegionArgument = %old_ptr
+//   newRegionArguments = [%ordinary, %current_offset0, %current_offset1]
+//   pointerInfo.newIndices = [1, 2]
+//   pointerInfo.componentIndices = [4, 5]
+//   pointerInfo.initInfo.components =
+//       [shape0, shape1, stride0, stride1, initial_offset0, initial_offset1]
+//
+// The rebuilt descriptor keeps shape and stride, replaces the final two
+// components with the current offsets, and records `%old_ptr -> %rebuilt_ptr`
+// in `regionEnv`. Invalid indices, incompatible component types, or a policy
+// that cannot recompose the descriptor return failure without recording a
+// partial binding; the enclosing loop rewrite owns cleanup of inserted IR.
+static LogicalResult bindLoopCarriedPointer(
+    Value oldRegionArgument, const LoopPointerInfo &pointerInfo,
+    ValueRange newRegionArguments, OpBuilder &builder, Location loc,
+    RewriteEnv &regionEnv) {
+  FailureOr<SmallVector<Value>> carriedComponentValues =
+      gatherValues(newRegionArguments, pointerInfo.newIndices);
+  if (failed(carriedComponentValues))
+    return failure();
+
+  FailureOr<DecomposedValue> argumentInfo = withReplacedComponents(
+      pointerInfo.initInfo, pointerInfo.componentIndices,
+      *carriedComponentValues);
+  if (failed(argumentInfo))
+    return failure();
+
+  Value rebuiltPointer =
+      regionEnv.policy.recompose(*argumentInfo, builder, loc);
+  if (!rebuiltPointer)
+    return failure();
+
+  regionEnv.recordDecomposition(oldRegionArgument, *argumentInfo,
+                                rebuiltPointer);
+  return success();
+}
+
+// Binds every original loop region argument to its replacement-region state.
+// A pointer slot delegates to bindLoopCarriedPointer because one original
+// pointer may occupy several component positions in the new signature. An
+// ordinary slot keeps one SSA value and is mapped through oldToNewStart.
+//
+// Example:
+//   oldRegionArguments = [%x, %old_ptr, %y]
+//   newRegionArguments = [%new_x, %offset0, %offset1, %new_y]
+//   pointerInfos = [{oldIndex = 1, newIndices = [1, 2]}]
+//   oldToNewStart = [0, 1, 3]
+//
+// The resulting environment maps %x to %new_x and %y to %new_y. For
+// %old_ptr, it gathers %offset0 and %offset1, rebuilds the complete pointer,
+// and records both its SSA mapping and current decomposition.
+//
+// The function deliberately visits every argument after a binding failure.
+// The surrounding builder callback may still need all available mappings to
+// construct structurally valid temporary IR before its new loop is erased.
+// It therefore accumulates failure and reports it only after the full range.
+static LogicalResult bindLoopRegionArguments(
+    ValueRange oldRegionArguments, ValueRange newRegionArguments,
+    ArrayRef<LoopPointerInfo> pointerInfos,
+    ArrayRef<unsigned> oldToNewStart, OpBuilder &builder, Location loc,
+    RewriteEnv &regionEnv) {
+  bool allArgumentsBound = true;
+  for (auto [oldIndex, oldRegionArgument] :
+       llvm::enumerate(oldRegionArguments)) {
+    const LoopPointerInfo *pointerInfo =
+        findPointerInfoByOldIndex(pointerInfos, oldIndex);
+    if (pointerInfo) {
+      if (failed(bindLoopCarriedPointer(
+              oldRegionArgument, *pointerInfo, newRegionArguments, builder,
+              loc, regionEnv)))
+        allArgumentsBound = false;
+      continue;
+    }
+
+    if (oldIndex >= oldToNewStart.size() ||
+        oldToNewStart[oldIndex] >= newRegionArguments.size()) {
+      allArgumentsBound = false;
+      continue;
+    }
+    regionEnv.valueMapping.map(
+        oldRegionArgument,
+        newRegionArguments[oldToNewStart[oldIndex]]);
+  }
+  return allArgumentsBound ? success() : failure();
+}
+
 static LogicalResult rewriteControlFlowOp(Operation *op, OpBuilder &builder,
                                           RewriteEnv &env);
 
@@ -428,39 +530,16 @@ static LogicalResult rewriteForOp(scf::ForOp forOp, OpBuilder &builder,
       forOp.getLoc(), env.remap(forOp.getLowerBound()),
       env.remap(forOp.getUpperBound()), env.remap(forOp.getStep()),
       newInitArgs,
-      [&](OpBuilder &bodyBuilder, Location loc, Value iv, ValueRange args) {
+      [&](OpBuilder &bodyBuilder, Location loc, Value iv,
+          ValueRange newRegionArgs) {
         RewriteEnv bodyEnv = env;
         bodyEnv.valueMapping.map(forOp.getInductionVar(), iv);
 
-        // Reconstruct the original iter-argument type at region entry before
-        // cloning users. This keeps the body semantics independent of the
-        // signature expansion.
-        for (auto [idx, oldArg] : llvm::enumerate(forOp.getRegionIterArgs())) {
-          if (const LoopPointerInfo *info =
-              findPointerInfoByOldIndex(pointerInfos, idx)) {
-            FailureOr<SmallVector<Value>> carriedComponentValues =
-                gatherValues(args, info->newIndices);
-            if (failed(carriedComponentValues)) {
-              bodyOk = false;
-              continue;
-            }
-            FailureOr<DecomposedValue> argInfo = withReplacedComponents(
-                info->initInfo, info->componentIndices,
-                *carriedComponentValues);
-            if (failed(argInfo)) {
-              bodyOk = false;
-              continue;
-            }
-            Value rebuilt = env.policy.recompose(*argInfo, bodyBuilder, loc);
-            if (!rebuilt) {
-              bodyOk = false;
-              continue;
-            }
-            bodyEnv.recordDecomposition(oldArg, *argInfo, rebuilt);
-            continue;
-          }
-          bodyEnv.valueMapping.map(oldArg, args[oldToNewStart[idx]]);
-        }
+        // Bind pointer and ordinary iter-arguments before cloning body users.
+        if (failed(bindLoopRegionArguments(
+                forOp.getRegionIterArgs(), newRegionArgs, pointerInfos,
+                oldToNewStart, bodyBuilder, loc, bodyEnv)))
+          bodyOk = false;
 
         if (failed(rewriteBodyOps(forOp.getBody(), bodyBuilder, bodyEnv)))
           bodyOk = false;
@@ -479,7 +558,7 @@ static LogicalResult rewriteForOp(scf::ForOp forOp, OpBuilder &builder,
                                              yieldOp.getLoc()))) {
               bodyOk = false;
               for (unsigned newIndex : info->newIndices)
-                newYieldOperands.push_back(args[newIndex]);
+                newYieldOperands.push_back(newRegionArgs[newIndex]);
               continue;
             }
             FailureOr<SmallVector<Value>> nextComponents =
@@ -487,7 +566,7 @@ static LogicalResult rewriteForOp(scf::ForOp forOp, OpBuilder &builder,
             if (failed(nextComponents)) {
               bodyOk = false;
               for (unsigned newIndex : info->newIndices)
-                newYieldOperands.push_back(args[newIndex]);
+                newYieldOperands.push_back(newRegionArgs[newIndex]);
               continue;
             }
             newYieldOperands.append(nextComponents->begin(),
@@ -600,37 +679,14 @@ static LogicalResult rewriteWhileOp(scf::WhileOp whileOp, OpBuilder &builder,
   bool bodyOk = true;
   auto newWhileOp = builder.create<scf::WhileOp>(
       whileOp.getLoc(), newResultTypes, newInits,
-      [&](OpBuilder &bodyBuilder, Location loc, ValueRange args) {
+      [&](OpBuilder &bodyBuilder, Location loc, ValueRange newRegionArgs) {
         RewriteEnv beforeEnv = env;
-        // Rebuild pointer values at the before-region boundary, rewrite the
-        // body, then decompose the values forwarded by scf.condition.
-        for (auto [idx, oldArg] :
-             llvm::enumerate(whileOp.getBeforeArguments())) {
-          if (const LoopPointerInfo *info =
-              findPointerInfoByOldIndex(pointerInfos, idx)) {
-            FailureOr<SmallVector<Value>> carriedComponentValues =
-                gatherValues(args, info->newIndices);
-            if (failed(carriedComponentValues)) {
-              bodyOk = false;
-              continue;
-            }
-            FailureOr<DecomposedValue> argInfo = withReplacedComponents(
-                info->initInfo, info->componentIndices,
-                *carriedComponentValues);
-            if (failed(argInfo)) {
-              bodyOk = false;
-              continue;
-            }
-            Value rebuilt = env.policy.recompose(*argInfo, bodyBuilder, loc);
-            if (!rebuilt) {
-              bodyOk = false;
-              continue;
-            }
-            beforeEnv.recordDecomposition(oldArg, *argInfo, rebuilt);
-            continue;
-          }
-          beforeEnv.valueMapping.map(oldArg, args[oldToNewStart[idx]]);
-        }
+        // Bind the before-region arguments, then rewrite the body and the
+        // values forwarded by scf.condition.
+        if (failed(bindLoopRegionArguments(
+                whileOp.getBeforeArguments(), newRegionArgs, pointerInfos,
+                oldToNewStart, bodyBuilder, loc, beforeEnv)))
+          bodyOk = false;
 
         if (failed(rewriteBodyOps(whileOp.getBeforeBody(), bodyBuilder,
                                   beforeEnv)))
@@ -649,7 +705,7 @@ static LogicalResult rewriteWhileOp(scf::WhileOp whileOp, OpBuilder &builder,
                     info->componentTypes, bodyBuilder, conditionOp.getLoc()))) {
               bodyOk = false;
               for (unsigned newIndex : info->newIndices)
-                newConditionArgs.push_back(args[newIndex]);
+                newConditionArgs.push_back(newRegionArgs[newIndex]);
               continue;
             }
             FailureOr<SmallVector<Value>> conditionComponents = gatherValues(
@@ -657,7 +713,7 @@ static LogicalResult rewriteWhileOp(scf::WhileOp whileOp, OpBuilder &builder,
             if (failed(conditionComponents)) {
               bodyOk = false;
               for (unsigned newIndex : info->newIndices)
-                newConditionArgs.push_back(args[newIndex]);
+                newConditionArgs.push_back(newRegionArgs[newIndex]);
               continue;
             }
             newConditionArgs.append(conditionComponents->begin(),
@@ -672,37 +728,14 @@ static LogicalResult rewriteWhileOp(scf::WhileOp whileOp, OpBuilder &builder,
             beforeEnv.remap(conditionOp.getCondition()),
             newConditionArgs);
       },
-      [&](OpBuilder &bodyBuilder, Location loc, ValueRange args) {
+      [&](OpBuilder &bodyBuilder, Location loc, ValueRange newRegionArgs) {
         RewriteEnv afterEnv = env;
-        // Apply the same reconstruction/decomposition contract to the after
-        // region and its backedge yield.
-        for (auto [idx, oldArg] :
-             llvm::enumerate(whileOp.getAfterArguments())) {
-          if (const LoopPointerInfo *info =
-              findPointerInfoByOldIndex(pointerInfos, idx)) {
-            FailureOr<SmallVector<Value>> carriedComponentValues =
-                gatherValues(args, info->newIndices);
-            if (failed(carriedComponentValues)) {
-              bodyOk = false;
-              continue;
-            }
-            FailureOr<DecomposedValue> argInfo = withReplacedComponents(
-                info->initInfo, info->componentIndices,
-                *carriedComponentValues);
-            if (failed(argInfo)) {
-              bodyOk = false;
-              continue;
-            }
-            Value rebuilt = env.policy.recompose(*argInfo, bodyBuilder, loc);
-            if (!rebuilt) {
-              bodyOk = false;
-              continue;
-            }
-            afterEnv.recordDecomposition(oldArg, *argInfo, rebuilt);
-            continue;
-          }
-          afterEnv.valueMapping.map(oldArg, args[oldToNewStart[idx]]);
-        }
+        // Bind the after-region arguments before rewriting the body and its
+        // backedge yield.
+        if (failed(bindLoopRegionArguments(
+                whileOp.getAfterArguments(), newRegionArgs, pointerInfos,
+                oldToNewStart, bodyBuilder, loc, afterEnv)))
+          bodyOk = false;
 
         if (failed(
                 rewriteBodyOps(whileOp.getAfterBody(), bodyBuilder, afterEnv)))
@@ -720,7 +753,7 @@ static LogicalResult rewriteWhileOp(scf::WhileOp whileOp, OpBuilder &builder,
                                              yieldOp.getLoc()))) {
               bodyOk = false;
               for (unsigned newIndex : info->newIndices)
-                newYieldOperands.push_back(args[newIndex]);
+                newYieldOperands.push_back(newRegionArgs[newIndex]);
               continue;
             }
             FailureOr<SmallVector<Value>> nextComponents =
@@ -728,7 +761,7 @@ static LogicalResult rewriteWhileOp(scf::WhileOp whileOp, OpBuilder &builder,
             if (failed(nextComponents)) {
               bodyOk = false;
               for (unsigned newIndex : info->newIndices)
-                newYieldOperands.push_back(args[newIndex]);
+                newYieldOperands.push_back(newRegionArgs[newIndex]);
               continue;
             }
             newYieldOperands.append(nextComponents->begin(),
