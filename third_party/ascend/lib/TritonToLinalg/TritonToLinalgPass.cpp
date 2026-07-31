@@ -563,6 +563,14 @@ void TritonToLinalgPass::addDynamicLegal(
     return true;
   });
 
+  target.addDynamicallyLegalOp<scf::IfOp>([](scf::IfOp op) {
+    auto isPointer = [](Type type) {
+      return isa<triton::PointerType>(type);
+    };
+    return llvm::none_of(op->getOperandTypes(), isPointer) &&
+           llvm::none_of(op->getResultTypes(), isPointer);
+  });
+
   target.addDynamicallyLegalOp<scf::ForOp, scf::YieldOp>([](Operation *op) {
     return llvm::all_of(op->getOperandTypes(), [](Type t) {
       if (isa<triton::PointerType>(t)) {
@@ -713,6 +721,8 @@ void TritonToLinalgPass::populateTritonToLinalgConversionPatterns(
   patterns.add<TTOpConverters::LoopConverter<scf::WhileOp>>(
       patterns.getContext());
   patterns.add<TTOpConverters::YieldConverter>(patterns.getContext());
+  patterns.add<TTOpConverters::IfConverter>(typeConverter,
+                                             patterns.getContext());
 
   patterns.add<TTOpConverters::DeviceAssertConverter>(patterns.getContext());
   patterns.add<TTOpConverters::DevicePrintConverter>(patterns.getContext());

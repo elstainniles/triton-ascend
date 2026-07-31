@@ -59,6 +59,10 @@
 namespace mlir {
 namespace triton {
 
+static bool isControlFlowPointerTransport(Operation *op) {
+  return op && isa<scf::IfOp, scf::ForOp, scf::WhileOp>(op);
+}
+
 // MemAccType selectMaxMemAccTy(const MemAccType &v1, const MemAccType &v2) {
 //   return (v1 > v2) ? v1 : v2;
 // }
@@ -422,8 +426,12 @@ void BlockDataParser::parse(
   //
   if (isa<triton::PointerType>(operand.getType())) {
     // Just consider two state: ptr<scalar> and ptr<tensor<scalar>>
-    auto remappedPtr = rewriter.getRemappedValue(operand);
-    assert(remappedPtr);
+    Value remappedPtr = rewriter.getRemappedValue(operand);
+    if (!remappedPtr) {
+      if (Operation *definingOp = operand.getDefiningOp())
+        definingOp->emitError("scalar pointer has no converted value");
+      return;
+    }
     if (auto op = operand.getDefiningOp()) {
       if (auto addPtrOp = dyn_cast<triton::AddPtrOp>(op)) {
         parseAddPtr(addPtrOp, data, loc, rewriter, known);
@@ -440,11 +448,18 @@ void BlockDataParser::parse(
         data.setSource(remappedPtr);
       } else if (isDistributedTypeCustomOp(op)) {
         data.setSource(remappedPtr);
+      } else if (isControlFlowPointerTransport(op)) {
+        if (!isa<BaseMemRefType>(remappedPtr.getType())) {
+          op->emitError("SCF pointer transport did not convert to a memref");
+          return;
+        }
+        data.setSource(remappedPtr);
       } else {
-        LLVM_DEBUG({ llvm::dbgs() << operand << "\n"; });
-        llvm_unreachable("Unexpected operand defining operation, a scalar "
-                         "pointer can only be produced by AddPtrOp or direct "
-                         "block ptr or hivm CustomOp");
+        op->emitError()
+            << "unsupported scalar pointer producer '" << op->getName()
+            << "' with original type " << operand.getType()
+            << " and converted type " << remappedPtr.getType();
+        return;
       }
     } else {
       data.setSource(remappedPtr);
@@ -1390,19 +1405,31 @@ void BlockDataParser::rewriteAddPtr(
   rewriter.restoreInsertionPoint(insertPoint);
 }
 
-OpFoldResult
-accumulatePotentialOffsetOnBase(triton::MakeTensorPtrOp op, Value base,
-                                OpFoldResult offset,
-                                ConversionPatternRewriter &rewriter) {
-  if (auto baseRecast = base.getDefiningOp<memref::ReinterpretCastOp>()) {
-    assert(isa<triton::AddPtrOp>(op.getBase().getDefiningOp()) &&
-           "base of MakeTensorPtrOp only comes from native ptr or AddPtrOp");
+static FailureOr<OpFoldResult>
+getBaseMemRefOffset(Value convertedBase, Location loc,
+                    ConversionPatternRewriter &rewriter) {
+  auto memrefType = dyn_cast<MemRefType>(convertedBase.getType());
+  if (!memrefType)
+    return failure();
 
-    return addOpFoldResult(offset, baseRecast.getConstifiedMixedOffset(),
-                           op.getLoc(), rewriter, rewriter.getIndexType());
-  }
+  // Preserve the existing foldable path for a directly converted tt.addptr.
+  // Reinterpret-casting a reinterpret cast does not compose offsets, so the
+  // first cast's absolute offset must be carried into the new descriptor.
+  if (auto baseRecast =
+          convertedBase.getDefiningOp<memref::ReinterpretCastOp>())
+    return baseRecast.getConstifiedMixedOffset();
 
-  return offset;
+  auto stridedLayout = memrefType.getStridesAndOffset();
+  int64_t staticOffset = stridedLayout.second;
+  if (!ShapedType::isDynamic(staticOffset))
+    return OpFoldResult(rewriter.getIndexAttr(staticOffset));
+
+  // An scf.if/for/while result hides the selected descriptor's defining op.
+  // Read its runtime offset from the memref descriptor instead of inspecting
+  // the original Triton pointer producer.
+  auto metadata = rewriter.create<memref::ExtractStridedMetadataOp>(
+      loc, convertedBase);
+  return OpFoldResult(metadata.getOffset());
 }
 
 void BlockDataParser::rewriteCustomOp(
@@ -1488,9 +1515,9 @@ void BlockDataParser::rewriteCustomOp(
 }
 
 // Design for load/store boundary_check.
-memref::ReinterpretCastOp createRedundantOp(triton::MakeTensorPtrOp op,
-                                            ConversionPatternRewriter &rewriter,
-                                            BlockData &data) {
+memref::ReinterpretCastOp
+createRedundantOp(triton::MakeTensorPtrOp op, OpFoldResult sourceBaseOffset,
+                  ConversionPatternRewriter &rewriter, BlockData &data) {
   auto loc = op.getLoc();
   // to do boundary_check in tt.load, we need to keep the parent tensor's
   // shape info in the IR.
@@ -1508,10 +1535,10 @@ memref::ReinterpretCastOp createRedundantOp(triton::MakeTensorPtrOp op,
   // dim offset from base is initialized as zero.
   SmallVector<OpFoldResult> curOffsets(op.getOffsets().size(),
                                        rewriter.getIndexAttr(0));
-  // Just accumulate base potential offset
-  curOffsets.front() = accumulatePotentialOffsetOnBase(
-      op, rewriter.getRemappedValue(op.getBase()), curOffsets.front(),
-      rewriter);
+  // Both the full-shape descriptor and the final block descriptor use the
+  // same absolute source offset. Reusing this value avoids both dropping it
+  // across SCF and accidentally composing it twice.
+  curOffsets.front() = sourceBaseOffset;
 
   for (auto offset : curOffsets) {
     data.getOffsetsRef().push_back(offset);
@@ -1533,25 +1560,39 @@ memref::ReinterpretCastOp createRedundantOp(triton::MakeTensorPtrOp op,
   return castOp;
 }
 
-void BlockDataParser::rewriteMakeTensorPtrOp(
-    triton::MakeTensorPtrOp op, Value base, ConversionPatternRewriter &rewriter,
+LogicalResult BlockDataParser::rewriteMakeTensorPtrOp(
+    triton::MakeTensorPtrOp op, Value convertedBase,
+    ConversionPatternRewriter &rewriter,
     llvm::SmallDenseMap<Value, BlockData> &known) {
+  if (!convertedBase || !isa<BaseMemRefType>(convertedBase.getType())) {
+    op.emitOpError("expected the converted base to be a memref descriptor");
+    return failure();
+  }
   Location loc = op.getLoc();
   BlockData data;
 
-  auto orderSize = op.getOrder().size();
-
-  // Handle base is defined by tt.bitcast
+  // Parse the original producer only for semantic information such as a
+  // bitcast element type. The runtime source always comes from the conversion
+  // adaptor so SCF-selected memref descriptors are not bypassed.
   BlockDataParser::parse(op.getBase(), data, loc, rewriter, known);
+  if (!data.hasSource()) {
+    op.emitOpError("failed to resolve the converted scalar base");
+    return failure();
+  }
   if (data.hasResElemTy()) {
-    auto memrefType = dyn_cast<BaseMemRefType>(data.getSourceRef().getType())
-                          .cloneWith(std::nullopt, data.getResElemTyRef());
+    auto sourceType = dyn_cast<BaseMemRefType>(data.getSourceRef().getType());
+    if (!sourceType) {
+      op.emitOpError("bitcast base did not resolve to a memref descriptor");
+      return failure();
+    }
+    auto memrefType =
+        sourceType.cloneWith(std::nullopt, data.getResElemTyRef());
     UnrealizedConversionCastOp castOp =
-        rewriter.create<mlir::UnrealizedConversionCastOp>(loc, memrefType,
-                                                          data.getSourceRef());
+        rewriter.create<mlir::UnrealizedConversionCastOp>(
+            loc, memrefType, data.getSourceRef());
     data.setSource(castOp.getOutputs()[0]);
   } else {
-    data.setSource(rewriter.getRemappedValue(op.getBase()));
+    data.setSource(convertedBase);
   }
 
   data.getOffsetsRef() =
@@ -1572,20 +1613,20 @@ void BlockDataParser::rewriteMakeTensorPtrOp(
     newOffsets.push_back(mulOpFoldResult(offset, stride, loc, rewriter,
                                          rewriter.getIndexType()));
 
-  // 1. Consider that current base ptr may comes from `triton::AddPtrOp`,
-  // which have been converted to `memref::ReinterpretCastOp` with 1D
-  // shape([1,]) by `AddPtrConverter`.
-  // 2. While here would also convert `triton::MakeTensorPtrOp` to
-  // `memref::ReinterpretCastOp`, it will create use-def on double recast
-  // which means offset&size&stride info of first one will be dropped in terms
-  // of memref recast op fold specification.
-  //
-  // Conclusion with above two:
-  // Base of MakeTensorPtrOp has been seen as origin base, so it should
-  // reserve offset of first recast if it exists.
-  // Here extract the offset of first recast and add it to highest dimension
-  newOffsets.front() =
-      accumulatePotentialOffsetOnBase(op, base, newOffsets.front(), rewriter);
+  if (newOffsets.empty()) {
+    op.emitOpError("expected at least one block pointer dimension");
+    return failure();
+  }
+
+  FailureOr<OpFoldResult> sourceBaseOffset =
+      getBaseMemRefOffset(convertedBase, loc, rewriter);
+  if (failed(sourceBaseOffset)) {
+    op.emitOpError("could not extract the converted base offset");
+    return failure();
+  }
+  newOffsets.front() = addOpFoldResult(
+      newOffsets.front(), *sourceBaseOffset, loc, rewriter,
+      rewriter.getIndexType());
 
   data.getOffsetsRef().clear();
 
@@ -1611,7 +1652,8 @@ void BlockDataParser::rewriteMakeTensorPtrOp(
 
   // special handling for davinci
   // create redundant reinterpret_cast op for record shape info
-  auto redundantOp = createRedundantOp(op, rewriter, data);
+  auto redundantOp =
+      createRedundantOp(op, *sourceBaseOffset, rewriter, data);
   redundantOp->setAttr("tensor_ptr_full_shape", rewriter.getUnitAttr());
 
   // create reinterpret_cast op for the target block
@@ -1701,6 +1743,8 @@ void BlockDataParser::rewriteMakeTensorPtrOp(
     }
     rewriter.create<func::CallOp>(loc, funcName, dstElemTy, args);
   }
+
+  return success();
 }
 
 void BlockDataParser::rewriteAdvanceOp(
@@ -2458,10 +2502,11 @@ void BlockDataParser::rewriteLoopOp(
                      dyn_cast<triton::MakeTensorPtrOp>(bodyOp)) {
         ConversionPatternRewriter::InsertionGuard guard(rewriter);
         rewriter.setInsertionPoint(makeTensorPtrOp);
-        rewriteMakeTensorPtrOp(
-            makeTensorPtrOp,
-            rewriter.getRemappedValue(makeTensorPtrOp.getBase()), rewriter,
-            known);
+        if (failed(rewriteMakeTensorPtrOp(
+                makeTensorPtrOp,
+                rewriter.getRemappedValue(makeTensorPtrOp.getBase()),
+                rewriter, known)))
+          return;
       } else if (auto loopOp = dyn_cast<LoopLikeOpInterface>(bodyOp);
                  loopOp && !loopOp->hasAttr("ExtractedLoadOrStore")) {
         ConversionPatternRewriter::InsertionGuard guard(rewriter);

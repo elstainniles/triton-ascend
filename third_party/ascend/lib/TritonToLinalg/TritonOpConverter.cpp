@@ -171,10 +171,106 @@ TransposeConverter::matchAndRewrite(triton::TransOp op, OpAdaptor adaptor,
   return success();
 }
 
+static FailureOr<Type> getIfResultCarrierType(
+    Type originalType, const TypeConverter &typeConverter) {
+  auto pointerType = dyn_cast<triton::PointerType>(originalType);
+  if (!pointerType)
+    return originalType;
+  if (isa<ShapedType>(pointerType.getPointeeType()))
+    return failure();
+
+  Type convertedType = typeConverter.convertType(originalType);
+  if (!convertedType)
+    return failure();
+
+  auto memrefType = dyn_cast<MemRefType>(convertedType);
+  if (!memrefType)
+    return failure();
+
+  // An scf.if may select a plain pointer or an AddPtr-derived pointer. Use a
+  // local, maximally dynamic strided descriptor so both branch values have a
+  // common type while preserving the selected pointer's runtime offset.
+  SmallVector<int64_t> dynamicStrides(memrefType.getRank(),
+                                      ShapedType::kDynamic);
+  auto layout = StridedLayoutAttr::get(
+      originalType.getContext(), ShapedType::kDynamic, dynamicStrides);
+  return Type(MemRefType::get(memrefType.getShape(),
+                              memrefType.getElementType(), layout,
+                              memrefType.getMemorySpace()));
+}
+
+LogicalResult
+IfConverter::matchAndRewrite(scf::IfOp op, OpAdaptor adaptor,
+                             ConversionPatternRewriter &rewriter) const {
+  const TypeConverter *typeConverter = getTypeConverter();
+  if (!typeConverter)
+    return rewriter.notifyMatchFailure(op, "requires a type converter");
+  if (llvm::none_of(op.getResultTypes(),
+                    [](Type type) { return isa<triton::PointerType>(type); }))
+    return failure();
+
+  SmallVector<Type> convertedResultTypes;
+  convertedResultTypes.reserve(op.getNumResults());
+  for (Type resultType : op.getResultTypes()) {
+    FailureOr<Type> convertedType =
+        getIfResultCarrierType(resultType, *typeConverter);
+    if (failed(convertedType))
+      return rewriter.notifyMatchFailure(op,
+                                         "could not convert an if result type");
+    convertedResultTypes.push_back(*convertedType);
+  }
+
+  auto newIfOp = rewriter.create<scf::IfOp>(
+      op.getLoc(), convertedResultTypes, adaptor.getCondition(),
+      /*withElseRegion=*/true);
+  newIfOp->setAttrs(op->getAttrs());
+
+  // Move the original regions instead of cloning them. Besides preserving
+  // side effects, this keeps nested operations in the conversion driver's
+  // worklist so their operands are remapped normally.
+  rewriter.eraseBlock(newIfOp.thenBlock());
+  rewriter.eraseBlock(newIfOp.elseBlock());
+  rewriter.inlineRegionBefore(op.getThenRegion(), newIfOp.getThenRegion(),
+                              newIfOp.getThenRegion().end());
+  rewriter.inlineRegionBefore(op.getElseRegion(), newIfOp.getElseRegion(),
+                              newIfOp.getElseRegion().end());
+  rewriter.replaceOp(op, newIfOp.getResults());
+  return success();
+}
+
 LogicalResult
 YieldConverter::matchAndRewrite(scf::YieldOp op, OpAdaptor adaptor,
                                 ConversionPatternRewriter &rewriter) const {
-  rewriter.replaceOpWithNewOp<scf::YieldOp>(op, adaptor.getOperands());
+  SmallVector<Value> convertedOperands(adaptor.getOperands());
+
+  // Pointer-bearing scf.if uses a dynamic strided carrier at the join. Cast
+  // each converted branch value to that carrier so plain function arguments
+  // and AddPtr reinterpret casts can be yielded by the same operation.
+  if (auto parentIf = dyn_cast<scf::IfOp>(op->getParentOp());
+      parentIf &&
+      llvm::none_of(parentIf.getResultTypes(),
+                    [](Type type) { return isa<triton::PointerType>(type); })) {
+    if (parentIf.getNumResults() != convertedOperands.size())
+      return rewriter.notifyMatchFailure(op,
+                                         "yield/result arity does not match");
+
+    for (auto [index, targetType] :
+         llvm::enumerate(parentIf.getResultTypes())) {
+      Value &operand = convertedOperands[index];
+      if (operand.getType() == targetType)
+        continue;
+      auto sourceType = dyn_cast<MemRefType>(operand.getType());
+      auto targetMemrefType = dyn_cast<MemRefType>(targetType);
+      if (!sourceType || !targetMemrefType ||
+          !memref::CastOp::areCastCompatible(sourceType, targetMemrefType))
+        return rewriter.notifyMatchFailure(
+            op, "converted yield operand is incompatible with if result");
+      operand = rewriter.create<memref::CastOp>(op.getLoc(), targetMemrefType,
+                                                operand);
+    }
+  }
+
+  rewriter.replaceOpWithNewOp<scf::YieldOp>(op, convertedOperands);
   return success();
 }
 
@@ -195,9 +291,8 @@ LogicalResult MakeTensorPtrConverter::matchAndRewrite(
     triton::MakeTensorPtrOp op, OpAdaptor adaptor,
     ConversionPatternRewriter &rewriter) const {
   llvm::SmallDenseMap<Value, BlockData> known;
-  BlockDataParser::rewriteMakeTensorPtrOp(op, adaptor.getBase(), rewriter,
-                                          known);
-  return success();
+  return BlockDataParser::rewriteMakeTensorPtrOp(
+      op, adaptor.getBase(), rewriter, known);
 }
 
 LogicalResult PreciseDivConverter::matchAndRewrite(

@@ -535,6 +535,29 @@ public:
                   ConversionPatternRewriter &rewriter) const override;
 };
 
+// Rebuild an scf.if whose result list contains Triton scalar pointers so the
+// control-flow boundary carries memref descriptors instead. The original
+// branch regions are moved into the new operation, preserving side effects and
+// allowing the conversion driver to rewrite each scf.yield operand in place.
+//
+// Example:
+//   %base = scf.if %cond -> !tt.ptr<f32> {
+//     scf.yield %lhs : !tt.ptr<f32>
+//   } else {
+//     scf.yield %rhs : !tt.ptr<f32>
+//   }
+// becomes an scf.if returning a rank-one strided memref descriptor. A fully
+// dynamic offset and stride let the same result represent either a plain base
+// pointer or a pointer produced by tt.addptr without losing address metadata.
+class IfConverter : public OpConversionPattern<scf::IfOp> {
+public:
+  using OpConversionPattern<scf::IfOp>::OpConversionPattern;
+
+  LogicalResult
+  matchAndRewrite(scf::IfOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override;
+};
+
 class YieldConverter : public OpConversionPattern<scf::YieldOp> {
 public:
   using OpConversionPattern<scf::YieldOp>::OpConversionPattern;
