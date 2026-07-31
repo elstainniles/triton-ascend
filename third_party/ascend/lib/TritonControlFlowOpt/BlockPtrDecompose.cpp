@@ -49,9 +49,9 @@ static constexpr unsigned getOffsetStart(unsigned rank) {
 ///   components = [base, shape..., strides..., offsets...]
 ///   attributes = [order]
 ///
-/// Loops currently carry only `offsets`; base, shape, and strides must remain
-/// identical across a backedge. An scf.if may select shape, stride, or offset
-/// components whose SSA values differ, but its base must remain identical.
+/// Every supported SCF boundary carries all components in this exact order.
+/// `order` remains policy-owned static metadata and must agree on every
+/// incoming path.
 ///
 /// Keep rank/layout checks local to this file: the generic control-flow
 /// machinery intentionally does not know the descriptor format of a policy.
@@ -75,6 +75,18 @@ static bool hasValidLayout(const StateT &state) {
   return succeeded(rank) && state.components.size() == 1 + 3 * *rank &&
          state.attributes.size() == 1 &&
          isa<DenseI32ArrayAttr>(state.attributes.front());
+}
+
+/// Returns the complete, ordered descriptor range used to expand one
+/// block-pointer control-flow slot. Keeping this policy-local prevents the
+/// generic SCF rewrite from depending on the BlockPtr field layout.
+static SmallVector<unsigned>
+getAllComponentIndices(const AnalyzedValue &value) {
+  SmallVector<unsigned> indices;
+  indices.reserve(value.components.size());
+  for (unsigned index = 0; index < value.components.size(); ++index)
+    indices.push_back(index);
+  return indices;
 }
 
 class BlockPtrPolicy final : public ControlFlowRewritePolicy {
@@ -147,13 +159,9 @@ public:
   getLoopCandidateComponents(const AnalyzedValue &value) const override {
     if (!hasValidLayout(value))
       return failure();
-    unsigned rank = *getRank(value.originalType);
-    SmallVector<unsigned> indices;
-    // Only the final rank entries (offsets) are legal loop-carried state in the
-    // current block-pointer model.
-    for (unsigned dimension = 0; dimension < rank; ++dimension)
-      indices.push_back(getOffsetStart(rank) + dimension);
-    return indices;
+    // A BlockPtr never crosses a supported loop boundary directly. Its entire
+    // descriptor becomes ordinary loop-carried SSA state.
+    return getAllComponentIndices(value);
   }
 
   FailureOr<SmallVector<unsigned>>
@@ -168,36 +176,16 @@ public:
         initial.attributes != next.attributes)
       return failure();
 
-    unsigned rank = *getRank(initial.originalType);
-    // The current implementation does not expand shape or stride iter_args.
-    // Reject a loop that changes either instead of silently reconstructing a
-    // descriptor with stale values.
-    for (unsigned index = kBaseComponent; index < getOffsetStart(rank);
-         ++index) {
-      const AnalyzedComponent &initialComponent = initial.components[index];
-      const AnalyzedComponent &argumentComponent =
-          regionArgument.components[index];
-      const AnalyzedComponent &nextComponent = next.components[index];
-      if (initialComponent.type != argumentComponent.type ||
-          initialComponent.type != nextComponent.type ||
-          initialComponent.identity != argumentComponent.identity ||
-          initialComponent.identity != nextComponent.identity)
-        return failure();
-    }
-
-    SmallVector<unsigned> transferred;
-    // An offset is carried only if the backedge state depends on the region
-    // argument. Constant or unchanged offsets stay outside the signature.
-    for (unsigned dimension = 0; dimension < rank; ++dimension) {
-      unsigned index = getOffsetStart(rank) + dimension;
+    // Full descriptor transfer permits every field to change, but each
+    // position must retain the strict type required by tt.make_tensor_ptr.
+    for (unsigned index = 0; index < initial.components.size(); ++index) {
       if (failed(joinComponentTypes(initial.components[index].type,
+                                    regionArgument.components[index].type)) ||
+          failed(joinComponentTypes(initial.components[index].type,
                                     next.components[index].type)))
         return failure();
-      if (regionArgument.components[index].identity !=
-          next.components[index].identity)
-        transferred.push_back(index);
     }
-    return transferred;
+    return getAllComponentIndices(initial);
   }
 
   FailureOr<SmallVector<unsigned>>
@@ -205,28 +193,18 @@ public:
                              const AnalyzedValue &elseValue) const override {
     if (!hasValidLayout(thenValue) || !hasValidLayout(elseValue) ||
         thenValue.originalType != elseValue.originalType ||
-        thenValue.components[kBaseComponent].type !=
-            elseValue.components[kBaseComponent].type ||
-        thenValue.components[kBaseComponent].identity !=
-            elseValue.components[kBaseComponent].identity ||
-        thenValue.attributes != elseValue.attributes ||
-        thenValue.components.size() != elseValue.components.size())
+        thenValue.attributes != elseValue.attributes)
       return failure();
 
-    // Unlike loops, an if can select shape, stride, or offset components.
-    // Base and order remain fixed so reconstruction preserves the current
-    // same-base behavior.
-    SmallVector<unsigned> transferred;
-    for (unsigned index = getShapeStart();
-         index < thenValue.components.size(); ++index) {
+    // Both branches yield a complete descriptor even when a field has the same
+    // symbolic identity. This gives every rewritten BlockPtr boundary one
+    // stable positional schema.
+    for (unsigned index = 0; index < thenValue.components.size(); ++index) {
       if (failed(joinComponentTypes(thenValue.components[index].type,
                                     elseValue.components[index].type)))
         return failure();
-      if (thenValue.components[index].identity !=
-          elseValue.components[index].identity)
-        transferred.push_back(index);
     }
-    return transferred;
+    return getAllComponentIndices(thenValue);
   }
 
   FailureOr<Type> joinComponentTypes(Type lhs, Type rhs) const override {
@@ -328,8 +306,8 @@ public:
 namespace mlir::triton::controlflow {
 
 LogicalResult runBlockPtrDecompose(ModuleOp module) {
-  // Make the explicit descriptor carried by a block pointer cross each
-  // supported SCF boundary as ordinary SSA components.
+  // Expand every BlockPtr that crosses a supported SCF boundary into its full
+  // ordered descriptor, then rebuild the pointer at each use site.
   BlockPtrPolicy policy;
   return rewriteControlFlow(module, policy);
 }
