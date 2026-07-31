@@ -37,14 +37,13 @@ namespace mlir::triton::controlflow {
 
 /// Policy-owned description of one value crossing a control-flow boundary.
 ///
-/// `components` are runtime values that a policy may place in an expanded SCF
-/// signature. `invariants` and `attributes` are retained by the policy to
-/// rebuild the original value. Their layout is private to that policy; the
-/// shared rewrite never interprets pointer-specific fields.
+/// `components` contain every runtime value needed to rebuild the original
+/// value. A policy may place a selected subset in an expanded SCF signature.
+/// `attributes` retain non-SSA metadata. Both layouts are private to the
+/// policy; the shared rewrite never interprets pointer-specific fields.
 struct DecomposedValue {
   Type originalType;
   SmallVector<Value> components;
-  SmallVector<Value> invariants;
   SmallVector<Attribute> attributes;
 };
 
@@ -70,7 +69,7 @@ private:
 ///
 /// The policy decides how its value is decomposed and rebuilt, which components
 /// cross loop/if boundaries, and whether two decompositions share a compatible
-/// invariant schema. It is not an IR marker and carries no state between
+/// non-carried schema. It is not an IR marker and carries no state between
 /// policy invocations.
 class ControlFlowRewritePolicy : public ControlFlowAnalysisPolicy {
 public:

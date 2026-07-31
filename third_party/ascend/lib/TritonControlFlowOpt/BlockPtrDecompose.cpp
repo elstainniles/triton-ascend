@@ -35,15 +35,23 @@ using namespace mlir::triton::controlflow;
 
 namespace {
 
+static constexpr unsigned kBaseComponent = 0;
+static constexpr unsigned getShapeStart() { return kBaseComponent + 1; }
+static constexpr unsigned getStrideStart(unsigned rank) {
+  return getShapeStart() + rank;
+}
+static constexpr unsigned getOffsetStart(unsigned rank) {
+  return getStrideStart(rank) + rank;
+}
+
 /// Block-pointer component layout used only by this policy:
 ///
-///   components = [shape..., strides..., offsets...]
-///   invariants = [base]
+///   components = [base, shape..., strides..., offsets...]
 ///   attributes = [order]
 ///
-/// Loops currently carry only `offsets`; shape and strides must remain
-/// invariant across a backedge. An scf.if may select any component whose SSA
-/// value differs between its branches.
+/// Loops currently carry only `offsets`; base, shape, and strides must remain
+/// identical across a backedge. An scf.if may select shape, stride, or offset
+/// components whose SSA values differ, but its base must remain identical.
 ///
 /// Keep rank/layout checks local to this file: the generic control-flow
 /// machinery intentionally does not know the descriptor format of a policy.
@@ -64,8 +72,8 @@ static FailureOr<unsigned> getRank(Type originalType) {
 template <typename StateT>
 static bool hasValidLayout(const StateT &state) {
   FailureOr<unsigned> rank = getRank(state.originalType);
-  return succeeded(rank) && state.components.size() == 3 * *rank &&
-         state.invariants.size() == 1 && state.attributes.size() == 1 &&
+  return succeeded(rank) && state.components.size() == 1 + 3 * *rank &&
+         state.attributes.size() == 1 &&
          isa<DenseI32ArrayAttr>(state.attributes.front());
 }
 
@@ -94,7 +102,10 @@ public:
       // types and symbolic identities here; this phase must not create IR.
       AnalyzedValue result;
       result.originalType = value.getType();
-      unsigned componentIndex = 0;
+      Value base = makePtr.getBase();
+      result.components.push_back(
+          {base.getType(), ComponentIdentity::fromValue(base, kBaseComponent)});
+      unsigned componentIndex = getShapeStart();
       auto appendComponents = [&](ValueRange values) {
         for (Value component : values) {
           result.components.push_back(
@@ -105,7 +116,6 @@ public:
       appendComponents(makePtr.getShape());
       appendComponents(makePtr.getStrides());
       appendComponents(makePtr.getOffsets());
-      result.invariants.push_back(makePtr.getBase());
       result.attributes.push_back(makePtr.getOrderAttr());
       if (!hasValidLayout(result))
         return failure();
@@ -125,7 +135,7 @@ public:
     if (advance.getOffsets().size() != rank)
       return failure();
     for (unsigned dimension = 0; dimension < rank; ++dimension) {
-      unsigned componentIndex = 2 * rank + dimension;
+      unsigned componentIndex = getOffsetStart(rank) + dimension;
       result->components[componentIndex].identity =
           ComponentIdentity::fromValue(value, componentIndex);
     }
@@ -142,7 +152,7 @@ public:
     // Only the final rank entries (offsets) are legal loop-carried state in the
     // current block-pointer model.
     for (unsigned dimension = 0; dimension < rank; ++dimension)
-      indices.push_back(2 * rank + dimension);
+      indices.push_back(getOffsetStart(rank) + dimension);
     return indices;
   }
 
@@ -154,8 +164,6 @@ public:
         !hasValidLayout(next) ||
         initial.originalType != regionArgument.originalType ||
         initial.originalType != next.originalType ||
-        initial.invariants != regionArgument.invariants ||
-        initial.invariants != next.invariants ||
         initial.attributes != regionArgument.attributes ||
         initial.attributes != next.attributes)
       return failure();
@@ -164,17 +172,24 @@ public:
     // The current implementation does not expand shape or stride iter_args.
     // Reject a loop that changes either instead of silently reconstructing a
     // descriptor with stale values.
-    for (unsigned index = 0; index < 2 * rank; ++index) {
-      if (initial.components[index].type != next.components[index].type ||
-          initial.components[index].identity != next.components[index].identity)
+    for (unsigned index = kBaseComponent; index < getOffsetStart(rank);
+         ++index) {
+      const AnalyzedComponent &initialComponent = initial.components[index];
+      const AnalyzedComponent &argumentComponent =
+          regionArgument.components[index];
+      const AnalyzedComponent &nextComponent = next.components[index];
+      if (initialComponent.type != argumentComponent.type ||
+          initialComponent.type != nextComponent.type ||
+          initialComponent.identity != argumentComponent.identity ||
+          initialComponent.identity != nextComponent.identity)
         return failure();
     }
 
     SmallVector<unsigned> transferred;
     // An offset is carried only if the backedge state depends on the region
-    // argument. Constant/invariant offsets remain outside the loop signature.
+    // argument. Constant or unchanged offsets stay outside the signature.
     for (unsigned dimension = 0; dimension < rank; ++dimension) {
-      unsigned index = 2 * rank + dimension;
+      unsigned index = getOffsetStart(rank) + dimension;
       if (failed(joinComponentTypes(initial.components[index].type,
                                     next.components[index].type)))
         return failure();
@@ -190,16 +205,20 @@ public:
                              const AnalyzedValue &elseValue) const override {
     if (!hasValidLayout(thenValue) || !hasValidLayout(elseValue) ||
         thenValue.originalType != elseValue.originalType ||
-        thenValue.invariants != elseValue.invariants ||
+        thenValue.components[kBaseComponent].type !=
+            elseValue.components[kBaseComponent].type ||
+        thenValue.components[kBaseComponent].identity !=
+            elseValue.components[kBaseComponent].identity ||
         thenValue.attributes != elseValue.attributes ||
         thenValue.components.size() != elseValue.components.size())
       return failure();
 
-    // Unlike loops, an if can select shape, stride, or offset components. Base
-    // and order remain invariants because AdapterIR cannot represent a runtime
-    // selection between heterogeneous pointer descriptors.
+    // Unlike loops, an if can select shape, stride, or offset components.
+    // Base and order remain fixed so reconstruction preserves the current
+    // same-base behavior.
     SmallVector<unsigned> transferred;
-    for (unsigned index = 0; index < thenValue.components.size(); ++index) {
+    for (unsigned index = getShapeStart();
+         index < thenValue.components.size(); ++index) {
       if (failed(joinComponentTypes(thenValue.components[index].type,
                                     elseValue.components[index].type)))
         return failure();
@@ -242,13 +261,13 @@ public:
       // Materialize the concrete counterpart of analyzeValue's descriptor.
       DecomposedValue result;
       result.originalType = value.getType();
+      result.components.push_back(makePtr.getBase());
       result.components.append(makePtr.getShape().begin(),
                                makePtr.getShape().end());
       result.components.append(makePtr.getStrides().begin(),
                                makePtr.getStrides().end());
       result.components.append(makePtr.getOffsets().begin(),
                                makePtr.getOffsets().end());
-      result.invariants.push_back(makePtr.getBase());
       result.attributes.push_back(makePtr.getOrderAttr());
       if (!hasValidLayout(result))
         return failure();
@@ -272,7 +291,7 @@ public:
     OpBuilder::InsertionGuard guard(builder);
     builder.setInsertionPoint(advance);
     for (auto [dim, delta] : llvm::enumerate(advance.getOffsets())) {
-      unsigned component = 2 * *rank + dim;
+      unsigned component = getOffsetStart(*rank) + dim;
       Value currentOffset = result->components[component];
       Value remappedDelta = context.remap(delta);
       if (!remappedDelta)
@@ -297,10 +316,10 @@ public:
     unsigned rank = *getRank(value.originalType);
     auto order = cast<DenseI32ArrayAttr>(value.attributes.front());
     return builder.create<triton::MakeTensorPtrOp>(
-        loc, value.originalType, value.invariants.front(),
-        ValueRange(value.components).take_front(rank),
-        ValueRange(value.components).slice(rank, rank),
-        ValueRange(value.components).take_back(rank), order);
+        loc, value.originalType, value.components[kBaseComponent],
+        ValueRange(value.components).slice(getShapeStart(), rank),
+        ValueRange(value.components).slice(getStrideStart(rank), rank),
+        ValueRange(value.components).slice(getOffsetStart(rank), rank), order);
   }
 };
 

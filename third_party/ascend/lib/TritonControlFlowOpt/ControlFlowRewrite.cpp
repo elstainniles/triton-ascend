@@ -65,7 +65,7 @@ namespace {
 // handlers are mutually recursive through rewriteBodyOps(), share one
 // short-lived RewriteEnv, and must agree on signature expansion, nested-op
 // ordering and failure cleanup. Splitting them by op kind would expose those
-// private invariants through additional internal headers without creating an
+// private constraints through additional internal headers without creating an
 // independently reusable component.
 //
 //===----------------------------------------------------------------------===//
@@ -84,8 +84,8 @@ namespace {
 /// offsets, a region-local environment can contain:
 /// valueMapping:      %old_ptr_arg -> %rebuilt_ptr
 /// decomposedValues:  %old_ptr_arg -> {
-///   components = [%shape0, %stride0, %new_offset0],
-///   invariants = [%base], attributes = [order]
+///   components = [%base, %shape0, %stride0, %new_offset0],
+///   attributes = [order]
 /// }
 /// Operations cloned into that region use the mapping, while pointer
 /// decomposition uses the stored components.
@@ -152,9 +152,9 @@ struct RewriteEnv {
   /// %next = tt.advance %ptr, [%delta0, %delta1]
   ///
   /// decomposeValue(%next) -> DecomposedValue {
-  ///   components = [%shape0, %shape1, %stride0, %stride1,
+  ///   components = [%base, %shape0, %shape1, %stride0, %stride1,
   ///                 %offset0 + %delta0, %offset1 + %delta1],
-  ///   invariants = [%base], attributes = [order]
+  ///   attributes = [order]
   /// }
   /// The caller can put selected components into a new control-flow signature
   /// or pass the whole descriptor to policy.recompose(). Unsupported values
@@ -245,9 +245,9 @@ gatherValues(ValueRange sourceValues, ArrayRef<unsigned> indices) {
 // replacement changes the component type; the input object remains unchanged.
 //
 // Example:
-//   decomposition.components = [shape, stride, originalOffset]
-//   componentIndices = [2], replacements = [nextOffset]
-//   result.components = [shape, stride, nextOffset]
+//   decomposition.components = [base, shape, stride, originalOffset]
+//   componentIndices = [3], replacements = [nextOffset]
+//   result.components = [base, shape, stride, nextOffset]
 static FailureOr<DecomposedValue>
 withReplacedComponents(DecomposedValue decomposition,
                        ArrayRef<unsigned> componentIndices,
@@ -325,9 +325,10 @@ static auto findPointerInfoByOldIndex(InfoRange &pointerInfos,
 //   oldRegionArgument = %old_ptr
 //   newRegionArguments = [%ordinary, %current_offset0, %current_offset1]
 //   pointerInfo.newIndices = [1, 2]
-//   pointerInfo.componentIndices = [4, 5]
+//   pointerInfo.componentIndices = [5, 6]
 //   pointerInfo.initInfo.components =
-//       [shape0, shape1, stride0, stride1, initial_offset0, initial_offset1]
+//       [base, shape0, shape1, stride0, stride1, initial_offset0,
+//        initial_offset1]
 //
 // The rebuilt descriptor keeps shape and stride, replaces the final two
 // components with the current offsets, and records `%old_ptr -> %rebuilt_ptr`
@@ -417,7 +418,7 @@ static LogicalResult bindLoopRegionArguments(
 // Example:
 //   oldOperands = [%next_ptr, %sum]
 //   pointerInfo = {
-//     oldIndex = 0, componentIndices = [4, 5], newIndices = [0, 1]
+//     oldIndex = 0, componentIndices = [5, 6], newIndices = [0, 1]
 //   }
 //   currentRegionArguments = [%current_offset0, %current_offset1, %sum_arg]
 //
@@ -488,7 +489,7 @@ static LogicalResult rewriteLoopTerminatorOperands(
 //   oldResults = [%old_sum, %old_ptr, %old_flag]
 //   newResults = [%new_sum, %offset0, %offset1, %new_flag]
 //   pointerInfo = {
-//     oldIndex = 1, componentIndices = [4, 5], newIndices = [1, 2]
+//     oldIndex = 1, componentIndices = [5, 6], newIndices = [1, 2]
 //   }
 //   oldToNewStart = [0, 1, 3]
 //
