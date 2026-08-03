@@ -535,10 +535,22 @@ public:
                   ConversionPatternRewriter &rewriter) const override;
 };
 
-// Rebuild an scf.if whose result list contains Triton scalar pointers so the
-// control-flow boundary carries memref descriptors instead. The original
-// branch regions are moved into the new operation, preserving side effects and
-// allowing the conversion driver to rewrite each scf.yield operand in place.
+// Return true when value is a Triton scalar pointer used exclusively as the
+// base operand of one or more tt.make_tensor_ptr operations. Restricting the
+// transport conversion to this contract keeps scalar pointer load/store and
+// tensor-of-pointers paths on their existing lowerings.
+bool hasOnlyBlockPtrBaseUses(Value value);
+
+// Return true when every scalar pointer result of the operation satisfies the
+// BlockPtr base-use contract. At least one such pointer result must exist.
+bool isBlockPtrBaseTransport(scf::IfOp op);
+bool isBlockPtrBaseTransport(arith::SelectOp op);
+
+// Rebuild an scf.if whose supported BlockPtr base results are Triton scalar
+// pointers so the control-flow boundary carries memref descriptors instead.
+// The original branch regions are moved into the new operation, preserving
+// side effects and allowing the conversion driver to rewrite each scf.yield
+// operand in place.
 //
 // Example:
 //   %base = scf.if %cond -> !tt.ptr<f32> {
@@ -546,6 +558,7 @@ public:
 //   } else {
 //     scf.yield %rhs : !tt.ptr<f32>
 //   }
+//   %ptr = tt.make_tensor_ptr %base, ...
 // becomes an scf.if returning a rank-one strided memref descriptor. A fully
 // dynamic offset and stride let the same result represent either a plain base
 // pointer or a pointer produced by tt.addptr without losing address metadata.
@@ -555,6 +568,28 @@ public:
 
   LogicalResult
   matchAndRewrite(scf::IfOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override;
+};
+
+// Convert a canonicalized scalar-pointer select used as a BlockPtr base into a
+// select over a common dynamic-strided memref carrier. Both the selected source
+// allocation and its runtime descriptor offset remain available to
+// tt.make_tensor_ptr lowering.
+//
+// Example:
+//   %base = arith.select %cond, %lhs, %rhs : !tt.ptr<f32>
+//   %ptr = tt.make_tensor_ptr %base, ...
+// becomes:
+//   %lhs_carrier = memref.cast %lhs : ... to memref<?xf32, strided<[?], offset: ?>>
+//   %rhs_carrier = memref.cast %rhs : ... to memref<?xf32, strided<[?], offset: ?>>
+//   %base = arith.select %cond, %lhs_carrier, %rhs_carrier
+//       : memref<?xf32, strided<[?], offset: ?>>
+class PointerSelectConverter : public OpConversionPattern<arith::SelectOp> {
+public:
+  using OpConversionPattern<arith::SelectOp>::OpConversionPattern;
+
+  LogicalResult
+  matchAndRewrite(arith::SelectOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override;
 };
 

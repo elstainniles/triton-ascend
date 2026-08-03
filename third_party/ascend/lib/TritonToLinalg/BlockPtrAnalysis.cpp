@@ -59,8 +59,12 @@
 namespace mlir {
 namespace triton {
 
-static bool isControlFlowPointerTransport(Operation *op) {
-  return op && isa<scf::IfOp, scf::ForOp, scf::WhileOp>(op);
+// Recognize original scalar-pointer producers whose converted result may act
+// as a memref carrier. The parse site still requires BaseMemRefType, so merely
+// appearing in this list never makes an unconverted pointer an opaque source.
+static bool isScalarPointerTransport(Operation *op) {
+  return op &&
+         isa<scf::IfOp, scf::ForOp, scf::WhileOp, arith::SelectOp>(op);
 }
 
 // MemAccType selectMaxMemAccTy(const MemAccType &v1, const MemAccType &v2) {
@@ -448,9 +452,9 @@ void BlockDataParser::parse(
         data.setSource(remappedPtr);
       } else if (isDistributedTypeCustomOp(op)) {
         data.setSource(remappedPtr);
-      } else if (isControlFlowPointerTransport(op)) {
+      } else if (isScalarPointerTransport(op)) {
         if (!isa<BaseMemRefType>(remappedPtr.getType())) {
-          op->emitError("SCF pointer transport did not convert to a memref");
+          op->emitError("scalar pointer transport did not convert to a memref");
           return;
         }
         data.setSource(remappedPtr);

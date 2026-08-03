@@ -564,11 +564,7 @@ void TritonToLinalgPass::addDynamicLegal(
   });
 
   target.addDynamicallyLegalOp<scf::IfOp>([](scf::IfOp op) {
-    auto isPointer = [](Type type) {
-      return isa<triton::PointerType>(type);
-    };
-    return llvm::none_of(op->getOperandTypes(), isPointer) &&
-           llvm::none_of(op->getResultTypes(), isPointer);
+    return !TTOpConverters::isBlockPtrBaseTransport(op);
   });
 
   target.addDynamicallyLegalOp<scf::ForOp, scf::YieldOp>([](Operation *op) {
@@ -584,22 +580,31 @@ void TritonToLinalgPass::addDynamicLegal(
     });
   });
 
-  target.addDynamicallyLegalDialect<arith::ArithDialect, math::MathDialect>(
-      [this](Operation *op) {
-        if (op->hasAttr("MetaUse")) {
+  auto isArithOrMathOpLegal = [this](Operation *op) {
+    if (op->hasAttr("MetaUse"))
+      return false;
+
+    if (isa<arith::ConstantOp>(op))
+      return true;
+
+    bool operateOnTensors =
+        llvm::all_of(op->getOperandTypes(),
+                     [](Type type) { return isa<RankedTensorType>(type); });
+
+    return this->namedOps || !operateOnTensors;
+  };
+
+  // Keep the existing Arith legality for every non-target select. Only scalar
+  // pointers used exclusively as BlockPtr bases enter PointerSelectConverter.
+  target.addDynamicallyLegalOp<arith::SelectOp>(
+      [isArithOrMathOpLegal](arith::SelectOp op) {
+        if (TTOpConverters::isBlockPtrBaseTransport(op))
           return false;
-        }
-
-        if (isa<arith::ConstantOp>(op)) {
-          return true;
-        }
-
-        bool operateOnTensors =
-            llvm::all_of(op->getOperandTypes(),
-                         [](Type type) { return isa<RankedTensorType>(type); });
-
-        return this->namedOps || !operateOnTensors;
+        return isArithOrMathOpLegal(op);
       });
+
+  target.addDynamicallyLegalDialect<arith::ArithDialect, math::MathDialect>(
+      isArithOrMathOpLegal);
 }
 
 void TritonToLinalgPass::populateTritonToLinalgCanonicalizationPatterns(
@@ -723,6 +728,8 @@ void TritonToLinalgPass::populateTritonToLinalgConversionPatterns(
   patterns.add<TTOpConverters::YieldConverter>(patterns.getContext());
   patterns.add<TTOpConverters::IfConverter>(typeConverter,
                                              patterns.getContext());
+  patterns.add<TTOpConverters::PointerSelectConverter>(
+      typeConverter, patterns.getContext());
 
   patterns.add<TTOpConverters::DeviceAssertConverter>(patterns.getContext());
   patterns.add<TTOpConverters::DevicePrintConverter>(patterns.getContext());

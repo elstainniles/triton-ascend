@@ -171,32 +171,90 @@ TransposeConverter::matchAndRewrite(triton::TransOp op, OpAdaptor adaptor,
   return success();
 }
 
-static FailureOr<Type> getIfResultCarrierType(
-    Type originalType, const TypeConverter &typeConverter) {
+bool hasOnlyBlockPtrBaseUses(Value value) {
+  auto pointerType = dyn_cast<triton::PointerType>(value.getType());
+  if (!pointerType || isa<ShapedType>(pointerType.getPointeeType()) ||
+      value.use_empty())
+    return false;
+
+  return llvm::all_of(value.getUses(), [&](OpOperand &use) {
+    auto makePtr = dyn_cast<triton::MakeTensorPtrOp>(use.getOwner());
+    return makePtr && makePtr.getBase() == value;
+  });
+}
+
+bool isBlockPtrBaseTransport(scf::IfOp op) {
+  bool hasPointerResult = false;
+  for (Value result : op.getResults()) {
+    if (!isa<triton::PointerType>(result.getType()))
+      continue;
+    hasPointerResult = true;
+    if (!hasOnlyBlockPtrBaseUses(result))
+      return false;
+  }
+  return hasPointerResult;
+}
+
+bool isBlockPtrBaseTransport(arith::SelectOp op) {
+  return hasOnlyBlockPtrBaseUses(op.getResult());
+}
+
+// Convert a scalar Triton pointer type to a common memref descriptor type. The
+// element type, rank, shape, and memory space come from TritonTypeConverter;
+// only offset and strides are made dynamic so descriptors from different
+// control-flow/select paths can share one result type without losing metadata.
+static FailureOr<MemRefType>
+getScalarPointerCarrierType(Type originalType,
+                            const TypeConverter &typeConverter) {
   auto pointerType = dyn_cast<triton::PointerType>(originalType);
-  if (!pointerType)
-    return originalType;
-  if (isa<ShapedType>(pointerType.getPointeeType()))
+  if (!pointerType || isa<ShapedType>(pointerType.getPointeeType()))
     return failure();
 
   Type convertedType = typeConverter.convertType(originalType);
   if (!convertedType)
     return failure();
-
   auto memrefType = dyn_cast<MemRefType>(convertedType);
   if (!memrefType)
     return failure();
 
-  // An scf.if may select a plain pointer or an AddPtr-derived pointer. Use a
-  // local, maximally dynamic strided descriptor so both branch values have a
-  // common type while preserving the selected pointer's runtime offset.
+  // A join may select a plain pointer or an AddPtr-derived pointer. Use a local,
+  // maximally dynamic strided descriptor so both values have a common type
+  // while preserving the selected pointer's runtime offset.
   SmallVector<int64_t> dynamicStrides(memrefType.getRank(),
                                       ShapedType::kDynamic);
   auto layout = StridedLayoutAttr::get(
       originalType.getContext(), ShapedType::kDynamic, dynamicStrides);
-  return Type(MemRefType::get(memrefType.getShape(),
-                              memrefType.getElementType(), layout,
-                              memrefType.getMemorySpace()));
+  return MemRefType::get(memrefType.getShape(), memrefType.getElementType(),
+                         layout, memrefType.getMemorySpace());
+}
+
+static FailureOr<Type> getIfResultCarrierType(
+    Type originalType, const TypeConverter &typeConverter) {
+  if (!isa<triton::PointerType>(originalType))
+    return originalType;
+
+  FailureOr<MemRefType> carrier =
+      getScalarPointerCarrierType(originalType, typeConverter);
+  if (failed(carrier))
+    return failure();
+  return Type(*carrier);
+}
+
+// Materialize a no-op-compatible memref cast to the common carrier. Returning
+// failure for non-memref or incompatible values prevents the pointer transport
+// pattern from silently changing element, shape, rank, or memory-space types.
+static FailureOr<Value>
+castToMemRefCarrier(Value value, MemRefType carrierType, Location loc,
+                    ConversionPatternRewriter &rewriter) {
+  if (value.getType() == carrierType)
+    return value;
+
+  auto sourceType = dyn_cast<MemRefType>(value.getType());
+  if (!sourceType ||
+      !memref::CastOp::areCastCompatible(sourceType, carrierType))
+    return failure();
+
+  return rewriter.create<memref::CastOp>(loc, carrierType, value).getResult();
 }
 
 LogicalResult
@@ -205,8 +263,7 @@ IfConverter::matchAndRewrite(scf::IfOp op, OpAdaptor adaptor,
   const TypeConverter *typeConverter = getTypeConverter();
   if (!typeConverter)
     return rewriter.notifyMatchFailure(op, "requires a type converter");
-  if (llvm::none_of(op.getResultTypes(),
-                    [](Type type) { return isa<triton::PointerType>(type); }))
+  if (!isBlockPtrBaseTransport(op))
     return failure();
 
   SmallVector<Type> convertedResultTypes;
@@ -238,6 +295,38 @@ IfConverter::matchAndRewrite(scf::IfOp op, OpAdaptor adaptor,
   return success();
 }
 
+LogicalResult PointerSelectConverter::matchAndRewrite(
+    arith::SelectOp op, OpAdaptor adaptor,
+    ConversionPatternRewriter &rewriter) const {
+  if (!isBlockPtrBaseTransport(op))
+    return failure();
+
+  const TypeConverter *typeConverter = getTypeConverter();
+  if (!typeConverter)
+    return rewriter.notifyMatchFailure(op, "requires a type converter");
+
+  FailureOr<MemRefType> carrierType =
+      getScalarPointerCarrierType(op.getType(), *typeConverter);
+  if (failed(carrierType))
+    return rewriter.notifyMatchFailure(
+        op, "could not build a scalar pointer memref carrier");
+
+  FailureOr<Value> trueValue = castToMemRefCarrier(
+      adaptor.getTrueValue(), *carrierType, op.getLoc(), rewriter);
+  FailureOr<Value> falseValue = castToMemRefCarrier(
+      adaptor.getFalseValue(), *carrierType, op.getLoc(), rewriter);
+  if (failed(trueValue) || failed(falseValue))
+    return rewriter.notifyMatchFailure(
+        op, "selected pointer values cannot use a common memref carrier");
+
+  auto convertedSelect = rewriter.create<arith::SelectOp>(
+      op.getLoc(), *carrierType, adaptor.getCondition(), *trueValue,
+      *falseValue);
+  convertedSelect->setAttrs(op->getAttrs());
+  rewriter.replaceOp(op, convertedSelect.getResult());
+  return success();
+}
+
 LogicalResult
 YieldConverter::matchAndRewrite(scf::YieldOp op, OpAdaptor adaptor,
                                 ConversionPatternRewriter &rewriter) const {
@@ -259,14 +348,17 @@ YieldConverter::matchAndRewrite(scf::YieldOp op, OpAdaptor adaptor,
       Value &operand = convertedOperands[index];
       if (operand.getType() == targetType)
         continue;
-      auto sourceType = dyn_cast<MemRefType>(operand.getType());
       auto targetMemrefType = dyn_cast<MemRefType>(targetType);
-      if (!sourceType || !targetMemrefType ||
-          !memref::CastOp::areCastCompatible(sourceType, targetMemrefType))
+      if (!targetMemrefType)
         return rewriter.notifyMatchFailure(
             op, "converted yield operand is incompatible with if result");
-      operand = rewriter.create<memref::CastOp>(op.getLoc(), targetMemrefType,
-                                                operand);
+
+      FailureOr<Value> casted = castToMemRefCarrier(
+          operand, targetMemrefType, op.getLoc(), rewriter);
+      if (failed(casted))
+        return rewriter.notifyMatchFailure(
+            op, "converted yield operand is incompatible with if result");
+      operand = *casted;
     }
   }
 
