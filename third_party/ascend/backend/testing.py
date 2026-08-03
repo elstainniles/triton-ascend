@@ -39,6 +39,9 @@ class ProfilerResultMismatchError(RuntimeError):
             f"target_kernel_name={target_kernel_name!r}, expected_rows={expected_rows}, actual_rows={actual_rows}")
 
 
+_EVENT_BATCH_SIZE = 1024
+
+
 def do_bench_npu(
     funcs,
     warmup=5,
@@ -48,6 +51,107 @@ def do_bench_npu(
     keep_res=False,
     target_kernel_name: Optional[str] = None,
 ):
+    """Benchmark NPU callables while preserving the public API contract.
+
+    Device events are used by default so compute kernels and stream-ordered
+    tasks such as MemcpyAsync share the same lightweight measurement path.
+    Supplying a profiler-specific option keeps the legacy profiler behaviour;
+    incomplete profiler data falls back to event timing for the whole batch.
+    """
+    use_legacy_profiler = prof_dir is not None or keep_res or target_kernel_name is not None
+    if use_legacy_profiler:
+        try:
+            result = _do_bench_npu_profiler(
+                funcs,
+                warmup=warmup,
+                active=active,
+                clear_l2_cache=clear_l2_cache,
+                prof_dir=prof_dir,
+                keep_res=keep_res,
+                target_kernel_name=target_kernel_name,
+            )
+            values = result if isinstance(result, list) else [result]
+            if all(value != float("inf") for value in values):
+                return result
+        except ProfilerResultMismatchError as exc:
+            import warnings
+
+            warnings.warn(
+                "NPU profiler did not produce a complete set of target kernel records; "
+                "the operation may be a non-compute task such as MemcpyAsync. "
+                f"Falling back to device-event timing. Details: {exc}",
+                RuntimeWarning,
+                stacklevel=2,
+            )
+
+    return _do_bench_npu_event(funcs, warmup=warmup, active=active, clear_l2_cache=clear_l2_cache)
+
+
+def _do_bench_npu_event(funcs, warmup=5, active=30, clear_l2_cache=False):
+    if not isinstance(funcs, list):
+        funcs = [funcs]
+    if not funcs:
+        raise ValueError("funcs must contain at least one callable")
+    if warmup < 0:
+        raise ValueError("warmup must be non-negative")
+    if active <= 0:
+        raise ValueError("active must be positive")
+
+    driver = runtime.driver.active
+    device_interface = driver.get_device_interface()
+    cache_buffer = driver.get_empty_cache_for_benchmark() if clear_l2_cache else None
+    results = []
+
+    def run_once(fn):
+        if cache_buffer is not None:
+            driver.clear_cache(cache_buffer)
+        fn()
+
+    for fn in funcs:
+        # Compile and initialize runtime state before applying the requested
+        # warmup count, matching the historical do_bench_npu behaviour.
+        fn()
+        device_interface.synchronize()
+
+        for _ in builtins.range(warmup):
+            run_once(fn)
+        device_interface.synchronize()
+
+        elapsed_ms = 0.0
+        measured = 0
+        while measured < active:
+            batch_size = min(_EVENT_BATCH_SIZE, active - measured)
+            start_events = [device_interface.Event(enable_timing=True) for _ in builtins.range(batch_size)]
+            end_events = [device_interface.Event(enable_timing=True) for _ in builtins.range(batch_size)]
+
+            for start_event, end_event in zip(start_events, end_events):
+                if cache_buffer is not None:
+                    driver.clear_cache(cache_buffer)
+                start_event.record()
+                fn()
+                end_event.record()
+
+            device_interface.synchronize()
+            elapsed_ms += sum(start.elapsed_time(end) for start, end in zip(start_events, end_events))
+            measured += batch_size
+
+        results.append(elapsed_ms / active)
+
+    if len(results) == 1:
+        return results[0]
+    return results
+
+
+def _do_bench_npu_profiler(
+    funcs,
+    warmup=5,
+    active=30,
+    clear_l2_cache=False,
+    prof_dir=None,
+    keep_res=False,
+    target_kernel_name: Optional[str] = None,
+):
+    """Internal profiler benchmark used by autotune and profiling flows."""
     import torch
     import torch_npu
 
