@@ -23,6 +23,7 @@
 
 #include <cstdlib>
 
+#include "TritonControlFlowOpt/ControlFlowRewrite.h"
 #include "TritonToLinalg/BlockPtrAnalysis.h"
 #include "ascend/include/Dialect/TritonAscend/IR/TritonAscendDialect.h"
 #include "ascend/include/TritonToLinalg/ArgMinMaxConverter.h"
@@ -564,7 +565,7 @@ void TritonToLinalgPass::addDynamicLegal(
   });
 
   target.addDynamicallyLegalOp<scf::IfOp>([](scf::IfOp op) {
-    return !TTOpConverters::isBlockPtrBaseTransport(op);
+    return !TTOpConverters::hasScalarPointerResult(op);
   });
 
   target.addDynamicallyLegalOp<scf::ForOp, scf::YieldOp>([](Operation *op) {
@@ -594,11 +595,11 @@ void TritonToLinalgPass::addDynamicLegal(
     return this->namedOps || !operateOnTensors;
   };
 
-  // Keep the existing Arith legality for every non-target select. Only scalar
-  // pointers used exclusively as BlockPtr bases enter PointerSelectConverter.
+  // Numeric selects retain the existing Arith legality. Every scalar-pointer
+  // select uses the integer-address converter so no memref object crosses it.
   target.addDynamicallyLegalOp<arith::SelectOp>(
       [isArithOrMathOpLegal](arith::SelectOp op) {
-        if (TTOpConverters::isBlockPtrBaseTransport(op))
+        if (TTOpConverters::isScalarPointerSelect(op))
           return false;
         return isArithOrMathOpLegal(op);
       });
@@ -736,6 +737,8 @@ void TritonToLinalgPass::populateTritonToLinalgConversionPatterns(
   patterns.add<TTOpConverters::MatmulConverter>(patterns.getContext());
   patterns.add<TTOpConverters::DotScaledConverter>(patterns.getContext());
   patterns.add<TTOpConverters::PtrToIntConverter>(patterns.getContext());
+  patterns.add<TTOpConverters::IntToPtrConverter>(
+      typeConverter, patterns.getContext());
 
   patterns.add<TTOpConverters::IndirectLoadConverter>(patterns.getContext());
   patterns.add<TTOpConverters::StrideLoadConverter>(patterns.getContext());
@@ -1082,7 +1085,15 @@ void TritonToLinalgPass::runOnOperation() {
 
   moduleOp.walk([this](LoopLikeOpInterface loopOp) {
     auto *op = loopOp.getOperation();
-    if (!op->hasAttr("ExtractedLoadOrStore"))
+    // CFO-expanded pointer loops already carry policy-owned descriptor
+    // components. They require ordinary nested-op conversion, not the legacy
+    // pointer-loop decomposition a second time.
+    bool hasExpandedPointerDescriptor =
+        op->hasAttr(mlir::triton::controlflow::kPointerDescriptorBoundaryAttr);
+    op->removeAttr(
+        mlir::triton::controlflow::kPointerDescriptorBoundaryAttr);
+    if (!op->hasAttr("ExtractedLoadOrStore") &&
+        !hasExpandedPointerDescriptor)
       op->setAttr("UnhandledLoopOp", UnitAttr::get(op->getContext()));
 
     for (auto res : loopOp->getResults()) {
@@ -1147,8 +1158,14 @@ void TritonToLinalgPass::runOnOperation() {
   moduleOp.walk([&](hivm::PointerCastOp op) { castOps.push_back(op); });
 
   for (auto op : castOps) {
-    SmallVector<Operation *> userOps(op->getUsers().begin(),
-                                     op->getUsers().end());
+    SmallVector<memref::ReinterpretCastOp> reinterpretCastOps;
+    for (Operation *user : op->getUsers()) {
+      if (auto reinterpretCast = dyn_cast<memref::ReinterpretCastOp>(user))
+        reinterpretCastOps.push_back(reinterpretCast);
+    }
+    if (reinterpretCastOps.empty())
+      continue;
+
     IRRewriter rewriter(&getContext());
     rewriter.setInsertionPointAfter(op);
     Value addr = op.getAddrs()[0];
@@ -1167,14 +1184,14 @@ void TritonToLinalgPass::runOnOperation() {
       llvm_unreachable("Cannot get memory size");
     }
 
-    for (auto userOp : userOps) {
-      auto reinterpretCastOp = cast<memref::ReinterpretCastOp>(userOp);
+    for (memref::ReinterpretCastOp reinterpretCastOp : reinterpretCastOps) {
       auto sizes = reinterpretCastOp.getStaticSizes();
       auto staticStrides = reinterpretCastOp.getStaticStrides();
       auto strides = reinterpretCastOp.getStrides();
       if (reinterpretCastOp.getStaticOffsets().size() != 1)
-        userOp->emitError("IntToPtrOp must converted to PointerCastOp of "
-                          "memref<?xdtype> type");
+        reinterpretCastOp->emitError(
+            "IntToPtrOp must converted to PointerCastOp of "
+            "memref<?xdtype> type");
       int64_t castOpSize = 0;
       SmallVector<int64_t> dynamicSizes;
       for (const auto &[size, stride] : llvm::zip_equal(sizes, staticStrides)) {
@@ -1227,7 +1244,8 @@ void TritonToLinalgPass::runOnOperation() {
           reinterpretCastOp.getStaticSizes(),
           reinterpretCastOp.getStaticStrides());
     }
-    rewriter.eraseOp(op);
+    if (op->use_empty())
+      rewriter.eraseOp(op);
   }
 
   // Try interleave optimization

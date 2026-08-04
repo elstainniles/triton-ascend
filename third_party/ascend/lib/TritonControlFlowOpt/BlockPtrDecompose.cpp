@@ -49,10 +49,13 @@ static constexpr unsigned getOffsetStart(unsigned rank) {
 
 /// Block-pointer component layout used only by this policy:
 ///
-///   components = [base, shape..., strides..., offsets...]
+///   components = [base_address, shape..., strides..., offsets...]
 ///   attributes = [order]
 ///
 /// Every supported SCF boundary carries all components in this exact order.
+/// The base is represented as an i64 address rather than a pointer/memref so a
+/// control-flow merge remains an SSA value selection and cannot be lowered as
+/// a memory-object copy by the backend.
 /// `order` remains policy-owned static metadata and must agree on every
 /// incoming path.
 ///
@@ -68,6 +71,20 @@ static FailureOr<unsigned> getRank(Type originalType) {
   if (!tensorType)
     return failure();
   return tensorType.getRank();
+}
+
+// Recovers the scalar pointer type accepted by tt.make_tensor_ptr from the
+// BlockPtr result type. The address space is preserved across the temporary
+// integer carrier.
+static FailureOr<triton::PointerType> getBasePointerType(Type originalType) {
+  auto pointerType = dyn_cast<triton::PointerType>(originalType);
+  if (!pointerType)
+    return failure();
+  auto tensorType = dyn_cast<RankedTensorType>(pointerType.getPointeeType());
+  if (!tensorType)
+    return failure();
+  return triton::PointerType::get(tensorType.getElementType(),
+                                  pointerType.getAddressSpace());
 }
 
 // Validates the common block-pointer schema for either state representation.
@@ -203,7 +220,8 @@ public:
       result.originalType = value.getType();
       Value base = makePtr.getBase();
       result.components.push_back(
-          {base.getType(), ComponentIdentity::fromValue(base, kBaseComponent)});
+          {IntegerType::get(value.getContext(), 64),
+           ComponentIdentity::fromValue(base, kBaseComponent)});
       unsigned componentIndex = getShapeStart();
       auto appendComponents = [&](ValueRange values) {
         for (Value component : values) {
@@ -309,6 +327,16 @@ public:
     return isa<triton::AdvanceOp>(op);
   }
 
+  /// Marks loops whose BlockPtr slots now carry descriptor scalars so the
+  /// downstream lowering does not run its legacy pointer-loop rewrite again.
+  /// An scf.if needs no marker because that legacy path handles only loops.
+  void finalizeRewrittenControlFlowOp(Operation *op) const override {
+    if (!isa<scf::ForOp, scf::WhileOp>(op))
+      return;
+    op->setAttr(kPointerDescriptorBoundaryAttr,
+                UnitAttr::get(op->getContext()));
+  }
+
   FailureOr<DecomposedValue> decompose(Value value,
                                        const ControlFlowRewriteContext &context,
                                        OpBuilder &builder,
@@ -326,7 +354,11 @@ public:
       // Materialize the concrete counterpart of analyzeValue's descriptor.
       DecomposedValue result;
       result.originalType = value.getType();
-      result.components.push_back(makePtr.getBase());
+      OpBuilder::InsertionGuard guard(builder);
+      builder.setInsertionPoint(makePtr);
+      Value baseAddress = builder.create<triton::PtrToIntOp>(
+          makePtr.getLoc(), builder.getI64Type(), makePtr.getBase());
+      result.components.push_back(baseAddress);
       result.components.append(makePtr.getShape().begin(),
                                makePtr.getShape().end());
       result.components.append(makePtr.getStrides().begin(),
@@ -380,8 +412,15 @@ public:
       return nullptr;
     unsigned rank = *getRank(value.originalType);
     auto order = cast<DenseI32ArrayAttr>(value.attributes.front());
+    FailureOr<triton::PointerType> basePointerType =
+        getBasePointerType(value.originalType);
+    if (failed(basePointerType) ||
+        value.components[kBaseComponent].getType() != builder.getI64Type())
+      return nullptr;
+    Value base = builder.create<triton::IntToPtrOp>(
+        loc, *basePointerType, value.components[kBaseComponent]);
     return builder.create<triton::MakeTensorPtrOp>(
-        loc, value.originalType, value.components[kBaseComponent],
+        loc, value.originalType, base,
         ValueRange(value.components).slice(getShapeStart(), rank),
         ValueRange(value.components).slice(getStrideStart(rank), rank),
         ValueRange(value.components).slice(getOffsetStart(rank), rank), order);

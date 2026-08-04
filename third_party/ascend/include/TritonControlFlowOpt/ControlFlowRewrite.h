@@ -32,8 +32,16 @@
 
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/SmallVector.h"
+#include "llvm/ADT/StringRef.h"
 
 namespace mlir::triton::controlflow {
+
+/// Handoff marker for SCF loops whose pointer slots have already been expanded
+/// into policy-owned descriptor components. TritonToLinalg consumes and
+/// removes it instead of applying its legacy pointer-loop decomposition a
+/// second time.
+inline constexpr llvm::StringLiteral kPointerDescriptorBoundaryAttr =
+    "PointerDescriptorBoundary";
 
 /// Policy-owned description of one value crossing a control-flow boundary.
 ///
@@ -69,8 +77,8 @@ private:
 ///
 /// The policy decides how its value is decomposed and rebuilt, which components
 /// cross loop/if boundaries, and whether two decompositions share a compatible
-/// non-carried schema. It is not an IR marker and carries no state between
-/// policy invocations.
+/// non-carried schema. It carries no mutable state between policy invocations;
+/// the optional finalization hook may attach a downstream handoff marker.
 class ControlFlowRewritePolicy : public ControlFlowAnalysisPolicy {
 public:
   virtual ~ControlFlowRewritePolicy() = default;
@@ -78,6 +86,13 @@ public:
   /// Whether results of this ordinary operation need immediate decomposition
   /// after cloning so later operations can reuse their exact component state.
   virtual bool shouldDecomposeOperation(Operation *op) const = 0;
+
+  /// Allows a policy to annotate a newly created SCF operation with metadata
+  /// required by a downstream consumer. The shared rewrite invokes this after
+  /// copying the original attributes and only when this policy changed the
+  /// operation's own signature, so metadata cannot leak to an outer operation
+  /// that was rebuilt solely because it contains nested control flow.
+  virtual void finalizeRewrittenControlFlowOp(Operation *op) const {}
 
   virtual FailureOr<DecomposedValue>
   decompose(Value value, const ControlFlowRewriteContext &context,

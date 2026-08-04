@@ -686,6 +686,8 @@ static LogicalResult rewriteForOp(scf::ForOp forOp, OpBuilder &builder,
         bodyBuilder.create<scf::YieldOp>(yieldOp.getLoc(), newYieldOperands);
       });
   newForOp->setAttrs(forOp->getAttrs());
+  if (analysis->rewritesOwnSignature())
+    env.policy.finalizeRewrittenControlFlowOp(newForOp);
 
   if (!bodyOk) {
     newForOp.erase();
@@ -812,6 +814,8 @@ static LogicalResult rewriteWhileOp(scf::WhileOp whileOp, OpBuilder &builder,
         bodyBuilder.create<scf::YieldOp>(yieldOp.getLoc(), newYieldOperands);
       });
   newWhileOp->setAttrs(whileOp->getAttrs());
+  if (analysis->rewritesOwnSignature())
+    env.policy.finalizeRewrittenControlFlowOp(newWhileOp);
 
   if (!bodyOk) {
     newWhileOp.erase();
@@ -910,6 +914,8 @@ static LogicalResult rewriteIfOp(scf::IfOp ifOp, OpBuilder &builder,
       builder.create<scf::IfOp>(ifOp.getLoc(), newResultTypes,
                                 env.remap(ifOp.getCondition()), hasElse);
   newIfOp->setAttrs(ifOp->getAttrs());
+  if (analysis->rewritesOwnSignature())
+    env.policy.finalizeRewrittenControlFlowOp(newIfOp);
 
   // The then region always exists, including for a result-less one-arm if.
   // Rewriting it is still required when it contains affected nested SCF.

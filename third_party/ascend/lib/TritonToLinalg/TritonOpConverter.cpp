@@ -171,37 +171,28 @@ TransposeConverter::matchAndRewrite(triton::TransOp op, OpAdaptor adaptor,
   return success();
 }
 
-bool hasOnlyBlockPtrBaseUses(Value value) {
-  auto pointerType = dyn_cast<triton::PointerType>(value.getType());
-  if (!pointerType || isa<ShapedType>(pointerType.getPointeeType()) ||
-      value.use_empty())
-    return false;
-
-  return llvm::all_of(value.getUses(), [&](OpOperand &use) {
-    auto makePtr = dyn_cast<triton::MakeTensorPtrOp>(use.getOwner());
-    return makePtr && makePtr.getBase() == value;
-  });
-}
-
-bool isBlockPtrBaseTransport(scf::IfOp op) {
+bool hasScalarPointerResult(scf::IfOp op) {
   bool hasPointerResult = false;
-  for (Value result : op.getResults()) {
-    if (!isa<triton::PointerType>(result.getType()))
+  for (Type resultType : op.getResultTypes()) {
+    auto pointerType = dyn_cast<triton::PointerType>(resultType);
+    if (!pointerType)
       continue;
-    hasPointerResult = true;
-    if (!hasOnlyBlockPtrBaseUses(result))
+    if (isa<ShapedType>(pointerType.getPointeeType()))
       return false;
+    hasPointerResult = true;
   }
   return hasPointerResult;
 }
 
-bool isBlockPtrBaseTransport(arith::SelectOp op) {
-  return hasOnlyBlockPtrBaseUses(op.getResult());
+bool isScalarPointerSelect(arith::SelectOp op) {
+  auto pointerType = dyn_cast<triton::PointerType>(op.getType());
+  return pointerType &&
+         !isa<ShapedType>(pointerType.getPointeeType());
 }
 
 // Convert a scalar Triton pointer type to the canonical memref descriptor used
-// by TritonTypeConverter. BlockPtr bases carry complete, offset-free allocation
-// addresses, so control-flow joins do not need a dynamic layout.
+// by TritonTypeConverter. It is reconstructed only after a complete byte
+// address has crossed control flow, so it needs no dynamic layout.
 static FailureOr<MemRefType>
 getScalarPointerCarrierType(Type originalType,
                             const TypeConverter &typeConverter) {
@@ -219,16 +210,16 @@ getScalarPointerCarrierType(Type originalType,
   return memrefType;
 }
 
-static FailureOr<Type> getIfResultCarrierType(
-    Type originalType, const TypeConverter &typeConverter) {
-  if (!isa<triton::PointerType>(originalType))
-    return originalType;
+static FailureOr<Type>
+getIfResultCarrierType(Type originalType,
+                       const TypeConverter &typeConverter) {
+  if (isa<triton::PointerType>(originalType))
+    return IntegerType::get(originalType.getContext(), 64);
 
-  FailureOr<MemRefType> carrier =
-      getScalarPointerCarrierType(originalType, typeConverter);
-  if (failed(carrier))
+  Type convertedType = typeConverter.convertType(originalType);
+  if (!convertedType)
     return failure();
-  return Type(*carrier);
+  return convertedType;
 }
 
 // Materialize a no-op-compatible memref cast to the common carrier. Returning
@@ -248,13 +239,55 @@ castToMemRefCarrier(Value value, MemRefType carrierType, Location loc,
   return rewriter.create<memref::CastOp>(loc, carrierType, value).getResult();
 }
 
+// Converts a memref descriptor into the complete byte address represented by
+// that descriptor. extract_aligned_pointer_as_index yields the aligned buffer
+// pointer; the descriptor's element offset must therefore be converted to
+// bytes and added explicitly before the address crosses control flow.
+static FailureOr<Value>
+materializePointerAddress(Value value, Location loc,
+                          ConversionPatternRewriter &rewriter) {
+  auto memrefType = dyn_cast<MemRefType>(value.getType());
+  if (!memrefType)
+    return failure();
+  Type elementType = memrefType.getElementType();
+  if (!elementType.isIntOrFloat())
+    return failure();
+
+  Value address = rewriter.create<memref::ExtractAlignedPointerAsIndexOp>(
+      loc, value);
+  int64_t staticOffset = memrefType.getStridesAndOffset().second;
+  if (staticOffset != 0) {
+    Value elementOffset;
+    if (ShapedType::isDynamic(staticOffset)) {
+      elementOffset =
+          rewriter.create<memref::ExtractStridedMetadataOp>(loc, value)
+              .getOffset();
+    } else {
+      elementOffset =
+          rewriter.create<arith::ConstantIndexOp>(loc, staticOffset);
+    }
+
+    int64_t elementBytes =
+        (elementType.getIntOrFloatBitWidth() + 7) / 8;
+    if (elementBytes != 1) {
+      Value scale =
+          rewriter.create<arith::ConstantIndexOp>(loc, elementBytes);
+      elementOffset =
+          rewriter.create<arith::MulIOp>(loc, elementOffset, scale);
+    }
+    address = rewriter.create<arith::AddIOp>(loc, address, elementOffset);
+  }
+  return rewriter.create<arith::IndexCastOp>(
+      loc, rewriter.getI64Type(), address);
+}
+
 LogicalResult
 IfConverter::matchAndRewrite(scf::IfOp op, OpAdaptor adaptor,
                              ConversionPatternRewriter &rewriter) const {
   const TypeConverter *typeConverter = getTypeConverter();
   if (!typeConverter)
     return rewriter.notifyMatchFailure(op, "requires a type converter");
-  if (!isBlockPtrBaseTransport(op))
+  if (!hasScalarPointerResult(op))
     return failure();
 
   SmallVector<Type> convertedResultTypes;
@@ -282,39 +315,62 @@ IfConverter::matchAndRewrite(scf::IfOp op, OpAdaptor adaptor,
                               newIfOp.getThenRegion().end());
   rewriter.inlineRegionBefore(op.getElseRegion(), newIfOp.getElseRegion(),
                               newIfOp.getElseRegion().end());
-  rewriter.replaceOp(op, newIfOp.getResults());
+
+  SmallVector<Value> replacementResults;
+  replacementResults.reserve(op.getNumResults());
+  rewriter.setInsertionPointAfter(newIfOp);
+  for (auto [originalResultType, newResult] :
+       llvm::zip(op.getResultTypes(), newIfOp.getResults())) {
+    if (!isa<triton::PointerType>(originalResultType)) {
+      replacementResults.push_back(newResult);
+      continue;
+    }
+    FailureOr<MemRefType> resultType =
+        getScalarPointerCarrierType(originalResultType, *typeConverter);
+    if (failed(resultType))
+      return rewriter.notifyMatchFailure(
+          op, "could not reconstruct a scalar pointer result");
+    replacementResults.push_back(
+        rewriter
+            .create<hivm::PointerCastOp>(op.getLoc(), *resultType,
+                                         ValueRange{newResult})
+            .getResult());
+  }
+  rewriter.replaceOp(op, replacementResults);
   return success();
 }
 
 LogicalResult PointerSelectConverter::matchAndRewrite(
     arith::SelectOp op, OpAdaptor adaptor,
     ConversionPatternRewriter &rewriter) const {
-  if (!isBlockPtrBaseTransport(op))
+  if (!isScalarPointerSelect(op))
     return failure();
 
   const TypeConverter *typeConverter = getTypeConverter();
   if (!typeConverter)
     return rewriter.notifyMatchFailure(op, "requires a type converter");
 
-  FailureOr<MemRefType> carrierType =
+  FailureOr<MemRefType> resultType =
       getScalarPointerCarrierType(op.getType(), *typeConverter);
-  if (failed(carrierType))
+  if (failed(resultType))
     return rewriter.notifyMatchFailure(
         op, "could not build a scalar pointer memref carrier");
 
-  FailureOr<Value> trueValue = castToMemRefCarrier(
-      adaptor.getTrueValue(), *carrierType, op.getLoc(), rewriter);
-  FailureOr<Value> falseValue = castToMemRefCarrier(
-      adaptor.getFalseValue(), *carrierType, op.getLoc(), rewriter);
-  if (failed(trueValue) || failed(falseValue))
+  FailureOr<Value> trueAddress = materializePointerAddress(
+      adaptor.getTrueValue(), op.getLoc(), rewriter);
+  FailureOr<Value> falseAddress = materializePointerAddress(
+      adaptor.getFalseValue(), op.getLoc(), rewriter);
+  if (failed(trueAddress) || failed(falseAddress))
     return rewriter.notifyMatchFailure(
-        op, "selected pointer values cannot use a common memref carrier");
+        op, "selected pointer values have no complete integer address");
 
-  auto convertedSelect = rewriter.create<arith::SelectOp>(
-      op.getLoc(), *carrierType, adaptor.getCondition(), *trueValue,
-      *falseValue);
-  convertedSelect->setAttrs(op->getAttrs());
-  rewriter.replaceOp(op, convertedSelect.getResult());
+  auto selectedAddress = rewriter.create<arith::SelectOp>(
+      op.getLoc(), rewriter.getI64Type(), adaptor.getCondition(),
+      *trueAddress, *falseAddress);
+  selectedAddress->setAttrs(op->getAttrs());
+  auto pointerCast = rewriter.create<hivm::PointerCastOp>(
+      op.getLoc(), *resultType, ValueRange{selectedAddress.getResult()});
+  rewriter.replaceOp(op, pointerCast.getResult());
   return success();
 }
 
@@ -323,8 +379,8 @@ YieldConverter::matchAndRewrite(scf::YieldOp op, OpAdaptor adaptor,
                                 ConversionPatternRewriter &rewriter) const {
   SmallVector<Value> convertedOperands(adaptor.getOperands());
 
-  // Pointer-bearing scf.if uses the canonical scalar-pointer memref type at the
-  // join. Cast each converted branch value to that exact result type.
+  // A rewritten pointer-bearing scf.if carries complete i64 addresses. Other
+  // converted results retain the existing exact-type memref cast behavior.
   if (auto parentIf = dyn_cast<scf::IfOp>(op->getParentOp());
       parentIf &&
       llvm::none_of(parentIf.getResultTypes(),
@@ -338,6 +394,16 @@ YieldConverter::matchAndRewrite(scf::YieldOp op, OpAdaptor adaptor,
       Value &operand = convertedOperands[index];
       if (operand.getType() == targetType)
         continue;
+
+      if (targetType.isInteger(64) && isa<MemRefType>(operand.getType())) {
+        FailureOr<Value> address =
+            materializePointerAddress(operand, op.getLoc(), rewriter);
+        if (failed(address))
+          return rewriter.notifyMatchFailure(
+              op, "could not materialize a yielded pointer address");
+        operand = *address;
+        continue;
+      }
       auto targetMemrefType = dyn_cast<MemRefType>(targetType);
       if (!targetMemrefType)
         return rewriter.notifyMatchFailure(
@@ -2890,26 +2956,41 @@ DotScaledConverter::matchAndRewrite(triton::DotScaledOp op, OpAdaptor adaptor,
 }
 
 LogicalResult
+IntToPtrConverter::matchAndRewrite(triton::IntToPtrOp op, OpAdaptor adaptor,
+                                   ConversionPatternRewriter &rewriter) const {
+  auto pointerType = dyn_cast<triton::PointerType>(op.getType());
+  if (!pointerType || isa<ShapedType>(pointerType.getPointeeType()))
+    return rewriter.notifyMatchFailure(
+        op, "only scalar pointer reconstruction is supported");
+
+  const TypeConverter *typeConverter = getTypeConverter();
+  if (!typeConverter)
+    return rewriter.notifyMatchFailure(op, "requires a type converter");
+  auto resultType =
+      dyn_cast<MemRefType>(typeConverter->convertType(op.getType()));
+  if (!resultType)
+    return rewriter.notifyMatchFailure(
+        op, "pointer result did not convert to a memref type");
+
+  // Rebuild the memref only after the integer address has crossed control
+  // flow. Selecting an i64 address is a pure SSA operation and avoids the
+  // backend interpreting a memref-valued merge as a GM-to-UB copy.
+  auto pointerCast = rewriter.create<hivm::PointerCastOp>(
+      op.getLoc(), resultType, ValueRange{adaptor.getSrc()});
+  rewriter.replaceOp(op, pointerCast.getResult());
+  return success();
+}
+
+LogicalResult
 PtrToIntConverter::matchAndRewrite(triton::PtrToIntOp op, OpAdaptor adaptor,
                                    ConversionPatternRewriter &rewriter) const {
-  auto loc = op.getLoc();
-  Value ptr = adaptor.getSrc();
-
-  if (!mlir::isa<MemRefType>(ptr.getType())) {
+  FailureOr<Value> address =
+      materializePointerAddress(adaptor.getSrc(), op.getLoc(), rewriter);
+  if (failed(address)) {
     return rewriter.notifyMatchFailure(op, "input is not a memref type");
   }
 
-  auto resultType = op.getType();
-
-  // memref.extract_aligned_pointer_as_index is used to obtain the integer
-  // representation of the base address.
-  auto ptrToIndexOp =
-      rewriter.create<memref::ExtractAlignedPointerAsIndexOp>(loc, ptr);
-
-  Value intResult =
-      rewriter.create<arith::IndexCastOp>(loc, resultType, ptrToIndexOp);
-
-  rewriter.replaceOp(op, intResult);
+  rewriter.replaceOp(op, *address);
   return success();
 }
 

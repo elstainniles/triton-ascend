@@ -22,14 +22,17 @@ module {
 
 // CHECK-LABEL: tt.func public @if_block_ptr_different_base(
 // CHECK-SAME:  %[[BASE0:.*]]: !tt.ptr<f32>, %[[BASE1:.*]]: !tt.ptr<f32>
-// CHECK:       %[[SELECTED:.*]]:4 = scf.if {{.*}}
-// CHECK-SAME:      -> (!tt.ptr<f32>, i64, i64, i32) {
-// CHECK:         scf.yield %[[BASE0]], %{{.*}}, %{{.*}}, %{{.*}}
-// CHECK-SAME:        : !tt.ptr<f32>, i64, i64, i32
+// CHECK:       %[[BASE0_ADDR:.*]] = tt.ptr_to_int %[[BASE0]]
+// CHECK:       %[[BASE1_ADDR:.*]] = tt.ptr_to_int %[[BASE1]]
+// CHECK:       %[[SELECTED:[^ ]+]]:4 = scf.if %{{.*}} ->
+// CHECK-SAME:      (i64, i64, i64, i32) {
+// CHECK:         scf.yield %[[BASE0_ADDR]], %{{.*}}, %{{.*}}, %{{.*}}
+// CHECK-SAME:        : i64, i64, i64, i32
 // CHECK:       } else {
-// CHECK:         scf.yield %[[BASE1]], %{{.*}}, %{{.*}}, %{{.*}}
-// CHECK-SAME:        : !tt.ptr<f32>, i64, i64, i32
+// CHECK:         scf.yield %[[BASE1_ADDR]], %{{.*}}, %{{.*}}, %{{.*}}
+// CHECK-SAME:        : i64, i64, i64, i32
 // CHECK:       }
-// CHECK:       %[[REBUILT:.*]] = tt.make_tensor_ptr %[[SELECTED]]#0,
+// CHECK:       %[[SELECTED_BASE:.*]] = tt.int_to_ptr %[[SELECTED]]#0
+// CHECK:       %[[REBUILT:.*]] = tt.make_tensor_ptr %[[SELECTED_BASE]],
 // CHECK-SAME:      [%[[SELECTED]]#1], [%[[SELECTED]]#2], [%[[SELECTED]]#3]
 // CHECK:       tt.return %[[REBUILT]] : !tt.ptr<tensor<16xf32>>

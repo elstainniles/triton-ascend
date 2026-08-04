@@ -26,6 +26,7 @@
 #include "Utils/Utils.h"
 
 #include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/Dialect/SCF/IR/SCF.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
 
 using namespace mlir;
@@ -311,6 +312,15 @@ public:
   /// can obtain their accumulated offsets from the rewrite context.
   bool shouldDecomposeOperation(Operation *op) const override {
     return isa<triton::AddPtrOp>(op);
+  }
+
+  /// Marks loops whose TensorPtr slots now carry complete offsets so the
+  /// downstream lowering does not decompose the same pointer boundary again.
+  void finalizeRewrittenControlFlowOp(Operation *op) const override {
+    if (!isa<scf::ForOp, scf::WhileOp>(op))
+      return;
+    op->setAttr(kPointerDescriptorBoundaryAttr,
+                UnitAttr::get(op->getContext()));
   }
 
   /// Materializes the same decomposition described by analyzeValue. This may

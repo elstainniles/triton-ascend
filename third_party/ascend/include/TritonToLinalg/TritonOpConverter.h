@@ -535,19 +535,13 @@ public:
                   ConversionPatternRewriter &rewriter) const override;
 };
 
-// Return true when value is a Triton scalar pointer used exclusively as the
-// base operand of one or more tt.make_tensor_ptr operations. Restricting the
-// transport conversion to this contract keeps scalar pointer load/store and
-// tensor-of-pointers paths on their existing lowerings.
-bool hasOnlyBlockPtrBaseUses(Value value);
+// These predicates select only scalar !tt.ptr<T> transports. A
+// tensor<...x!tt.ptr<T>> follows the separate tensor-pointer lowering.
+bool hasScalarPointerResult(scf::IfOp op);
+bool isScalarPointerSelect(arith::SelectOp op);
 
-// Return true when every scalar pointer result of the operation satisfies the
-// BlockPtr base-use contract. At least one such pointer result must exist.
-bool isBlockPtrBaseTransport(scf::IfOp op);
-bool isBlockPtrBaseTransport(arith::SelectOp op);
-
-// Rebuild an scf.if whose supported BlockPtr base results are Triton scalar
-// pointers so the control-flow boundary carries memref descriptors instead.
+// Rebuild an scf.if with scalar-pointer results so the boundary carries
+// complete i64 addresses and reconstructs memrefs only after the join.
 // The original branch regions are moved into the new operation, preserving
 // side effects and allowing the conversion driver to rewrite each scf.yield
 // operand in place.
@@ -559,9 +553,7 @@ bool isBlockPtrBaseTransport(arith::SelectOp op);
 //     scf.yield %rhs : !tt.ptr<f32>
 //   }
 //   %ptr = tt.make_tensor_ptr %base, ...
-// becomes an scf.if returning a rank-one strided memref descriptor. A fully
-// dynamic offset and stride let the same result represent either a plain base
-// pointer or a pointer produced by tt.addptr without losing address metadata.
+// becomes an scf.if returning i64 plus one hivm.pointer_cast after the if.
 class IfConverter : public OpConversionPattern<scf::IfOp> {
 public:
   using OpConversionPattern<scf::IfOp>::OpConversionPattern;
@@ -571,19 +563,19 @@ public:
                   ConversionPatternRewriter &rewriter) const override;
 };
 
-// Convert a canonicalized scalar-pointer select used as a BlockPtr base into a
-// select over the standard scalar-pointer memref type. BlockPtr bases are
-// offset-free, so address displacement remains in the explicit descriptor
-// offsets rather than in a dynamic memref layout.
+// Convert a scalar-pointer select into a select over complete integer addresses
+// and reconstruct one memref after the selection. This handles both BlockPtr
+// bases and ordinary scalar pointers without asking the backend to merge two
+// memory objects.
 //
 // Example:
 //   %base = arith.select %cond, %lhs, %rhs : !tt.ptr<f32>
 //   %ptr = tt.make_tensor_ptr %base, ...
 // becomes:
-//   %lhs_carrier = memref.cast %lhs : ... to memref<?xf32>
-//   %rhs_carrier = memref.cast %rhs : ... to memref<?xf32>
-//   %base = arith.select %cond, %lhs_carrier, %rhs_carrier
-//       : memref<?xf32>
+//   %lhs_addr = memref.extract_aligned_pointer_as_index %lhs
+//   %rhs_addr = memref.extract_aligned_pointer_as_index %rhs
+//   %selected_addr = arith.select %cond, %lhs_addr, %rhs_addr : i64
+//   %base = hivm.pointer_cast %selected_addr : i64 to memref<?xf32>
 class PointerSelectConverter : public OpConversionPattern<arith::SelectOp> {
 public:
   using OpConversionPattern<arith::SelectOp>::OpConversionPattern;
@@ -742,6 +734,14 @@ public:
   using OpConversionPattern<triton::PtrToIntOp>::OpConversionPattern;
   LogicalResult
   matchAndRewrite(triton::PtrToIntOp op, OpAdaptor adaptor,
+                  ConversionPatternRewriter &rewriter) const override;
+};
+
+class IntToPtrConverter : public OpConversionPattern<triton::IntToPtrOp> {
+public:
+  using OpConversionPattern<triton::IntToPtrOp>::OpConversionPattern;
+  LogicalResult
+  matchAndRewrite(triton::IntToPtrOp op, OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override;
 };
 
