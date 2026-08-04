@@ -214,6 +214,12 @@ bool isScalarPointer(Value value) {
   return pointerType && !isa<ShapedType>(pointerType.getPointeeType());
 }
 
+bool isTensorPointer(Value value) {
+  auto tensorType = dyn_cast<RankedTensorType>(value.getType());
+  return tensorType &&
+         isa<triton::PointerType>(tensorType.getElementType());
+}
+
 // A scalar pointer selected or carried by structured control flow is already a
 // complete runtime address. Recording the SSA value itself as the source avoids
 // choosing one incoming source and losing the other branch or loop iteration.
@@ -224,6 +230,20 @@ void recordOpaqueScalarPointer(
   offsetMap[pointer].setPtr(pointer);
   offsetMap[pointer].setZeroOffset();
   offsetMap[pointer].setScalarLike(true);
+}
+
+// A per-lane tensor-pointer select may choose a different source for every
+// element, so it cannot be represented by one incoming base plus a structured
+// offset. Preserve the selected pointer tensor itself as the complete opaque
+// base and attach a zero displacement. Later addptr parsing can accumulate an
+// additional offset without discarding the select's lane-wise source choice.
+void recordOpaqueTensorPointer(
+    Value pointerTensor, llvm::DenseMap<Value, PtrOffsetInfo> &offsetMap) {
+  auto tensorType = cast<RankedTensorType>(pointerTensor.getType());
+  offsetMap[pointerTensor] = PtrOffsetInfo();
+  offsetMap[pointerTensor].setPtr(pointerTensor);
+  offsetMap[pointerTensor].setZeroOffset();
+  offsetMap[pointerTensor].setUnstructured(tensorType.getRank());
 }
 
 } // namespace
@@ -815,6 +835,11 @@ void parseSelect(arith::SelectOp op, const Location &loc,
                  llvm::DenseMap<Value, PtrOffsetInfo> &offsetMap) {
   if (isScalarPointer(op.getResult())) {
     recordOpaqueScalarPointer(op.getResult(), offsetMap);
+    return;
+  }
+
+  if (isTensorPointer(op.getResult())) {
+    recordOpaqueTensorPointer(op.getResult(), offsetMap);
     return;
   }
 

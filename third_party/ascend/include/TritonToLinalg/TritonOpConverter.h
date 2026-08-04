@@ -605,6 +605,10 @@ public:
   matchAndRewrite(LoopOpTy op,
                   typename OpConversionPattern<LoopOpTy>::OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
+    // The generic SCF structural converter owns CFO-expanded descriptor loops.
+    // This legacy BlockData rewrite is only valid for explicitly marked loops.
+    if (!op->hasAttr("UnhandledLoopOp"))
+      return failure();
     llvm::SmallDenseMap<Value, BlockData> known;
 
     rewriter.modifyOpInPlace(

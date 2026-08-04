@@ -48,6 +48,7 @@
 #include "mlir/Dialect/ControlFlow/IR/ControlFlowOps.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
+#include "mlir/Dialect/SCF/Transforms/Patterns.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/Operation.h"
 #include "mlir/IR/TypeRange.h"
@@ -568,18 +569,25 @@ void TritonToLinalgPass::addDynamicLegal(
     return !TTOpConverters::hasScalarPointerResult(op);
   });
 
-  target.addDynamicallyLegalOp<scf::ForOp, scf::YieldOp>([](Operation *op) {
-    return llvm::all_of(op->getOperandTypes(), [](Type t) {
-      if (isa<triton::PointerType>(t)) {
-        return false;
-      }
-      if (auto shapedType = dyn_cast<ShapedType>(t)) {
-        return shapedType.getElementType().isIntOrFloat();
-      }
-      assert(t.isIntOrIndexOrFloat());
-      return true;
-    });
-  });
+  auto controlFlowTerminatorLegal =
+      [&tritonTypeConverter](Operation *op) {
+        Operation *parent = op->getParentOp();
+        if (parent && parent->hasAttr(
+                          controlflow::kPointerDescriptorBoundaryAttr))
+          return tritonTypeConverter.isLegal(op);
+
+        return llvm::all_of(op->getOperandTypes(), [](Type t) {
+          if (isa<triton::PointerType>(t))
+            return false;
+          if (auto shapedType = dyn_cast<ShapedType>(t))
+            return shapedType.getElementType().isIntOrFloat();
+          assert(t.isIntOrIndexOrFloat());
+          return true;
+        });
+      };
+
+  target.addDynamicallyLegalOp<scf::YieldOp, scf::ConditionOp>(
+      controlFlowTerminatorLegal);
 
   auto isArithOrMathOpLegal = [this](Operation *op) {
     if (op->hasAttr("MetaUse"))
@@ -686,6 +694,11 @@ void TritonToLinalgPass::populateTritonToLinalgConversionPatterns(
   populateFunctionOpInterfaceTypeConversionPattern<triton::FuncOp>(
       patterns, typeConverter);
 
+  // These generic patterns are selected only for CFO-marked descriptor loops
+  // by the dynamic legality below. Legacy pointer loops remain owned by the
+  // higher-benefit BlockData converters.
+  scf::populateSCFStructuralTypeConversions(typeConverter, patterns);
+
   patterns.add<triton::MetaUseEraser>(patterns.getContext());
   patterns.add<LoadStoreConverter::StoreConverter>(patterns.getContext());
   patterns.add<LoadStoreConverter::AddPtrConverter>(patterns.getContext());
@@ -723,12 +736,14 @@ void TritonToLinalgPass::populateTritonToLinalgConversionPatterns(
   patterns.add<TTOpConverters::CatConverter>(patterns.getContext());
   patterns.add<TTOpConverters::BitcastConverter>(patterns.getContext());
   patterns.add<TTOpConverters::LoopConverter<scf::ForOp>>(
-      patterns.getContext());
+      patterns.getContext(), PatternBenefit(2));
   patterns.add<TTOpConverters::LoopConverter<scf::WhileOp>>(
-      patterns.getContext());
-  patterns.add<TTOpConverters::YieldConverter>(patterns.getContext());
+      patterns.getContext(), PatternBenefit(2));
+  patterns.add<TTOpConverters::YieldConverter>(patterns.getContext(),
+                                               PatternBenefit(2));
   patterns.add<TTOpConverters::IfConverter>(typeConverter,
-                                             patterns.getContext());
+                                             patterns.getContext(),
+                                             PatternBenefit(2));
   patterns.add<TTOpConverters::PointerSelectConverter>(
       typeConverter, patterns.getContext());
 
@@ -1061,8 +1076,11 @@ void TritonToLinalgPass::runOnOperation() {
   this->addDynamicLegal(target, tritonTypeConverter);
 
   // 4. Mark ops that must be converted explicitly (e.g. tt.scan).
-  auto loopOpLegalFn = [](LoopLikeOpInterface op) {
-    return !op.getOperation()->hasAttr("UnhandledLoopOp");
+  auto loopOpLegalFn = [&tritonTypeConverter](LoopLikeOpInterface loopOp) {
+    Operation *op = loopOp.getOperation();
+    if (op->hasAttr(controlflow::kPointerDescriptorBoundaryAttr))
+      return tritonTypeConverter.isLegal(op);
+    return !op->hasAttr("UnhandledLoopOp");
   };
 
   target.addIllegalOp<triton::ScanOp>();
@@ -1090,11 +1108,12 @@ void TritonToLinalgPass::runOnOperation() {
     // pointer-loop decomposition a second time.
     bool hasExpandedPointerDescriptor =
         op->hasAttr(mlir::triton::controlflow::kPointerDescriptorBoundaryAttr);
-    op->removeAttr(
-        mlir::triton::controlflow::kPointerDescriptorBoundaryAttr);
     if (!op->hasAttr("ExtractedLoadOrStore") &&
         !hasExpandedPointerDescriptor)
       op->setAttr("UnhandledLoopOp", UnitAttr::get(op->getContext()));
+
+    if (hasExpandedPointerDescriptor)
+      return;
 
     for (auto res : loopOp->getResults()) {
       if (auto tensorType = dyn_cast<RankedTensorType>(res.getType());
@@ -1110,7 +1129,15 @@ void TritonToLinalgPass::runOnOperation() {
   });
 
   // 7. Convert ops.
-  if (failed(applyPartialConversion(moduleOp, target, std::move(patterns)))) {
+  LogicalResult conversionResult =
+      applyPartialConversion(moduleOp, target, std::move(patterns));
+
+  // The marker is a contract between CFO and this conversion pass; no
+  // downstream dialect should observe this implementation detail.
+  moduleOp.walk([](LoopLikeOpInterface loopOp) {
+    loopOp->removeAttr(controlflow::kPointerDescriptorBoundaryAttr);
+  });
+  if (failed(conversionResult)) {
     moduleOp->emitError("failed to apply Conversion Patterns");
     signalPassFailure();
   }

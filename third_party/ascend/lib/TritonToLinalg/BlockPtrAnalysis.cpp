@@ -59,6 +59,18 @@
 namespace mlir {
 namespace triton {
 
+hivm::PointerCastOp createScalarPointerCast(OpBuilder &builder, Location loc,
+                                            MemRefType resultType,
+                                            Value address) {
+  SmallVector<Value> dynamicSizes;
+  if (resultType.getNumDynamicDims() != 0) {
+    Value defaultSize = builder.create<arith::ConstantIndexOp>(loc, 1);
+    dynamicSizes.assign(resultType.getNumDynamicDims(), defaultSize);
+  }
+  return builder.create<hivm::PointerCastOp>(
+      loc, resultType, ValueRange{address}, ValueRange{dynamicSizes});
+}
+
 // Recognize original scalar-pointer producers whose converted result may act
 // as a memref carrier. The parse site still requires BaseMemRefType, so merely
 // appearing in this list never makes an unconverted pointer an opaque source.
@@ -1378,8 +1390,8 @@ void BlockDataParser::rewriteAddPtr(
     auto rtype = cast<triton::PointerType>(intToPtrOp.getResult().getType());
     auto memrefType =
         MemRefType::get({ShapedType::kDynamic}, rtype.getPointeeType());
-    auto hivmPointCastOp = rewriter.create<hivm::PointerCastOp>(
-        intToPtrOp.getLoc(), memrefType, ValueRange{intToPtrOp.getSrc()});
+    auto hivmPointCastOp = createScalarPointerCast(
+        rewriter, intToPtrOp.getLoc(), memrefType, intToPtrOp.getSrc());
     data.setSource(hivmPointCastOp.getResult());
   }
 
@@ -1449,8 +1461,8 @@ void BlockDataParser::rewriteCustomOp(
       auto rtype = cast<triton::PointerType>(intToPtrOp.getResult().getType());
       auto memrefType =
           MemRefType::get({ShapedType::kDynamic}, rtype.getPointeeType());
-      auto hivmPointCastOp = rewriter.create<hivm::PointerCastOp>(
-          intToPtrOp.getLoc(), memrefType, ValueRange{intToPtrOp.getSrc()});
+      auto hivmPointCastOp = createScalarPointerCast(
+          rewriter, intToPtrOp.getLoc(), memrefType, intToPtrOp.getSrc());
       if (data.getSizesRef().size() == 0) {
         data.getSizesRef().push_back(rewriter.getIndexAttr(1));
         if (data.getScalarRef().isNull()) {

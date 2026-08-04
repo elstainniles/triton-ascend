@@ -15,24 +15,28 @@ module attributes {hacc.target = #hacc.target<"Ascend910B2">} {
 }
 
 // CHECK-LABEL: func.func @scalar_pointer_select(
-// CHECK-SAME:  %[[LHS:.*]]: memref<?xf32>, %[[RHS:.*]]: memref<?xf32>
+// CHECK-SAME:  %[[LHS:[^ ,]+]]: memref<?xf32>, %[[RHS:[^ ,]+]]: memref<?xf32>
 // CHECK:       %[[LHS_INDEX:.*]] = memref.extract_aligned_pointer_as_index %[[LHS]]
 // CHECK:       %[[LHS_ADDRESS:.*]] = arith.index_cast %[[LHS_INDEX]] : index to i64
 // CHECK:       %[[RHS_INDEX:.*]] = memref.extract_aligned_pointer_as_index %[[RHS]]
 // CHECK:       %[[RHS_ADDRESS:.*]] = arith.index_cast %[[RHS_INDEX]] : index to i64
 // CHECK:       %[[SELECTED:.*]] = arith.select %{{.*}}, %[[LHS_ADDRESS]], %[[RHS_ADDRESS]] : i64
 // CHECK-NOT:   arith.select {{.*}} : memref
-// CHECK:       %[[POINTER:.*]] = hivm.pointer_cast
+// CHECK:       %[[DEFAULT_SIZE:.*]] = arith.constant 1 : index
+// CHECK:       %[[POINTER:.*]] = hivm.hir.pointer_cast
 // CHECK-SAME:  %[[SELECTED]]
+// CHECK-SAME:  %[[DEFAULT_SIZE]]
 // CHECK-SAME:  memref<?xf32>
 // CHECK:       %[[POINTER_INDEX:.*]] = memref.extract_aligned_pointer_as_index %[[POINTER]]
 // CHECK:       return %{{.*}} : i64
 
 // CHECK-LABEL: func.func @scalar_pointer_roundtrip(
-// CHECK-SAME:  %[[ADDRESS:.*]]: i64
-// CHECK:       %[[POINTER:.*]] = hivm.pointer_cast
+// CHECK-SAME:  %[[ADDRESS:[^ ,]+]]: i64
+// CHECK:       %[[ROUNDTRIP_SIZE:.*]] = arith.constant 1 : index
+// CHECK:       %[[ROUNDTRIP_POINTER:.*]] = hivm.hir.pointer_cast
 // CHECK-SAME:  %[[ADDRESS]]
+// CHECK-SAME:  %[[ROUNDTRIP_SIZE]]
 // CHECK-SAME:  memref<?xf32>
-// CHECK:       %[[POINTER_INDEX:.*]] = memref.extract_aligned_pointer_as_index %[[POINTER]]
+// CHECK:       %[[POINTER_INDEX:.*]] = memref.extract_aligned_pointer_as_index %[[ROUNDTRIP_POINTER]]
 // CHECK:       %[[ROUNDTRIP:.*]] = arith.index_cast %[[POINTER_INDEX]] : index to i64
 // CHECK:       return %[[ROUNDTRIP]] : i64

@@ -332,9 +332,7 @@ IfConverter::matchAndRewrite(scf::IfOp op, OpAdaptor adaptor,
       return rewriter.notifyMatchFailure(
           op, "could not reconstruct a scalar pointer result");
     replacementResults.push_back(
-        rewriter
-            .create<hivm::PointerCastOp>(op.getLoc(), *resultType,
-                                         ValueRange{newResult})
+        createScalarPointerCast(rewriter, op.getLoc(), *resultType, newResult)
             .getResult());
   }
   rewriter.replaceOp(op, replacementResults);
@@ -369,8 +367,8 @@ LogicalResult PointerSelectConverter::matchAndRewrite(
       op.getLoc(), rewriter.getI64Type(), adaptor.getCondition(),
       *trueAddress, *falseAddress);
   selectedAddress->setAttrs(op->getAttrs());
-  auto pointerCast = rewriter.create<hivm::PointerCastOp>(
-      op.getLoc(), *resultType, ValueRange{selectedAddress.getResult()});
+  auto pointerCast = createScalarPointerCast(
+      rewriter, op.getLoc(), *resultType, selectedAddress.getResult());
   rewriter.replaceOp(op, pointerCast.getResult());
   return success();
 }
@@ -2976,8 +2974,8 @@ IntToPtrConverter::matchAndRewrite(triton::IntToPtrOp op, OpAdaptor adaptor,
   // Rebuild the memref only after the integer address has crossed control
   // flow. Selecting an i64 address is a pure SSA operation and avoids the
   // backend interpreting a memref-valued merge as a GM-to-UB copy.
-  auto pointerCast = rewriter.create<hivm::PointerCastOp>(
-      op.getLoc(), resultType, ValueRange{adaptor.getSrc()});
+  auto pointerCast = createScalarPointerCast(
+      rewriter, op.getLoc(), resultType, adaptor.getSrc());
   rewriter.replaceOp(op, pointerCast.getResult());
   return success();
 }
