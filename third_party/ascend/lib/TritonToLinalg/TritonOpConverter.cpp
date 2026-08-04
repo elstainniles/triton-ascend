@@ -277,8 +277,9 @@ materializePointerAddress(Value value, Location loc,
     }
     address = rewriter.create<arith::AddIOp>(loc, address, elementOffset);
   }
-  return rewriter.create<arith::IndexCastOp>(
-      loc, rewriter.getI64Type(), address);
+  return rewriter
+      .create<arith::IndexCastOp>(loc, rewriter.getI64Type(), address)
+      .getResult();
 }
 
 LogicalResult
