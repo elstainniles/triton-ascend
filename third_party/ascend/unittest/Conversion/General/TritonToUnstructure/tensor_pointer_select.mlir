@@ -22,6 +22,6 @@ tt.func public @opaque_tensor_pointer_select(
 // CHECK:       scf.for
 // CHECK:       %[[LANE_PTR:.*]] = tensor.extract %[[SELECTED]]{{\[}}%{{.*}}] {DiscreteMemAccess} : tensor<4x!tt.ptr<f32>>
 // CHECK:       %[[ACCESS_PTR:.*]] = tt.addptr %[[LANE_PTR]],
-// CHECK-SAME:  : !tt.ptr<f32>, i32
+// CHECK-SAME:  : !tt.ptr<f32>, i64
 // CHECK:       tt.load %[[ACCESS_PTR]] {DiscreteMemAccess} : !tt.ptr<f32>
 // CHECK:       tt.return

@@ -76,6 +76,7 @@
 
 #include "llvm/ADT/BitVector.h"
 #include "llvm/ADT/STLExtras.h"
+#include "llvm/ADT/SmallPtrSet.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/SmallVectorExtras.h"
 #include "llvm/ADT/Twine.h"
@@ -107,6 +108,50 @@ static bool containsTritonPointer(Type type) {
 static bool hasPointerFreeBoundary(Operation *op) {
   return llvm::none_of(op->getOperandTypes(), containsTritonPointer) &&
          llvm::none_of(op->getResultTypes(), containsTritonPointer);
+}
+
+// Adds region terminator operands to a backward SSA worklist so the caller can
+// cross yield boundaries in nested structured control flow.
+static void appendRegionTerminatorOperands(
+    Operation *op, SmallVectorImpl<Value> &producerWorklist) {
+  for (Region &region : op->getRegions()) {
+    for (Block &block : region) {
+      Operation *terminator = block.getTerminator();
+      if (terminator)
+        producerWorklist.append(terminator->operand_begin(),
+                                terminator->operand_end());
+    }
+  }
+}
+
+// PointerDescriptorBoundary loops carry the scalar/tensor values required to
+// rebuild a Triton pointer after the loop. These values are address metadata
+// from UseAnalysis' perspective, but they remain live SSA operands at the
+// pointer-free control-flow boundary. Preserve their complete producer closure
+// so MetaUseEraser cannot leave the loop with dangling replacement casts.
+static void preservePointerDescriptorComputations(ModuleOp moduleOp) {
+  moduleOp.walk([&](LoopLikeOpInterface loopOp) {
+    Operation *loop = loopOp.getOperation();
+    if (!loop->hasAttr(controlflow::kPointerDescriptorBoundaryAttr))
+      return;
+
+    loop->removeAttr("MetaUse");
+
+    SmallVector<Value> producerWorklist(loop->getOperands());
+    appendRegionTerminatorOperands(loop, producerWorklist);
+    llvm::SmallPtrSet<Operation *, 32> visitedProducers;
+
+    while (!producerWorklist.empty()) {
+      Operation *producer = producerWorklist.pop_back_val().getDefiningOp();
+      if (!producer || !visitedProducers.insert(producer).second)
+        continue;
+
+      producer->removeAttr("MetaUse");
+      producerWorklist.append(producer->operand_begin(),
+                              producer->operand_end());
+      appendRegionTerminatorOperands(producer, producerWorklist);
+    }
+  });
 }
 
 // Convert structured custom ops after operand type converted,
@@ -1078,6 +1123,8 @@ void TritonToLinalgPass::runOnOperation() {
       signalPassFailure();
     }
   });
+
+  preservePointerDescriptorComputations(moduleOp);
 
   RewritePatternSet patterns(&getContext());
   ConversionTarget target(getContext());
