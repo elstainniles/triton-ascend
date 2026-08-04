@@ -48,7 +48,6 @@
 #include "mlir/Dialect/ControlFlow/IR/ControlFlowOps.h"
 #include "mlir/Dialect/Func/IR/FuncOps.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
-#include "mlir/Dialect/SCF/Transforms/Patterns.h"
 #include "mlir/IR/Builders.h"
 #include "mlir/IR/Operation.h"
 #include "mlir/IR/TypeRange.h"
@@ -97,6 +96,18 @@ using namespace triton;
 int nd2nzFlag = 0;
 bool compileOn91095Flag = false;
 bool existDotFlag = false;
+
+static bool containsTritonPointer(Type type) {
+  if (isa<triton::PointerType>(type))
+    return true;
+  auto shapedType = dyn_cast<ShapedType>(type);
+  return shapedType && isa<triton::PointerType>(shapedType.getElementType());
+}
+
+static bool hasPointerFreeBoundary(Operation *op) {
+  return llvm::none_of(op->getOperandTypes(), containsTritonPointer) &&
+         llvm::none_of(op->getResultTypes(), containsTritonPointer);
+}
 
 // Convert structured custom ops after operand type converted,
 // for example tt.ptr converted to memref.
@@ -569,22 +580,27 @@ void TritonToLinalgPass::addDynamicLegal(
     return !TTOpConverters::hasScalarPointerResult(op);
   });
 
-  auto controlFlowTerminatorLegal =
-      [&tritonTypeConverter](Operation *op) {
-        Operation *parent = op->getParentOp();
-        if (parent && parent->hasAttr(
-                          controlflow::kPointerDescriptorBoundaryAttr))
-          return tritonTypeConverter.isLegal(op);
+  auto controlFlowTerminatorLegal = [](Operation *op) {
+    Operation *parent = op->getParentOp();
+    if (parent && parent->hasAttr(
+                      TTOpConverters::kScalarPointerCarrierBoundaryAttr)) {
+      auto parentIf = cast<scf::IfOp>(parent);
+      return llvm::equal(op->getOperandTypes(), parentIf.getResultTypes());
+    }
 
-        return llvm::all_of(op->getOperandTypes(), [](Type t) {
-          if (isa<triton::PointerType>(t))
-            return false;
-          if (auto shapedType = dyn_cast<ShapedType>(t))
-            return shapedType.getElementType().isIntOrFloat();
-          assert(t.isIntOrIndexOrFloat());
-          return true;
-        });
-      };
+    if (parent &&
+        parent->hasAttr(controlflow::kPointerDescriptorBoundaryAttr))
+      return hasPointerFreeBoundary(op);
+
+    return llvm::all_of(op->getOperandTypes(), [](Type t) {
+      if (isa<triton::PointerType>(t))
+        return false;
+      if (auto shapedType = dyn_cast<ShapedType>(t))
+        return shapedType.getElementType().isIntOrFloat();
+      assert(t.isIntOrIndexOrFloat());
+      return true;
+    });
+  };
 
   target.addDynamicallyLegalOp<scf::YieldOp, scf::ConditionOp>(
       controlFlowTerminatorLegal);
@@ -693,11 +709,6 @@ void TritonToLinalgPass::populateTritonToLinalgConversionPatterns(
   nd2nzFlag = this->enableNd2nzOnVector;
   populateFunctionOpInterfaceTypeConversionPattern<triton::FuncOp>(
       patterns, typeConverter);
-
-  // These generic patterns are selected only for CFO-marked descriptor loops
-  // by the dynamic legality below. Legacy pointer loops remain owned by the
-  // higher-benefit BlockData converters.
-  scf::populateSCFStructuralTypeConversions(typeConverter, patterns);
 
   patterns.add<triton::MetaUseEraser>(patterns.getContext());
   patterns.add<LoadStoreConverter::StoreConverter>(patterns.getContext());
@@ -1076,10 +1087,10 @@ void TritonToLinalgPass::runOnOperation() {
   this->addDynamicLegal(target, tritonTypeConverter);
 
   // 4. Mark ops that must be converted explicitly (e.g. tt.scan).
-  auto loopOpLegalFn = [&tritonTypeConverter](LoopLikeOpInterface loopOp) {
+  auto loopOpLegalFn = [](LoopLikeOpInterface loopOp) {
     Operation *op = loopOp.getOperation();
     if (op->hasAttr(controlflow::kPointerDescriptorBoundaryAttr))
-      return tritonTypeConverter.isLegal(op);
+      return hasPointerFreeBoundary(op);
     return !op->hasAttr("UnhandledLoopOp");
   };
 
@@ -1136,6 +1147,9 @@ void TritonToLinalgPass::runOnOperation() {
   // downstream dialect should observe this implementation detail.
   moduleOp.walk([](LoopLikeOpInterface loopOp) {
     loopOp->removeAttr(controlflow::kPointerDescriptorBoundaryAttr);
+  });
+  moduleOp.walk([](scf::IfOp ifOp) {
+    ifOp->removeAttr(TTOpConverters::kScalarPointerCarrierBoundaryAttr);
   });
   if (failed(conversionResult)) {
     moduleOp->emitError("failed to apply Conversion Patterns");

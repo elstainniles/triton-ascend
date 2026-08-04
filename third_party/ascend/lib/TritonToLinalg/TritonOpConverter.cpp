@@ -306,6 +306,8 @@ IfConverter::matchAndRewrite(scf::IfOp op, OpAdaptor adaptor,
       op.getLoc(), convertedResultTypes, adaptor.getCondition(),
       /*withElseRegion=*/true);
   newIfOp->setAttrs(op->getAttrs());
+  newIfOp->setAttr(kScalarPointerCarrierBoundaryAttr,
+                   UnitAttr::get(rewriter.getContext()));
 
   // Move the original regions instead of cloning them. Besides preserving
   // side effects, this keeps nested operations in the conversion driver's
@@ -376,45 +378,42 @@ LogicalResult PointerSelectConverter::matchAndRewrite(
 LogicalResult
 YieldConverter::matchAndRewrite(scf::YieldOp op, OpAdaptor adaptor,
                                 ConversionPatternRewriter &rewriter) const {
+  auto parentIf = dyn_cast<scf::IfOp>(op->getParentOp());
+  if (!parentIf ||
+      !parentIf->hasAttr(kScalarPointerCarrierBoundaryAttr))
+    return failure();
+
   SmallVector<Value> convertedOperands(adaptor.getOperands());
 
-  // A rewritten pointer-bearing scf.if carries complete i64 addresses. Other
-  // converted results retain the existing exact-type memref cast behavior.
-  if (auto parentIf = dyn_cast<scf::IfOp>(op->getParentOp());
-      parentIf &&
-      llvm::none_of(parentIf.getResultTypes(),
-                    [](Type type) { return isa<triton::PointerType>(type); })) {
-    if (parentIf.getNumResults() != convertedOperands.size())
-      return rewriter.notifyMatchFailure(op,
-                                         "yield/result arity does not match");
+  if (parentIf.getNumResults() != convertedOperands.size())
+    return rewriter.notifyMatchFailure(op, "yield/result arity does not match");
 
-    for (auto [index, targetType] :
-         llvm::enumerate(parentIf.getResultTypes())) {
-      Value &operand = convertedOperands[index];
-      if (operand.getType() == targetType)
-        continue;
+  for (auto [index, targetType] :
+       llvm::enumerate(parentIf.getResultTypes())) {
+    Value &operand = convertedOperands[index];
+    if (operand.getType() == targetType)
+      continue;
 
-      if (targetType.isInteger(64) && isa<MemRefType>(operand.getType())) {
-        FailureOr<Value> address =
-            materializePointerAddress(operand, op.getLoc(), rewriter);
-        if (failed(address))
-          return rewriter.notifyMatchFailure(
-              op, "could not materialize a yielded pointer address");
-        operand = *address;
-        continue;
-      }
-      auto targetMemrefType = dyn_cast<MemRefType>(targetType);
-      if (!targetMemrefType)
+    if (targetType.isInteger(64) && isa<MemRefType>(operand.getType())) {
+      FailureOr<Value> address =
+          materializePointerAddress(operand, op.getLoc(), rewriter);
+      if (failed(address))
         return rewriter.notifyMatchFailure(
-            op, "converted yield operand is incompatible with if result");
-
-      FailureOr<Value> casted = castToMemRefCarrier(
-          operand, targetMemrefType, op.getLoc(), rewriter);
-      if (failed(casted))
-        return rewriter.notifyMatchFailure(
-            op, "converted yield operand is incompatible with if result");
-      operand = *casted;
+            op, "could not materialize a yielded pointer address");
+      operand = *address;
+      continue;
     }
+    auto targetMemrefType = dyn_cast<MemRefType>(targetType);
+    if (!targetMemrefType)
+      return rewriter.notifyMatchFailure(
+          op, "converted yield operand is incompatible with if result");
+
+    FailureOr<Value> casted = castToMemRefCarrier(
+        operand, targetMemrefType, op.getLoc(), rewriter);
+    if (failed(casted))
+      return rewriter.notifyMatchFailure(
+          op, "converted yield operand is incompatible with if result");
+    operand = *casted;
   }
 
   rewriter.replaceOpWithNewOp<scf::YieldOp>(op, convertedOperands);

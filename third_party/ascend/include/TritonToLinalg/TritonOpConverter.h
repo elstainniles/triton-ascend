@@ -37,6 +37,7 @@
 #include "mlir/Transforms/DialectConversion.h"
 
 #include "llvm/ADT/SmallVector.h"
+#include "llvm/ADT/StringRef.h"
 #include "llvm/ADT/TypeSwitch.h"
 #include "llvm/Support/Debug.h"
 
@@ -540,6 +541,12 @@ public:
 bool hasScalarPointerResult(scf::IfOp op);
 bool isScalarPointerSelect(arith::SelectOp op);
 
+// Marks an scf.if temporarily rebuilt by IfConverter. Its scalar-pointer
+// results are represented as complete i64 addresses, so only its own yields
+// require the matching pointer-to-address conversion.
+inline constexpr llvm::StringLiteral kScalarPointerCarrierBoundaryAttr =
+    "ScalarPointerCarrierBoundary";
+
 // Rebuild an scf.if with scalar-pointer results so the boundary carries
 // complete i64 addresses and reconstructs memrefs only after the join.
 // The original branch regions are moved into the new operation, preserving
@@ -585,6 +592,10 @@ public:
                   ConversionPatternRewriter &rewriter) const override;
 };
 
+// Convert the yields of an IfConverter-created scf.if to its carrier result
+// types. In particular, a yielded scalar pointer becomes its complete i64
+// address. Yields belonging to ordinary ifs or loops are intentionally left to
+// their owning conversions.
 class YieldConverter : public OpConversionPattern<scf::YieldOp> {
 public:
   using OpConversionPattern<scf::YieldOp>::OpConversionPattern;
@@ -605,8 +616,9 @@ public:
   matchAndRewrite(LoopOpTy op,
                   typename OpConversionPattern<LoopOpTy>::OpAdaptor adaptor,
                   ConversionPatternRewriter &rewriter) const override {
-    // The generic SCF structural converter owns CFO-expanded descriptor loops.
-    // This legacy BlockData rewrite is only valid for explicitly marked loops.
+    // CFO-expanded descriptor loops already carry pointer-free policy values
+    // and remain structurally unchanged. This legacy BlockData rewrite is only
+    // valid for explicitly marked loops.
     if (!op->hasAttr("UnhandledLoopOp"))
       return failure();
     llvm::SmallDenseMap<Value, BlockData> known;
