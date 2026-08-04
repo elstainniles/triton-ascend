@@ -572,18 +572,18 @@ public:
 };
 
 // Convert a canonicalized scalar-pointer select used as a BlockPtr base into a
-// select over a common dynamic-strided memref carrier. Both the selected source
-// allocation and its runtime descriptor offset remain available to
-// tt.make_tensor_ptr lowering.
+// select over the standard scalar-pointer memref type. BlockPtr bases are
+// offset-free, so address displacement remains in the explicit descriptor
+// offsets rather than in a dynamic memref layout.
 //
 // Example:
 //   %base = arith.select %cond, %lhs, %rhs : !tt.ptr<f32>
 //   %ptr = tt.make_tensor_ptr %base, ...
 // becomes:
-//   %lhs_carrier = memref.cast %lhs : ... to memref<?xf32, strided<[?], offset: ?>>
-//   %rhs_carrier = memref.cast %rhs : ... to memref<?xf32, strided<[?], offset: ?>>
+//   %lhs_carrier = memref.cast %lhs : ... to memref<?xf32>
+//   %rhs_carrier = memref.cast %rhs : ... to memref<?xf32>
 //   %base = arith.select %cond, %lhs_carrier, %rhs_carrier
-//       : memref<?xf32, strided<[?], offset: ?>>
+//       : memref<?xf32>
 class PointerSelectConverter : public OpConversionPattern<arith::SelectOp> {
 public:
   using OpConversionPattern<arith::SelectOp>::OpConversionPattern;
@@ -615,9 +615,9 @@ public:
                   ConversionPatternRewriter &rewriter) const override {
     llvm::SmallDenseMap<Value, BlockData> known;
 
-    op->removeAttr("UnhandledLoopOp");
-    BlockDataParser::rewriteLoopOp(op, rewriter, known);
-    return success();
+    rewriter.modifyOpInPlace(
+        op, [&]() { op->removeAttr("UnhandledLoopOp"); });
+    return BlockDataParser::rewriteLoopOp(op, rewriter, known);
   }
 };
 

@@ -25,8 +25,11 @@
 #include "TritonControlFlowOpt/ControlFlowRewrite.h"
 #include "Utils/Utils.h"
 
+#include "mlir/Dialect/Arith/IR/Arith.h"
+#include "mlir/Dialect/SCF/IR/SCF.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
 
+#include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/STLExtras.h"
 
 using namespace mlir;
@@ -87,6 +90,90 @@ getAllComponentIndices(const AnalyzedValue &value) {
   for (unsigned index = 0; index < value.components.size(); ++index)
     indices.push_back(index);
   return indices;
+}
+
+// Returns true when a block-pointer base hides address displacement in
+// tt.addptr. The traversal follows scalar-pointer transports through SCF and
+// arith.select so an addptr cannot be hidden behind a control-flow result.
+static bool hasAddPtrInBaseProvenance(Value value,
+                                      llvm::DenseSet<Value> &visited) {
+  if (!value || !visited.insert(value).second)
+    return false;
+  if (value.getDefiningOp<triton::AddPtrOp>())
+    return true;
+
+  auto followsAddPtr = [&](Value source) {
+    return hasAddPtrInBaseProvenance(source, visited);
+  };
+
+  if (auto selectOp = value.getDefiningOp<arith::SelectOp>())
+    return followsAddPtr(selectOp.getTrueValue()) ||
+           followsAddPtr(selectOp.getFalseValue());
+
+  if (auto ifOp = value.getDefiningOp<scf::IfOp>()) {
+    unsigned resultIndex = cast<OpResult>(value).getResultNumber();
+    return followsAddPtr(ifOp.thenYield().getOperand(resultIndex)) ||
+           followsAddPtr(ifOp.elseYield().getOperand(resultIndex));
+  }
+
+  if (auto forOp = value.getDefiningOp<scf::ForOp>()) {
+    unsigned resultIndex = cast<OpResult>(value).getResultNumber();
+    return followsAddPtr(forOp.getInitArgs()[resultIndex]) ||
+           followsAddPtr(forOp.getYieldedValues()[resultIndex]);
+  }
+
+  if (auto whileOp = value.getDefiningOp<scf::WhileOp>()) {
+    unsigned resultIndex = cast<OpResult>(value).getResultNumber();
+    return followsAddPtr(whileOp.getInits()[resultIndex]) ||
+           followsAddPtr(whileOp.getConditionOp().getArgs()[resultIndex]);
+  }
+
+  if (auto blockArgument = dyn_cast<BlockArgument>(value)) {
+    Operation *parentOp = blockArgument.getOwner()->getParentOp();
+    unsigned argumentIndex = blockArgument.getArgNumber();
+    if (auto forOp = dyn_cast_or_null<scf::ForOp>(parentOp)) {
+      if (argumentIndex == 0)
+        return false;
+      unsigned iterArgIndex = argumentIndex - 1;
+      return followsAddPtr(forOp.getInitArgs()[iterArgIndex]) ||
+             followsAddPtr(forOp.getYieldedValues()[iterArgIndex]);
+    }
+    if (auto whileOp = dyn_cast_or_null<scf::WhileOp>(parentOp)) {
+      if (blockArgument.getOwner() == whileOp.getBeforeBody())
+        return followsAddPtr(whileOp.getInits()[argumentIndex]) ||
+               followsAddPtr(
+                   whileOp.getYieldOp().getOperand(argumentIndex));
+      if (blockArgument.getOwner() == whileOp.getAfterBody())
+        return followsAddPtr(
+            whileOp.getConditionOp().getArgs()[argumentIndex]);
+    }
+    return false;
+  }
+
+  Operation *definingOp = value.getDefiningOp();
+  if (!definingOp)
+    return false;
+  return llvm::any_of(definingOp->getOperands(), [&](Value operand) {
+    return isa<triton::PointerType>(operand.getType()) &&
+           followsAddPtr(operand);
+  });
+}
+
+// A block pointer descriptor starts from an offset-free allocation base. Any
+// displacement must be represented by make_tensor_ptr offsets so it remains
+// explicit when the descriptor is flattened across control flow.
+static LogicalResult verifyOffsetFreeBlockPtrBases(ModuleOp module) {
+  bool valid = true;
+  module.walk([&](triton::MakeTensorPtrOp makePtr) {
+    llvm::DenseSet<Value> visited;
+    if (!hasAddPtrInBaseProvenance(makePtr.getBase(), visited))
+      return;
+    makePtr.emitOpError(
+        "requires an offset-free base; encode address displacement in the "
+        "make_tensor_ptr offsets instead of tt.addptr");
+    valid = false;
+  });
+  return success(valid);
 }
 
 class BlockPtrPolicy final : public ControlFlowRewritePolicy {
@@ -308,6 +395,8 @@ namespace mlir::triton::controlflow {
 LogicalResult runBlockPtrDecompose(ModuleOp module) {
   // Expand every BlockPtr that crosses a supported SCF boundary into its full
   // ordered descriptor, then rebuild the pointer at each use site.
+  if (failed(verifyOffsetFreeBlockPtrBases(module)))
+    return failure();
   BlockPtrPolicy policy;
   return rewriteControlFlow(module, policy);
 }

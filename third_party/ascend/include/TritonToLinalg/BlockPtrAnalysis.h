@@ -312,9 +312,9 @@ public:
 
   /// @param known is mainly designed for `rewriteLoop`, and is just non-const
   /// in `rewriteLoop`, `rewriteAddPtr` and `rewriteAdvance`
-  static void rewriteLoopOp(LoopLikeOpInterface op,
-                            ConversionPatternRewriter &rewriter,
-                            llvm::SmallDenseMap<Value, BlockData> &known);
+  static LogicalResult
+  rewriteLoopOp(LoopLikeOpInterface op, ConversionPatternRewriter &rewriter,
+                llvm::SmallDenseMap<Value, BlockData> &known);
 
   static void rewriteAddPtrToUnstrucMemAcc(triton::AddPtrOp op,
                                            triton::AddPtrOp::Adaptor &adaptor,

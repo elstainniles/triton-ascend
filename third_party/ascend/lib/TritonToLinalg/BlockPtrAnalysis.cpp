@@ -1410,7 +1410,7 @@ void BlockDataParser::rewriteAddPtr(
 }
 
 static FailureOr<OpFoldResult>
-getBaseMemRefOffset(Value convertedBase, Location loc,
+getBaseMemRefOffset(Value convertedBase,
                     ConversionPatternRewriter &rewriter) {
   auto memrefType = dyn_cast<MemRefType>(convertedBase.getType());
   if (!memrefType)
@@ -1428,12 +1428,10 @@ getBaseMemRefOffset(Value convertedBase, Location loc,
   if (!ShapedType::isDynamic(staticOffset))
     return OpFoldResult(rewriter.getIndexAttr(staticOffset));
 
-  // An scf.if/for/while result hides the selected descriptor's defining op.
-  // Read its runtime offset from the memref descriptor instead of inspecting
-  // the original Triton pointer producer.
-  auto metadata = rewriter.create<memref::ExtractStridedMetadataOp>(
-      loc, convertedBase);
-  return OpFoldResult(metadata.getOffset());
+  // A control-flow-carried BlockPtr base uses the canonical identity-layout
+  // memref and therefore has static offset zero. Dynamic hidden offsets are not
+  // valid BlockPtr bases; their displacement belongs in descriptor offsets.
+  return failure();
 }
 
 void BlockDataParser::rewriteCustomOp(
@@ -1623,7 +1621,7 @@ LogicalResult BlockDataParser::rewriteMakeTensorPtrOp(
   }
 
   FailureOr<OpFoldResult> sourceBaseOffset =
-      getBaseMemRefOffset(convertedBase, loc, rewriter);
+      getBaseMemRefOffset(convertedBase, rewriter);
   if (failed(sourceBaseOffset)) {
     op.emitOpError("could not extract the converted base offset");
     return failure();
@@ -2017,6 +2015,26 @@ bool isUsedWithCondition(Value v, std::function<bool(OpOperand *)> cond,
   return false;
 }
 
+// A loop-carried value may be consumed through a region argument, through a
+// while after-argument, or only after the loop result. Check every semantic view
+// of the same carried slot so an identity tensor.cast after the loop cannot hide
+// an AddPtr/load/store use from the decomposition decision.
+bool isLoopCarriedValueUsedWithCondition(
+    LoopLikeOpInterface loopOp, unsigned index,
+    const std::function<bool(OpOperand *)> &condition) {
+  if (index >= loopOp.getRegionIterArgs().size() ||
+      index >= loopOp->getNumResults())
+    return false;
+  if (isUsedWithCondition(loopOp.getRegionIterArgs()[index], condition))
+    return true;
+  if (auto whileOp = dyn_cast<scf::WhileOp>(loopOp.getOperation())) {
+    if (index < whileOp.getAfterArguments().size() &&
+        isUsedWithCondition(whileOp.getAfterArguments()[index], condition))
+      return true;
+  }
+  return isUsedWithCondition(loopOp->getResult(index), condition);
+}
+
 // This function is util function for rewriteLoopOp that create value from data.
 // Assume data is structured, and from regionIterArg from LoopLikeOpInterface.
 //
@@ -2080,7 +2098,7 @@ Value createFromData(RankedTensorType resType, const BlockData &data,
   return newRes;
 }
 
-void BlockDataParser::rewriteLoopOp(
+LogicalResult BlockDataParser::rewriteLoopOp(
     LoopLikeOpInterface op, ConversionPatternRewriter &rewriter,
     llvm::SmallDenseMap<Value, BlockData> &known) {
   SmallVector<Value> newInitArgs;
@@ -2130,7 +2148,7 @@ void BlockDataParser::rewriteLoopOp(
         isa<IntegerType>(cast<TensorType>(arg.getType()).getElementType()) &&
         cast<IntegerType>(cast<TensorType>(arg.getType()).getElementType())
                 .getWidth() != 1 &&
-        isUsedWithCondition(op.getRegionIterArgs()[i], [](OpOperand *use) {
+        isLoopCarriedValueUsedWithCondition(op, i, [](OpOperand *use) {
           auto *user = use->getOwner();
           return isa<triton::AddPtrOp>(user) ||
                  (isa<triton::LoadOp>(user) && use->getOperandNumber() == 1) ||
@@ -2152,7 +2170,7 @@ void BlockDataParser::rewriteLoopOp(
 
     maskIterArgs[i] =
         indexTensor &&
-        isUsedWithCondition(op.getRegionIterArgs()[i], [](OpOperand *use) {
+        isLoopCarriedValueUsedWithCondition(op, i, [](OpOperand *use) {
           auto *user = use->getOwner();
           return (isa<triton::LoadOp>(user) && use->getOperandNumber() == 1) ||
                  (isa<triton::StoreOp>(user) && use->getOperandNumber() == 2);
@@ -2413,8 +2431,8 @@ void BlockDataParser::rewriteLoopOp(
       auto indexTensor =
           isa<RankedTensorType>(resType) &&
           isa<IntegerType>(cast<RankedTensorType>(resType).getElementType()) &&
-          isUsedWithCondition(whileOp.getAfterArguments()[i],
-                              [](OpOperand *use) {
+          isLoopCarriedValueUsedWithCondition(whileOp, i,
+                                              [](OpOperand *use) {
                                 auto *user = use->getOwner();
                                 return isa<triton::AddPtrOp>(user) ||
                                        (isa<triton::LoadOp>(user) &&
@@ -2426,8 +2444,8 @@ void BlockDataParser::rewriteLoopOp(
         indexCnt += 2 * cast<RankedTensorType>(resType).getRank();
         usedForAfterRegionArgs.push_back(false);
         iterArgIdxMapForAfter.push_back(-1);
-        maskIterArgsForAfter[i] = isUsedWithCondition(
-            whileOp.getAfterArguments()[i], [](OpOperand *use) {
+        maskIterArgsForAfter[i] = isLoopCarriedValueUsedWithCondition(
+            whileOp, i, [](OpOperand *use) {
               auto *user = use->getOwner();
               return (isa<triton::LoadOp>(user) &&
                       use->getOperandNumber() == 1) ||
@@ -2485,6 +2503,10 @@ void BlockDataParser::rewriteLoopOp(
                       iterArgIdxMapForAfter, known);
   }
 
+  if (!newOp || newResults.size() != op->getNumResults())
+    return op->emitError(
+        "loop rewrite produced a result list with incompatible arity");
+
   // Copy all attributes from op to newOp
   newOp->setAttrs(op->getAttrs());
   rewriter.replaceOp(op, newResults);
@@ -2510,14 +2532,16 @@ void BlockDataParser::rewriteLoopOp(
                 makeTensorPtrOp,
                 rewriter.getRemappedValue(makeTensorPtrOp.getBase()),
                 rewriter, known)))
-          return;
+          return failure();
       } else if (auto loopOp = dyn_cast<LoopLikeOpInterface>(bodyOp);
                  loopOp && !loopOp->hasAttr("ExtractedLoadOrStore")) {
         ConversionPatternRewriter::InsertionGuard guard(rewriter);
         rewriter.setInsertionPoint(loopOp);
         // Remove UnhandledLoopOp attr before process
-        loopOp->removeAttr("UnhandledLoopOp");
-        rewriteLoopOp(loopOp, rewriter, known);
+        rewriter.modifyOpInPlace(
+            loopOp, [&]() { loopOp->removeAttr("UnhandledLoopOp"); });
+        if (failed(rewriteLoopOp(loopOp, rewriter, known)))
+          return failure();
       }
     }
   }
@@ -2534,6 +2558,7 @@ void BlockDataParser::rewriteLoopOp(
                                 OpPrintingFlags().printGenericOpForm());
     llvm::dbgs() << "\n";
   });
+  return success();
 }
 
 /// @brief Rewrite the triton::AddPtrOp to handle unstructured memory access.

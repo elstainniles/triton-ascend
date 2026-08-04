@@ -199,10 +199,9 @@ bool isBlockPtrBaseTransport(arith::SelectOp op) {
   return hasOnlyBlockPtrBaseUses(op.getResult());
 }
 
-// Convert a scalar Triton pointer type to a common memref descriptor type. The
-// element type, rank, shape, and memory space come from TritonTypeConverter;
-// only offset and strides are made dynamic so descriptors from different
-// control-flow/select paths can share one result type without losing metadata.
+// Convert a scalar Triton pointer type to the canonical memref descriptor used
+// by TritonTypeConverter. BlockPtr bases carry complete, offset-free allocation
+// addresses, so control-flow joins do not need a dynamic layout.
 static FailureOr<MemRefType>
 getScalarPointerCarrierType(Type originalType,
                             const TypeConverter &typeConverter) {
@@ -217,15 +216,7 @@ getScalarPointerCarrierType(Type originalType,
   if (!memrefType)
     return failure();
 
-  // A join may select a plain pointer or an AddPtr-derived pointer. Use a local,
-  // maximally dynamic strided descriptor so both values have a common type
-  // while preserving the selected pointer's runtime offset.
-  SmallVector<int64_t> dynamicStrides(memrefType.getRank(),
-                                      ShapedType::kDynamic);
-  auto layout = StridedLayoutAttr::get(
-      originalType.getContext(), ShapedType::kDynamic, dynamicStrides);
-  return MemRefType::get(memrefType.getShape(), memrefType.getElementType(),
-                         layout, memrefType.getMemorySpace());
+  return memrefType;
 }
 
 static FailureOr<Type> getIfResultCarrierType(
@@ -332,9 +323,8 @@ YieldConverter::matchAndRewrite(scf::YieldOp op, OpAdaptor adaptor,
                                 ConversionPatternRewriter &rewriter) const {
   SmallVector<Value> convertedOperands(adaptor.getOperands());
 
-  // Pointer-bearing scf.if uses a dynamic strided carrier at the join. Cast
-  // each converted branch value to that carrier so plain function arguments
-  // and AddPtr reinterpret casts can be yielded by the same operation.
+  // Pointer-bearing scf.if uses the canonical scalar-pointer memref type at the
+  // join. Cast each converted branch value to that exact result type.
   if (auto parentIf = dyn_cast<scf::IfOp>(op->getParentOp());
       parentIf &&
       llvm::none_of(parentIf.getResultTypes(),
