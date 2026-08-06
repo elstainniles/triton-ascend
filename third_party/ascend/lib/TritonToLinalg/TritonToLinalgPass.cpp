@@ -154,6 +154,60 @@ static void preservePointerDescriptorComputations(ModuleOp moduleOp) {
   });
 }
 
+// Recomputes the result layouts of subviews whose source descriptor has been
+// rebased. A memref.subview result layout is derived from both its mixed
+// offsets/strides and its source layout. For example, changing the source from
+// `memref<32xf32, strided<[1], offset: ?>>` to the equivalent rebased
+// `memref<32xf32, strided<[1]>>` changes a zero-offset subview result from a
+// dynamic offset to offset zero. Merely changing the source SSA value leaves
+// the old result type behind and makes SubViewOp verification fail.
+//
+// Subviews may be chained, so every updated result becomes a new worklist
+// source. Rank-reduced subviews retain their existing result shape while their
+// layout is inferred again from the rebased source.
+static LogicalResult propagateRebasedSubviewTypes(Value rebasedSource,
+                                                   IRRewriter &rewriter) {
+  SmallVector<Value> sources{rebasedSource};
+  llvm::SmallPtrSet<Operation *, 8> visited;
+
+  while (!sources.empty()) {
+    Value source = sources.pop_back_val();
+    for (Operation *user : source.getUsers()) {
+      auto subview = dyn_cast<memref::SubViewOp>(user);
+      if (!subview || !visited.insert(user).second)
+        continue;
+
+      auto sourceType = dyn_cast<MemRefType>(subview.getSource().getType());
+      auto oldResultType =
+          dyn_cast<MemRefType>(subview.getResult().getType());
+      if (!sourceType || !oldResultType)
+        return failure();
+
+      Type inferredType;
+      if (sourceType.getRank() == oldResultType.getRank()) {
+        inferredType = memref::SubViewOp::inferResultType(
+            sourceType, subview.getMixedOffsets(), subview.getMixedSizes(),
+            subview.getMixedStrides());
+      } else {
+        inferredType = memref::SubViewOp::inferRankReducedResultType(
+            oldResultType.getShape(), sourceType, subview.getMixedOffsets(),
+            subview.getMixedSizes(), subview.getMixedStrides());
+      }
+
+      auto inferredMemRefType = dyn_cast<MemRefType>(inferredType);
+      if (!inferredMemRefType)
+        return failure();
+      if (inferredMemRefType != oldResultType) {
+        rewriter.modifyOpInPlace(subview, [&] {
+          subview.getResult().setType(inferredMemRefType);
+        });
+      }
+      sources.push_back(subview.getResult());
+    }
+  }
+  return success();
+}
+
 // Convert structured custom ops after operand type converted,
 // for example tt.ptr converted to memref.
 template <typename CustomOpT>
@@ -1341,13 +1395,22 @@ void TritonToLinalgPass::runOnOperation() {
 
       // Keep the old result and replacement types equal while RAUW updates all
       // users to the rebased descriptor type.
-      reinterpretCastOp.getResult().setType(rebasedResultType);
-      rewriter.replaceOpWithNewOp<memref::ReinterpretCastOp>(
-          reinterpretCastOp, rebasedResultType, newCastOp,
-          ValueRange({}), reinterpretCastOp.getSizes(),
-          reinterpretCastOp.getStrides(), SmallVector<int64_t>({0}),
-          reinterpretCastOp.getStaticSizes(),
-          reinterpretCastOp.getStaticStrides());
+      rewriter.modifyOpInPlace(reinterpretCastOp, [&] {
+        reinterpretCastOp.getResult().setType(rebasedResultType);
+      });
+      auto rebasedReinterpretCast =
+          rewriter.replaceOpWithNewOp<memref::ReinterpretCastOp>(
+              reinterpretCastOp, rebasedResultType, newCastOp, ValueRange({}),
+              reinterpretCastOp.getSizes(), reinterpretCastOp.getStrides(),
+              SmallVector<int64_t>({0}), reinterpretCastOp.getStaticSizes(),
+              reinterpretCastOp.getStaticStrides());
+      if (failed(propagateRebasedSubviewTypes(
+              rebasedReinterpretCast.getResult(), rewriter))) {
+        rebasedReinterpretCast.emitError(
+            "failed to propagate rebased layout through subview users");
+        signalPassFailure();
+        return;
+      }
     }
     if (op->use_empty())
       rewriter.eraseOp(op);

@@ -283,6 +283,11 @@ public:
 
     // Full descriptor transfer permits every field to change, but each
     // position must retain the strict type required by tt.make_tensor_ptr.
+    // In particular, tt.advance preserving its base does not make the base a
+    // loop invariant: a nested if may rebuild the descriptor from a different
+    // root base, and that if result becomes the next backedge value. A generic
+    // SCF canonicalization may remove exactly forwarded components from an
+    // advance-only loop later; this policy must retain changing-base semantics.
     for (unsigned index = 0; index < initial.components.size(); ++index) {
       if (failed(joinComponentTypes(initial.components[index].type,
                                     regionArgument.components[index].type)) ||
