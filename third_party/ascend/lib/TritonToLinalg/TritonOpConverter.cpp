@@ -282,6 +282,27 @@ materializePointerAddress(Value value, Location loc,
   if (!elementType.isIntOrFloat())
     return failure();
 
+  // A canonical scalar PointerCast already stores the complete byte address
+  // that IntToPtr received. Extracting its aligned pointer immediately and
+  // casting it back to i64 is an identity round trip. In current failing
+  // kernels this chain also survives into InjectSync, so folding it keeps a
+  // redundant region-local form out of the backend. Only fold the canonical
+  // one-dimensional carrier; descriptors with a non-zero offset or a non-unit
+  // stride still require the general address materialization below.
+  if (auto pointerCast = value.getDefiningOp<hivm::PointerCastOp>()) {
+    auto [strides, offset] = memrefType.getStridesAndOffset();
+    if (pointerCast.getAddrs().size() == 1 && memrefType.getRank() == 1 &&
+        offset == 0 && strides.size() == 1 && strides.front() == 1) {
+      Value address = pointerCast.getAddrs().front();
+      if (address.getType().isInteger(64))
+        return address;
+      if (address.getType().isIndex())
+        return rewriter
+            .create<arith::IndexCastOp>(loc, rewriter.getI64Type(), address)
+            .getResult();
+    }
+  }
+
   Value address = rewriter.create<memref::ExtractAlignedPointerAsIndexOp>(
       loc, value);
   int64_t staticOffset = memrefType.getStridesAndOffset().second;

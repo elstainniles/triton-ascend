@@ -1324,9 +1324,26 @@ void TritonToLinalgPass::runOnOperation() {
       markOp->setAttr(hivm::AddressSpaceAttr::getMnemonic(),
                       {hivm::AddressSpaceAttr::get(rewriter.getContext(),
                                                    hivm::AddressSpace::GM)});
+      // realAddr already includes the old reinterpret-cast offset in bytes.
+      // The replacement view therefore starts at offset zero, and its result
+      // type must describe the same rebased layout. Reusing the old type here
+      // would combine static_offsets=[0] with (for example) a type-level
+      // offset of 1, which is rejected by the ReinterpretCast verifier.
+      auto oldResultType =
+          cast<MemRefType>(reinterpretCastOp.getResult().getType());
+      SmallVector<int64_t> rebasedStrides(
+          oldResultType.getStridesAndOffset().first);
+      auto rebasedResultType = MemRefType::get(
+          oldResultType.getShape(), oldResultType.getElementType(),
+          StridedLayoutAttr::get(oldResultType.getContext(), /*offset=*/0,
+                                 rebasedStrides),
+          oldResultType.getMemorySpace());
+
+      // Keep the old result and replacement types equal while RAUW updates all
+      // users to the rebased descriptor type.
+      reinterpretCastOp.getResult().setType(rebasedResultType);
       rewriter.replaceOpWithNewOp<memref::ReinterpretCastOp>(
-          reinterpretCastOp,
-          cast<MemRefType>(reinterpretCastOp.getResult().getType()), newCastOp,
+          reinterpretCastOp, rebasedResultType, newCastOp,
           ValueRange({}), reinterpretCastOp.getSizes(),
           reinterpretCastOp.getStrides(), SmallVector<int64_t>({0}),
           reinterpretCastOp.getStaticSizes(),
