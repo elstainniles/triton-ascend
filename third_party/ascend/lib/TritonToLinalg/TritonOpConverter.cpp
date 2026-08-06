@@ -239,6 +239,34 @@ castToMemRefCarrier(Value value, MemRefType carrierType, Location loc,
   return rewriter.create<memref::CastOp>(loc, carrierType, value).getResult();
 }
 
+// Dialect conversion may adapt a lane-local pointer descriptor such as
+// `memref<1xT, strided<[1], offset: ?>>` to the canonical scalar-pointer
+// carrier `memref<?xT>`. Address materialization must inspect the original
+// descriptor: its dynamic layout offset is part of the represented address and
+// cannot be recovered from the shape-only carrier type.
+//
+// Only unwrap a one-to-one memref materialization that preserves rank, element
+// type, and memory space. Other unrealized casts may represent a real element
+// or address-space conversion and must remain visible to their converters.
+static Value unwrapPointerDescriptorMaterialization(Value value) {
+  auto materialization =
+      value.getDefiningOp<UnrealizedConversionCastOp>();
+  if (!materialization || materialization.getInputs().size() != 1 ||
+      materialization.getOutputs().size() != 1)
+    return value;
+
+  Value source = materialization.getInputs().front();
+  auto sourceType = dyn_cast<MemRefType>(source.getType());
+  auto targetType = dyn_cast<MemRefType>(value.getType());
+  if (!sourceType || !targetType ||
+      sourceType.getRank() != targetType.getRank() ||
+      sourceType.getElementType() != targetType.getElementType() ||
+      sourceType.getMemorySpace() != targetType.getMemorySpace())
+    return value;
+
+  return source;
+}
+
 // Converts a memref descriptor into the complete byte address represented by
 // that descriptor. extract_aligned_pointer_as_index yields the aligned buffer
 // pointer; the descriptor's element offset must therefore be converted to
@@ -246,6 +274,7 @@ castToMemRefCarrier(Value value, MemRefType carrierType, Location loc,
 static FailureOr<Value>
 materializePointerAddress(Value value, Location loc,
                           ConversionPatternRewriter &rewriter) {
+  value = unwrapPointerDescriptorMaterialization(value);
   auto memrefType = dyn_cast<MemRefType>(value.getType());
   if (!memrefType)
     return failure();

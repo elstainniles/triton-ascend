@@ -73,7 +73,7 @@ tt.func @test_addptr_extract_bubbleup(%a: tensor<128x!tt.ptr<f32>>, %b: tensor<1
 // CHECK: %[[CONDITION:.*]] = tensor.extract %{{.*}}[%{{.*}}] {DiscreteMemAccess} : tensor<4xi1>
 // CHECK: %[[TRUE_VALUE:.*]] = tensor.extract %{{.*}}[%{{.*}}] {DiscreteMemAccess} : tensor<4x!tt.ptr<f32>>
 // CHECK: %[[FALSE_VALUE:.*]] = tensor.extract %{{.*}}[%{{.*}}] {DiscreteMemAccess} : tensor<4x!tt.ptr<f32>>
-// CHECK: arith.select %[[CONDITION]], %[[TRUE_VALUE]], %[[FALSE_VALUE]] : i1, !tt.ptr<f32>
+// CHECK: arith.select %[[CONDITION]], %[[TRUE_VALUE]], %[[FALSE_VALUE]] : !tt.ptr<f32>
 tt.func @test_select_pointer_extract_bubbleup(
     %condition: tensor<4xi1>, %true_value: tensor<4x!tt.ptr<f32>>,
     %false_value: tensor<4x!tt.ptr<f32>>, %i: index) -> !tt.ptr<f32> {
