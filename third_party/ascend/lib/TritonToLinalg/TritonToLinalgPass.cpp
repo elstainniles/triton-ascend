@@ -53,6 +53,7 @@
 #include "mlir/IR/Types.h"
 #include "mlir/Interfaces/SideEffectInterfaces.h"
 
+#include "triton/Analysis/AxisInfo.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
 
 #include "bishengir/Dialect/Annotation/IR/Annotation.h"
@@ -85,6 +86,7 @@
 
 #include <cassert>
 #include <cstdint>
+#include <memory>
 #include <optional>
 
 #define DEBUG_TYPE "triton-to-linalg"
@@ -95,6 +97,38 @@ using namespace triton;
 int nd2nzFlag = 0;
 bool compileOn91095Flag = false;
 bool existDotFlag = false;
+
+static triton::PointerType getElementPointerType(Type type) {
+  if (auto shapedType = dyn_cast<ShapedType>(type))
+    type = shapedType.getElementType();
+  return dyn_cast<triton::PointerType>(type);
+}
+
+static bool hasDifferentWidthPointerBitcast(ModuleOp moduleOp) {
+  bool found = false;
+  moduleOp.walk([&](triton::BitcastOp op) {
+    if (found)
+      return;
+    auto srcPtrTy = getElementPointerType(op.getSrc().getType());
+    auto dstPtrTy = getElementPointerType(op.getType());
+    if (!srcPtrTy || !dstPtrTy)
+      return;
+    Type srcPointeeType = srcPtrTy.getPointeeType();
+    Type dstPointeeType = dstPtrTy.getPointeeType();
+    if (auto shapedType = dyn_cast<ShapedType>(srcPointeeType))
+      srcPointeeType = shapedType.getElementType();
+    if (auto shapedType = dyn_cast<ShapedType>(dstPointeeType))
+      dstPointeeType = shapedType.getElementType();
+    if (!srcPointeeType.isIntOrFloat() || !dstPointeeType.isIntOrFloat())
+      return;
+    unsigned srcBitWidth = srcPointeeType.getIntOrFloatBitWidth();
+    unsigned dstBitWidth = dstPointeeType.getIntOrFloatBitWidth();
+    srcBitWidth = srcBitWidth == 1 ? 8 : srcBitWidth;
+    dstBitWidth = dstBitWidth == 1 ? 8 : dstBitWidth;
+    found = srcBitWidth != dstBitWidth;
+  });
+  return found;
+}
 
 // Convert structured custom ops after operand type converted,
 // for example tt.ptr converted to memref.
@@ -595,13 +629,15 @@ void TritonToLinalgPass::addDynamicLegal(
 }
 
 void TritonToLinalgPass::populateTritonToLinalgCanonicalizationPatterns(
-    RewritePatternSet &patterns) {
+    RewritePatternSet &patterns,
+    triton::ModuleAxisInfoAnalysis *axisInfoAnalysis) {
   patterns.add<LoadStoreConverter::LoadStoreCanonicalizer<triton::LoadOp>,
                LoadStoreConverter::LoadStoreCanonicalizer<triton::StoreOp>,
                LoadStoreConverter::LoadStoreCanonicalizer<triton::AtomicRMWOp>,
                LoadStoreConverter::LoadStoreCanonicalizer<triton::AtomicCASOp>>(
       patterns.getContext());
-  patterns.add<TTOpConverters::BitcastCanonicalizer>(patterns.getContext());
+  patterns.add<TTOpConverters::BitcastCanonicalizer>(patterns.getContext(),
+                                                     axisInfoAnalysis);
   patterns.add<TTOpConverters::FpToFpCanonicalizer>(patterns.getContext());
   patterns.add<LoadStoreConverter::ScalarStoreCanonicalizer>(
       patterns.getContext());
@@ -1004,9 +1040,15 @@ void TritonToLinalgPass::runOnOperation() {
     }
   }
 
+  std::unique_ptr<triton::ModuleAxisInfoAnalysis> axisInfoAnalysis;
+  if (hasDifferentWidthPointerBitcast(moduleOp))
+    axisInfoAnalysis =
+        std::make_unique<triton::ModuleAxisInfoAnalysis>(moduleOp);
+
   RewritePatternSet canonicalizerPatterns(&getContext());
   // 1. Canonicalize load/store related patterns.
-  this->populateTritonToLinalgCanonicalizationPatterns(canonicalizerPatterns);
+  this->populateTritonToLinalgCanonicalizationPatterns(canonicalizerPatterns,
+                                                       axisInfoAnalysis.get());
   if (failed(
           applyPatternsGreedily(moduleOp, std::move(canonicalizerPatterns)))) {
     moduleOp->emitError("failed to apply Canonicalizer Patterns");

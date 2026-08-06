@@ -40,6 +40,7 @@ extern bool existDotFlag;
 namespace mlir {
 namespace triton {
 
+class ModuleAxisInfoAnalysis;
 std::unique_ptr<OperationPass<ModuleOp>> createTritonToLinalgPass();
 
 std::unique_ptr<OperationPass<ModuleOp>>
@@ -82,8 +83,9 @@ private:
   void addDynamicLegal(ConversionTarget &target,
                        TritonTypeConverter &tritonTypeConverter);
 
-  void
-  populateTritonToLinalgCanonicalizationPatterns(RewritePatternSet &patterns);
+  void populateTritonToLinalgCanonicalizationPatterns(
+      RewritePatternSet &patterns,
+      mlir::triton::ModuleAxisInfoAnalysis *axisInfoAnalysis);
 
   void populateTritonToLinalgConversionPatterns(TypeConverter &typeConverter,
                                                 RewritePatternSet &patterns,
