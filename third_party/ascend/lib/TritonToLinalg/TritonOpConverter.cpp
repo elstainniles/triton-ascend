@@ -235,10 +235,10 @@ BitcastConverter::matchAndRewrite(triton::BitcastOp op, OpAdaptor adaptor,
   } else {
     // handling normal case: bitcast between tensors/memrefs
     auto srcPtrTy = getScalarPointerType(op.getSrc().getType());
-    auto dstPtrTy = getScalarPointerType(op.getType());
-    if (srcPtrTy && dstPtrTy &&
+    auto tensorDstPtrTy = getScalarPointerType(op.getType());
+    if (srcPtrTy && tensorDstPtrTy &&
         getNormalizedPointeeBitWidth(srcPtrTy) !=
-            getNormalizedPointeeBitWidth(dstPtrTy)) {
+            getNormalizedPointeeBitWidth(tensorDstPtrTy)) {
       return op.emitError(
           "different-width tensor pointer bitcast was not canonicalized to a "
           "scalar base pointer");
