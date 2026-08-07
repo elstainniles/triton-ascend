@@ -37,6 +37,7 @@
 #include "mlir/Transforms/GreedyPatternRewriteDriver.h"
 #include "mlir/Transforms/Passes.h"
 
+#include "llvm/ADT/APInt.h"
 #include "llvm/ADT/STLExtras.h"
 
 #define DEBUG_TYPE "triton-unstructure-converter"
@@ -83,6 +84,124 @@ static int64_t getTypeSizeInByte(Type type) {
     return floatType.getWidth() / kBitsPerByte;
   }
   llvm_unreachable("Unhandled element type of tensor");
+}
+
+static unsigned getNormalizedPointeeBitWidth(triton::PointerType pointerType) {
+  Type pointeeType = pointerType.getPointeeType();
+  if (!pointeeType.isIntOrFloat())
+    return 0;
+  unsigned bitWidth = pointeeType.getIntOrFloatBitWidth();
+  return bitWidth == 1 ? kBitsPerByte : bitWidth;
+}
+
+static std::optional<bool> isConstantOffsetDivisible(Value value,
+                                                      uint64_t divisor) {
+  auto constantOp = value.getDefiningOp<arith::ConstantOp>();
+  if (!constantOp)
+    return std::nullopt;
+
+  auto isDivisible = [divisor](const llvm::APInt &element) {
+    return element.srem(llvm::APInt(element.getBitWidth(), divisor)) == 0;
+  };
+  Attribute constant = constantOp.getValue();
+  if (auto integerAttr = dyn_cast<IntegerAttr>(constant))
+    return isDivisible(integerAttr.getValue());
+  if (auto denseAttr = dyn_cast<DenseElementsAttr>(constant)) {
+    for (auto element : denseAttr.getValues<llvm::APInt>())
+      if (!isDivisible(element))
+        return false;
+    return true;
+  }
+  return std::nullopt;
+}
+
+static Value createIntegerConstantLike(PatternRewriter &rewriter,
+                                       Location location, Value like,
+                                       uint64_t value) {
+  Type type = like.getType();
+  Type elementType = type;
+  if (auto shapedType = dyn_cast<ShapedType>(type))
+    elementType = shapedType.getElementType();
+  auto integerType = cast<IntegerType>(elementType);
+  auto scalarAttr = rewriter.getIntegerAttr(integerType, value);
+  if (auto shapedType = dyn_cast<ShapedType>(type)) {
+    auto denseAttr = DenseElementsAttr::get(shapedType, scalarAttr);
+    return rewriter.create<arith::ConstantOp>(location, type, denseAttr);
+  }
+  return rewriter.create<arith::ConstantOp>(location, scalarAttr);
+}
+
+static FailureOr<Value>
+rescaleOffsetForPointerBitcast(Value sourcePointer, Value offset,
+                               Location location, PatternRewriter &rewriter) {
+  auto bitcastOp = sourcePointer.getDefiningOp<triton::BitcastOp>();
+  if (!bitcastOp)
+    return offset;
+
+  auto sourceType = dyn_cast<triton::PointerType>(bitcastOp.getSrc().getType());
+  auto targetType = dyn_cast<triton::PointerType>(bitcastOp.getType());
+  if (!sourceType || !targetType)
+    return offset;
+
+  unsigned sourceBitWidth = getNormalizedPointeeBitWidth(sourceType);
+  unsigned targetBitWidth = getNormalizedPointeeBitWidth(targetType);
+  if (sourceBitWidth == targetBitWidth)
+    return offset;
+
+  Type sourcePointeeType = sourceType.getPointeeType();
+  Type targetPointeeType = targetType.getPointeeType();
+  if (!sourceBitWidth || !targetBitWidth || sourceBitWidth % kBitsPerByte != 0 ||
+      targetBitWidth % kBitsPerByte != 0) {
+    bitcastOp.emitError(
+        "different-width pointer bitcast requires byte-addressable scalar "
+        "integer or floating-point pointee types");
+    return failure();
+  }
+  if (sourceType.getAddressSpace() != targetType.getAddressSpace()) {
+    bitcastOp.emitError("cannot bitcast pointers between different address spaces");
+    return failure();
+  }
+
+  uint64_t sourceByteWidth = sourceBitWidth / kBitsPerByte;
+  uint64_t targetByteWidth = targetBitWidth / kBitsPerByte;
+  if (sourceByteWidth % targetByteWidth != 0 &&
+      targetByteWidth % sourceByteWidth != 0) {
+    bitcastOp.emitError("pointer pointee byte widths must have an integral ratio");
+    return failure();
+  }
+
+  if (targetByteWidth > sourceByteWidth) {
+    uint64_t ratio = targetByteWidth / sourceByteWidth;
+    auto divisibility = isConstantOffsetDivisible(offset, ratio);
+    if (divisibility && !*divisibility) {
+      bitcastOp.emitError()
+          << "cannot reinterpret ptr<" << sourcePointeeType << "> as ptr<"
+          << targetPointeeType << ">: pre-cast offset must be divisible by "
+          << ratio << " for every element; at least one offset is statically "
+                      "known not to be divisible";
+      return failure();
+    }
+
+    Value ratioValue =
+        createIntegerConstantLike(rewriter, location, offset, ratio);
+    if (!divisibility) {
+      Value remainder =
+          rewriter.create<arith::RemSIOp>(location, offset, ratioValue);
+      Value zero = createIntegerConstantLike(rewriter, location, offset, 0);
+      Value aligned = rewriter.create<arith::CmpIOp>(
+          location, arith::CmpIPredicate::eq, remainder, zero);
+      rewriter.create<triton::AssertOp>(
+          location, aligned,
+          rewriter.getStringAttr("pointer bitcast offset is not divisible by " +
+                                 std::to_string(ratio)));
+    }
+    return rewriter.create<arith::DivSIOp>(location, offset, ratioValue)
+        .getResult();
+  }
+
+  uint64_t ratio = sourceByteWidth / targetByteWidth;
+  Value ratioValue = createIntegerConstantLike(rewriter, location, offset, ratio);
+  return rewriter.create<arith::MulIOp>(location, offset, ratioValue).getResult();
 }
 
 template <typename MemAccOpTy>
@@ -515,6 +634,11 @@ LogicalResult UnstructuredMemAccessConverter<MemAccOpTy>::matchAndRewrite(
 
   auto srcPtr = ptrOffsetInfo.getPtr();
   auto ptrOffset = ptrOffsetInfo.getOffset();
+  FailureOr<Value> rescaledOffset =
+      rescaleOffsetForPointerBitcast(srcPtr, ptrOffset, loc, rewriter);
+  if (failed(rescaledOffset))
+    return failure();
+  ptrOffset = *rescaledOffset;
 
   // LoadLike is operation with result
   bool isLoadLike = !op->use_empty();

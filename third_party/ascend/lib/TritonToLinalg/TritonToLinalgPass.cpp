@@ -630,14 +630,14 @@ void TritonToLinalgPass::addDynamicLegal(
 
 void TritonToLinalgPass::populateTritonToLinalgCanonicalizationPatterns(
     RewritePatternSet &patterns,
-    triton::ModuleAxisInfoAnalysis *axisInfoAnalysis) {
+    triton::ModuleAxisInfoAnalysis *axisInfoAnalysis, bool &hadError) {
   patterns.add<LoadStoreConverter::LoadStoreCanonicalizer<triton::LoadOp>,
                LoadStoreConverter::LoadStoreCanonicalizer<triton::StoreOp>,
                LoadStoreConverter::LoadStoreCanonicalizer<triton::AtomicRMWOp>,
                LoadStoreConverter::LoadStoreCanonicalizer<triton::AtomicCASOp>>(
       patterns.getContext());
   patterns.add<TTOpConverters::BitcastCanonicalizer>(patterns.getContext(),
-                                                     axisInfoAnalysis);
+                                                     axisInfoAnalysis, hadError);
   patterns.add<TTOpConverters::FpToFpCanonicalizer>(patterns.getContext());
   patterns.add<LoadStoreConverter::ScalarStoreCanonicalizer>(
       patterns.getContext());
@@ -1046,13 +1046,18 @@ void TritonToLinalgPass::runOnOperation() {
         std::make_unique<triton::ModuleAxisInfoAnalysis>(moduleOp);
 
   RewritePatternSet canonicalizerPatterns(&getContext());
+  bool hadCanonicalizationError = false;
   // 1. Canonicalize load/store related patterns.
   this->populateTritonToLinalgCanonicalizationPatterns(canonicalizerPatterns,
-                                                       axisInfoAnalysis.get());
-  if (failed(
-          applyPatternsGreedily(moduleOp, std::move(canonicalizerPatterns)))) {
-    moduleOp->emitError("failed to apply Canonicalizer Patterns");
+                                                       axisInfoAnalysis.get(),
+                                                       hadCanonicalizationError);
+  LogicalResult canonicalizationResult =
+      applyPatternsGreedily(moduleOp, std::move(canonicalizerPatterns));
+  if (failed(canonicalizationResult) || hadCanonicalizationError) {
+    if (!hadCanonicalizationError)
+      moduleOp->emitError("failed to apply Canonicalizer Patterns");
     signalPassFailure();
+    return;
   }
 
   // 2.1 Pre-clean dead control-flow before use analysis.
@@ -1177,6 +1182,19 @@ void TritonToLinalgPass::runOnOperation() {
   for (auto op : castOps) {
     SmallVector<Operation *> userOps(op->getUsers().begin(),
                                      op->getUsers().end());
+    if (op.getAddrs().size() != 1) {
+      op.emitError("PointerCastOp must have exactly one address operand");
+      signalPassFailure();
+      return;
+    }
+    if (llvm::any_of(userOps, [](Operation *userOp) {
+          return !isa<memref::ReinterpretCastOp>(userOp);
+        })) {
+      op.emitError(
+          "PointerCastOp must be consumed by memref.reinterpret_cast");
+      signalPassFailure();
+      return;
+    }
     IRRewriter rewriter(&getContext());
     rewriter.setInsertionPointAfter(op);
     Value addr = op.getAddrs()[0];
@@ -1196,7 +1214,13 @@ void TritonToLinalgPass::runOnOperation() {
     }
 
     for (auto userOp : userOps) {
-      auto reinterpretCastOp = cast<memref::ReinterpretCastOp>(userOp);
+      auto reinterpretCastOp = dyn_cast<memref::ReinterpretCastOp>(userOp);
+      if (!reinterpretCastOp) {
+        userOp->emitError(
+            "PointerCastOp user must be memref.reinterpret_cast");
+        signalPassFailure();
+        return;
+      }
       auto sizes = reinterpretCastOp.getStaticSizes();
       auto staticStrides = reinterpretCastOp.getStaticStrides();
       auto strides = reinterpretCastOp.getStrides();
@@ -1206,7 +1230,12 @@ void TritonToLinalgPass::runOnOperation() {
       int64_t castOpSize = 0;
       SmallVector<int64_t> dynamicSizes;
       for (const auto &[size, stride] : llvm::zip_equal(sizes, staticStrides)) {
-        assert(!ShapedType::isDynamic(size));
+        if (ShapedType::isDynamic(size)) {
+          reinterpretCastOp.emitError(
+              "PointerCastOp requires statically known access sizes");
+          signalPassFailure();
+          return;
+        }
         if (ShapedType::isDynamic(stride))
           dynamicSizes.push_back(size);
         else

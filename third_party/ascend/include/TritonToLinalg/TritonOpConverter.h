@@ -101,14 +101,16 @@ public:
 class BitcastCanonicalizer : public OpRewritePattern<triton::BitcastOp> {
 public:
   BitcastCanonicalizer(MLIRContext *context,
-                       mlir::triton::ModuleAxisInfoAnalysis *axisInfoAnalysis)
+                       mlir::triton::ModuleAxisInfoAnalysis *axisInfoAnalysis,
+                       bool &hadError)
       : OpRewritePattern<triton::BitcastOp>(context),
-        axisInfoAnalysis(axisInfoAnalysis) {}
+        axisInfoAnalysis(axisInfoAnalysis), hadError(hadError) {}
   LogicalResult matchAndRewrite(triton::BitcastOp bitcastOp,
                                 PatternRewriter &rewriter) const override;
 
 private:
   mlir::triton::ModuleAxisInfoAnalysis *axisInfoAnalysis;
+  bool &hadError;
 };
 
 template <typename MathOp>

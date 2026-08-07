@@ -67,6 +67,11 @@ namespace TTOpConverters {
 using namespace mlir;
 using namespace triton;
 
+static constexpr llvm::StringLiteral kPointerBitcastRescaledOffsetAttr =
+    "tt.pointer_bitcast_rescaled_offset";
+static constexpr llvm::StringLiteral kPointerBitcastOffsetDivisorAttr =
+    "tt.pointer_bitcast_offset_divisor";
+
 static triton::PointerType getScalarPointerType(Type type) {
   if (auto shapedType = dyn_cast<ShapedType>(type))
     type = shapedType.getElementType();
@@ -85,8 +90,10 @@ static unsigned getNormalizedPointeeBitWidth(triton::PointerType pointerType) {
 
 static bool isFunctionArgument(Value value) {
   auto blockArgument = dyn_cast<BlockArgument>(value);
-  return blockArgument &&
-         isa<FunctionOpInterface>(blockArgument.getOwner()->getParentOp());
+  if (!blockArgument || !blockArgument.getOwner())
+    return false;
+  Operation *parentOp = blockArgument.getOwner()->getParentOp();
+  return parentOp && isa<FunctionOpInterface>(parentOp);
 }
 
 static std::optional<bool> isConstantDivisible(Value value, uint64_t divisor) {
@@ -110,28 +117,31 @@ static std::optional<bool> isConstantDivisible(Value value, uint64_t divisor) {
   return std::nullopt;
 }
 
-static bool
-isOffsetDivisible(Value offset, uint64_t divisor,
-                  triton::ModuleAxisInfoAnalysis *axisInfoAnalysis) {
+enum class OffsetDivisibility { Divisible, Indivisible, Unknown };
+
+static OffsetDivisibility
+getOffsetDivisibility(Value offset, uint64_t divisor,
+                      triton::ModuleAxisInfoAnalysis *axisInfoAnalysis) {
   if (divisor == 1)
-    return true;
+    return OffsetDivisibility::Divisible;
   if (auto constantResult = isConstantDivisible(offset, divisor))
-    return *constantResult;
+    return *constantResult ? OffsetDivisibility::Divisible
+                           : OffsetDivisibility::Indivisible;
   if (!axisInfoAnalysis)
-    return false;
+    return OffsetDivisibility::Unknown;
 
   auto *axisInfo = axisInfoAnalysis->getAxisInfo(offset);
   if (!axisInfo || axisInfo->getRank() == 0)
-    return false;
+    return OffsetDivisibility::Unknown;
   for (int dimension = 0; dimension < axisInfo->getRank(); ++dimension) {
     // Divisibility applies to the first element of each contiguous group.
     // A group longer than one contains adjacent values, so it cannot prove
     // that every lane is divisible by a value greater than one.
     if (axisInfo->getContiguity(dimension) != 1 ||
         axisInfo->getDivisibility(dimension) % divisor != 0)
-      return false;
+      return OffsetDivisibility::Unknown;
   }
-  return true;
+  return OffsetDivisibility::Divisible;
 }
 
 static Value createIntegerConstantLike(PatternRewriter &rewriter,
@@ -145,6 +155,22 @@ static Value createIntegerConstantLike(PatternRewriter &rewriter,
     return rewriter.create<arith::ConstantOp>(location, denseAttr);
   }
   return rewriter.create<arith::ConstantOp>(location, scalarAttr);
+}
+
+static FailureOr<Value>
+createPointerCast(Value source, Type elementType, Location location,
+                  PatternRewriter &rewriter) {
+  if (!isa<BaseMemRefType>(source.getType()))
+    return failure();
+
+  Value address =
+      rewriter.create<memref::ExtractAlignedPointerAsIndexOp>(location, source);
+  address = rewriter.create<arith::IndexCastOp>(
+      location, rewriter.getI64Type(), address);
+  auto resultType = MemRefType::get({ShapedType::kDynamic}, elementType);
+  return rewriter
+      .create<hivm::PointerCastOp>(location, resultType, ValueRange{address})
+      .getResult();
 }
 
 /**
@@ -195,43 +221,36 @@ BitcastConverter::matchAndRewrite(triton::BitcastOp op, OpAdaptor adaptor,
   Value result;
   auto loc = op.getLoc();
 
+  if (adaptor.getOperands().size() != 1 || !adaptor.getOperands().front())
+    return op.emitError(
+        "pointer bitcast expected exactly one converted source operand");
+  Value convertedSrc = adaptor.getOperands().front();
+
   if (auto dstPtrTy = dyn_cast<triton::PointerType>(op.getType())) {
     auto srcPtrTy = cast<triton::PointerType>(op.getSrc().getType());
-    auto resType =
-        MemRefType::get({ShapedType::kDynamic}, dstPtrTy.getPointeeType());
 
     unsigned srcBitWidth = getNormalizedPointeeBitWidth(srcPtrTy);
     unsigned dstBitWidth = getNormalizedPointeeBitWidth(dstPtrTy);
-    if (srcBitWidth != dstBitWidth) {
-      if (!isFunctionArgument(op.getSrc()))
-        return op.emitError(
-            "different-width pointer bitcast was not canonicalized to a "
-            "function argument");
-      result = rewriter
-                   .create<UnrealizedConversionCastOp>(loc, TypeRange{resType},
-                                                       adaptor.getSrc())
-                   .getResult(0);
-    } else {
-      auto i1Ty = rewriter.getIntegerType(1);
-      auto i8Ty = rewriter.getIntegerType(8);
-      bool isI1toI8 = (srcPtrTy.getPointeeType() == i1Ty) &&
-                      (dstPtrTy.getPointeeType() == i8Ty);
-      // handling special case: ptr<i1> -> ptr<i8>, directly forward without
-      // arith.bitcast
-      if (isI1toI8) {
-        // TypeConverter has already converted i1 to i8 memref,
-        LLVM_DEBUG({
-          llvm::dbgs()
-              << "[BitcastConverter] Special i1->i8 pointer bitcast. Forward "
-                 "without arith.bitcast. srcConvertedTy="
-              << adaptor.getSrc().getType() << "\n";
-        });
-        rewriter.replaceOp(op, adaptor.getSrc());
-        return success();
-      }
-      result =
-          rewriter.create<arith::BitcastOp>(loc, resType, adaptor.getSrc());
+    if (srcBitWidth != dstBitWidth && !isFunctionArgument(convertedSrc))
+      return op.emitError(
+          "different-width pointer bitcast was not canonicalized to a "
+          "function argument");
+
+    auto i1Ty = rewriter.getIntegerType(1);
+    auto i8Ty = rewriter.getIntegerType(8);
+    bool isI1toI8 = (srcPtrTy.getPointeeType() == i1Ty) &&
+                    (dstPtrTy.getPointeeType() == i8Ty);
+    // TypeConverter has already converted i1 pointer storage to i8.
+    if (isI1toI8) {
+      rewriter.replaceOp(op, convertedSrc);
+      return success();
     }
+
+    FailureOr<Value> pointerCast = createPointerCast(
+        convertedSrc, dstPtrTy.getPointeeType(), loc, rewriter);
+    if (failed(pointerCast))
+      return op.emitError("pointer bitcast expected a converted memref source");
+    result = *pointerCast;
   } else {
     // handling normal case: bitcast between tensors/memrefs
     auto srcPtrTy = getScalarPointerType(op.getSrc().getType());
@@ -244,7 +263,7 @@ BitcastConverter::matchAndRewrite(triton::BitcastOp op, OpAdaptor adaptor,
           "scalar base pointer");
     }
     result =
-        rewriter.create<arith::BitcastOp>(loc, op.getType(), adaptor.getSrc());
+        rewriter.create<arith::BitcastOp>(loc, op.getType(), convertedSrc);
   }
   rewriter.replaceOp(op, result);
   return success();
@@ -478,6 +497,12 @@ BitcastCanonicalizer::matchAndRewrite(triton::BitcastOp bitcastOp,
   auto dstPtrTy = getScalarPointerType(castRes.getType());
   if (!srcPtrTy || !dstPtrTy)
     return failure();
+  auto failWithError = [&](llvm::StringRef message) {
+    if (!hadError)
+      bitcastOp.emitError(message);
+    hadError = true;
+    return failure();
+  };
 
   unsigned srcBitWidth = getNormalizedPointeeBitWidth(srcPtrTy);
   unsigned dstBitWidth = getNormalizedPointeeBitWidth(dstPtrTy);
@@ -491,24 +516,28 @@ BitcastCanonicalizer::matchAndRewrite(triton::BitcastOp bitcastOp,
         !srcPointeeType.isIntOrFloat() || !dstPointeeType.isIntOrFloat() ||
         srcBitWidth < 8 || dstBitWidth < 8 || srcBitWidth % 8 != 0 ||
         dstBitWidth % 8 != 0) {
-      return bitcastOp.emitError(
+      return failWithError(
           "different-width pointer bitcast requires byte-addressable scalar "
           "integer or floating-point pointee types");
     }
     if (srcPtrTy.getAddressSpace() != dstPtrTy.getAddressSpace())
-      return bitcastOp.emitError(
+      return failWithError(
           "cannot bitcast pointers between different address spaces");
 
     srcByteWidth = srcBitWidth / 8;
     dstByteWidth = dstBitWidth / 8;
     if (srcByteWidth % dstByteWidth != 0 && dstByteWidth % srcByteWidth != 0) {
-      return bitcastOp.emitError(
+      return failWithError(
           "pointer pointee byte widths must have an integral ratio");
     }
   }
 
   Operation *beforeCastOp = castSrc.getDefiningOp();
   if (beforeCastOp == nullptr) {
+    if (differentBitWidth && isa<RankedTensorType>(castSrc.getType()))
+      return failWithError(
+          "different-width tensor pointer bitcast was not canonicalized to a "
+          "scalar base pointer");
     return failure();
   }
 
@@ -519,20 +548,44 @@ BitcastCanonicalizer::matchAndRewrite(triton::BitcastOp bitcastOp,
           .Case<triton::AddPtrOp>([&](triton::AddPtrOp addptrOp)
                                       -> FailureOr<Operation *> {
             Value newOffset = addptrOp.getOffset();
+            bool useOpaqueTensorOffset = false;
+            std::optional<uint64_t> opaqueTensorOffsetDivisor;
             if (differentBitWidth) {
               if (dstByteWidth > srcByteWidth) {
                 uint64_t ratio = dstByteWidth / srcByteWidth;
-                if (!isOffsetDivisible(addptrOp.getOffset(), ratio,
-                                       axisInfoAnalysis)) {
-                  bitcastOp.emitError()
-                      << "cannot reinterpret ptr<" << srcPtrTy.getPointeeType()
-                      << "> as ptr<" << dstPtrTy.getPointeeType()
-                      << ">: pre-cast offset must be divisible by " << ratio
-                      << " for every element; alignment could not be proven";
+                OffsetDivisibility divisibility = getOffsetDivisibility(
+                    addptrOp.getOffset(), ratio, axisInfoAnalysis);
+                if (divisibility == OffsetDivisibility::Indivisible) {
+                  if (!hadError)
+                    bitcastOp.emitError()
+                        << "cannot reinterpret ptr<" << srcPtrTy.getPointeeType()
+                        << "> as ptr<" << dstPtrTy.getPointeeType()
+                        << ">: pre-cast offset must be divisible by " << ratio
+                        << " for every element; at least one offset is "
+                           "statically known not to be divisible";
+                  hadError = true;
                   return failure();
                 }
                 Value ratioValue = createIntegerConstantLike(
                     rewriter, bitcastOp.getLoc(), newOffset, ratio);
+                if (divisibility == OffsetDivisibility::Unknown) {
+                  useOpaqueTensorOffset =
+                      isa<RankedTensorType>(newOffset.getType());
+                  if (useOpaqueTensorOffset)
+                    opaqueTensorOffsetDivisor = ratio;
+                  Value remainder = rewriter.create<arith::RemSIOp>(
+                      bitcastOp.getLoc(), newOffset, ratioValue);
+                  Value zeroValue = createIntegerConstantLike(
+                      rewriter, bitcastOp.getLoc(), newOffset, 0);
+                  Value aligned = rewriter.create<arith::CmpIOp>(
+                      bitcastOp.getLoc(), arith::CmpIPredicate::eq, remainder,
+                      zeroValue);
+                  rewriter.create<triton::AssertOp>(
+                      bitcastOp.getLoc(), aligned,
+                      rewriter.getStringAttr(
+                          "pointer bitcast offset is not divisible by " +
+                          std::to_string(ratio)));
+                }
                 newOffset = rewriter.create<arith::DivSIOp>(
                     bitcastOp.getLoc(), newOffset, ratioValue);
               } else {
@@ -548,9 +601,19 @@ BitcastCanonicalizer::matchAndRewrite(triton::BitcastOp bitcastOp,
             auto newAddPtrOp = rewriter.create<triton::AddPtrOp>(
                 bitcastOp.getLoc(), castRes.getType(), newCastOp.getResult(),
                 newOffset);
+            if (useOpaqueTensorOffset) {
+              newAddPtrOp->setAttr(kPointerBitcastRescaledOffsetAttr,
+                                   rewriter.getUnitAttr());
+              newAddPtrOp->setAttr(kPointerBitcastOffsetDivisorAttr,
+                                   rewriter.getI64IntegerAttr(
+                                       *opaqueTensorOffsetDivisor));
+            }
             return newAddPtrOp.getOperation();
           })
-          .Case<triton::SplatOp>([&](triton::SplatOp splatOp) {
+          .Case<triton::SplatOp>([&](triton::SplatOp splatOp)
+                                    -> FailureOr<Operation *> {
+            if (differentBitWidth)
+              return failure();
             Type newCastSrcTy =
                 cast<RankedTensorType>(castRes.getType()).getElementType();
 
@@ -562,7 +625,8 @@ BitcastCanonicalizer::matchAndRewrite(triton::BitcastOp bitcastOp,
             auto newCastOp = rewriter.create<triton::BitcastOp>(
                 bitcastOp.getLoc(), newCastSrcTy, splatSrc);
             return rewriter.create<triton::SplatOp>(
-                bitcastOp.getLoc(), castRes.getType(), newCastOp);
+                bitcastOp.getLoc(), castRes.getType(), newCastOp)
+                .getOperation();
           })
           // before: bitcast - bitcast
           // after(fusion optimization): bitcast

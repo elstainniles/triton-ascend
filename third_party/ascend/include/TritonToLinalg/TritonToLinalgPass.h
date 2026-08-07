@@ -85,7 +85,8 @@ private:
 
   void populateTritonToLinalgCanonicalizationPatterns(
       RewritePatternSet &patterns,
-      mlir::triton::ModuleAxisInfoAnalysis *axisInfoAnalysis);
+      mlir::triton::ModuleAxisInfoAnalysis *axisInfoAnalysis,
+      bool &hadError);
 
   void populateTritonToLinalgConversionPatterns(TypeConverter &typeConverter,
                                                 RewritePatternSet &patterns,

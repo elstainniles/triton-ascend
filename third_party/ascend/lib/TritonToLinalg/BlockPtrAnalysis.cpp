@@ -59,6 +59,31 @@
 namespace mlir {
 namespace triton {
 
+static constexpr llvm::StringLiteral kPointerBitcastRescaledOffsetAttr =
+    "tt.pointer_bitcast_rescaled_offset";
+static constexpr llvm::StringLiteral kPointerBitcastOffsetDivisorAttr =
+    "tt.pointer_bitcast_offset_divisor";
+static constexpr llvm::StringLiteral kPointerBitcastPointerCastAttr =
+    "tt.pointer_bitcast_pointer_cast";
+
+static Value createPointerCast(Value source, Type elementType,
+                               const Location &loc,
+                               ConversionPatternRewriter &rewriter) {
+  assert(isa<BaseMemRefType>(source.getType()) &&
+         "pointer bitcast source must be a memref");
+  if (cast<BaseMemRefType>(source.getType()).getElementType() == elementType)
+    return source;
+  Value address =
+      rewriter.create<memref::ExtractAlignedPointerAsIndexOp>(loc, source);
+  address = rewriter.create<arith::IndexCastOp>(
+      loc, rewriter.getI64Type(), address);
+  auto resultType = MemRefType::get({ShapedType::kDynamic}, elementType);
+  auto pointerCast =
+      rewriter.create<hivm::PointerCastOp>(loc, resultType, ValueRange{address});
+  pointerCast->setAttr(kPointerBitcastPointerCastAttr, rewriter.getUnitAttr());
+  return pointerCast.getResult();
+}
+
 // MemAccType selectMaxMemAccTy(const MemAccType &v1, const MemAccType &v2) {
 //   return (v1 > v2) ? v1 : v2;
 // }
@@ -306,10 +331,11 @@ void BlockData::divBlock(BlockData &lBlock, BlockData &rBlock, Location loc,
   assert(this->isEmpty() && lBlock.getRank() == rBlock.getRank());
 
   assert(!(lBlock.hasSource() && rBlock.hasSource()));
-  assert(lBlock.isScalar() && rBlock.isScalar());
+  assert(rBlock.isScalar());
 
   auto rScalar = rBlock.getScalar();
-  this->scalar = divOpFoldResult(lBlock.getScalar(), rScalar, loc, rewriter);
+  if (lBlock.isScalar())
+    this->scalar = divOpFoldResult(lBlock.getScalar(), rScalar, loc, rewriter);
 
   for (auto lOffset : lBlock.getOffsetsRef()) {
     this->offsets.push_back(divOpFoldResult(lOffset, rScalar, loc, rewriter));
@@ -331,6 +357,37 @@ memref::ReinterpretCastOp BlockData::createCastOp(ArrayRef<int64_t> resultShape,
                                                   const Location &loc,
                                                   OpBuilder &builder) const {
   OpFoldResult resOffset = this->inferBlockOffset(loc, builder);
+  Value castSource = this->source;
+
+  // A pointer bitcast changes the unit in which offsets are expressed. Fold
+  // the already-rescaled offset into the typed pointer address before creating
+  // the memref view. This keeps the reinterpret_cast operand offset and its
+  // result layout consistent, and prevents the PointerCast post-processing
+  // from changing a type that is already consumed by downstream operations.
+  if (auto pointerCast = castSource.getDefiningOp<hivm::PointerCastOp>();
+      pointerCast && pointerCast->hasAttr(kPointerBitcastPointerCastAttr)) {
+    Value offset = getValueOrCreateConstantIndexOp(builder, loc, resOffset);
+    Value address = pointerCast.getAddrs().front();
+    if (offset.getType() != address.getType())
+      offset = builder.create<arith::IndexCastOp>(loc, address.getType(), offset);
+
+    auto elementType =
+        cast<BaseMemRefType>(castSource.getType()).getElementType();
+    int64_t elementByteWidth =
+        (elementType.getIntOrFloatBitWidth() + 7) / 8;
+    Value byteWidth = builder.create<arith::ConstantOp>(
+        loc, builder.getIntegerAttr(address.getType(), elementByteWidth));
+    Value byteOffset =
+        builder.create<arith::MulIOp>(loc, offset, byteWidth);
+    Value rebasedAddress =
+        builder.create<arith::AddIOp>(loc, address, byteOffset);
+    auto rebasedPointerCast = builder.create<hivm::PointerCastOp>(
+        loc, castSource.getType(), ValueRange{rebasedAddress});
+    rebasedPointerCast->setAttr(kPointerBitcastPointerCastAttr,
+                                builder.getUnitAttr());
+    castSource = rebasedPointerCast.getResult();
+    resOffset = builder.getIndexAttr(0);
+  }
   auto resultType = this->getResultMemrefType(
       isa<Attribute>(resOffset) ? getConstantIntValue(resOffset).value()
                                 : ShapedType::kDynamic,
@@ -349,7 +406,7 @@ memref::ReinterpretCastOp BlockData::createCastOp(ArrayRef<int64_t> resultShape,
   }
 
   return builder.create<memref::ReinterpretCastOp>(
-      loc, resultType, this->source, resOffset, this->sizes, strides);
+      loc, resultType, castSource, resOffset, this->sizes, strides);
 }
 
 void BlockData::dump() const {
@@ -590,6 +647,7 @@ void BlockDataParser::parseDiv(
   BlockData lBlock, rBlock;
   parse(op.getLhs(), lBlock, loc, rewriter, known);
   parse(op.getRhs(), rBlock, loc, rewriter, known);
+
   data.divBlock(lBlock, rBlock, loc, rewriter);
 }
 
@@ -721,17 +779,13 @@ void BlockDataParser::parseBitcast(
     resElemPointeeTy =
         dyn_cast<triton::PointerType>(resElemTy).getPointeeType();
   } else {
-    auto srcPointeeType =
-        cast<triton::PointerType>(op.getSrc().getType()).getPointeeType();
+    auto srcPointeeType = cast<triton::PointerType>(op.getSrc().getType())
+                              .getPointeeType();
     auto resPointeeType = cast<triton::PointerType>(resType).getPointeeType();
 
-    // Handling special case
-    // If Op is MetaUse or src is i1 block argument and dst is i8,
-    // it should be converted to UnrealizedConversionCast
-    if (op->hasAttr("MetaUse") ||
-        (isa<BlockArgument>(op.getSrc()) &&
-         srcPointeeType == rewriter.getIntegerType(1) &&
-         resPointeeType == rewriter.getIntegerType(8))) {
+    // Preserve the original base memref and apply the pointee reinterpretation
+    // when the final pointer view is constructed.
+    if (op->hasAttr("MetaUse") || srcPointeeType != resPointeeType) {
       resElemPointeeTy = resPointeeType;
     } else {
       auto remappedValue = rewriter.getRemappedValue(op);
@@ -871,7 +925,21 @@ void BlockDataParser::parseAddPtr(
 
   BlockData ptrBlock, offsetBlock;
   parse(op.getPtr(), ptrBlock, op.getLoc(), rewriter, known);
-  parse(op.getOffset(), offsetBlock, op.getLoc(), rewriter, known);
+  if (op->hasAttr(kPointerBitcastRescaledOffsetAttr) &&
+      isa<ShapedType>(op.getOffset().getType())) {
+    auto shape = cast<ShapedType>(op.getOffset().getType()).getShape();
+    offsetBlock.setMemAccVal(MemAccVal::UnstrucMemAcc);
+    for (int64_t dimension : shape) {
+      offsetBlock.getOffsetsRef().push_back(rewriter.getIndexAttr(0));
+      offsetBlock.getSizesRef().push_back(rewriter.getIndexAttr(dimension));
+      offsetBlock.getStridesRef().push_back(rewriter.getIndexAttr(1));
+    }
+    // Source presence propagates unstructured access. The final, already
+    // rescaled value is consumed from the AddPtr adaptor during rewriting.
+    offsetBlock.setSource(op.getOffset());
+  } else {
+    parse(op.getOffset(), offsetBlock, op.getLoc(), rewriter, known);
+  }
 
   assert(ptrBlock.hasSource() &&
          "Ptr field should provide source/base pointer");
@@ -1285,6 +1353,11 @@ void BlockDataParser::rewriteAddPtr(
   BlockData data;
   parseAddPtr(op, data, op.getLoc(), rewriter, known);
 
+  if (data.hasResElemTy())
+    data.setSource(createPointerCast(data.getSourceRef(),
+                                     data.getResElemTyRef(), op.getLoc(),
+                                     rewriter));
+
   if (auto src = data.getSource();
       data.getMemAccTypeRef().isUnstructured() &&
       !(src && isa_and_nonnull<triton::IntToPtrOp>(src.getDefiningOp()))) {
@@ -1355,16 +1428,6 @@ void BlockDataParser::rewriteAddPtr(
     auto hivmPointCastOp = rewriter.create<hivm::PointerCastOp>(
         intToPtrOp.getLoc(), memrefType, ValueRange{intToPtrOp.getSrc()});
     data.setSource(hivmPointCastOp.getResult());
-  }
-
-  if (data.hasResElemTy()) {
-    // Handle bitcast scenario
-    auto memrefType = dyn_cast<BaseMemRefType>(data.getSourceRef().getType())
-                          .cloneWith(std::nullopt, data.getResElemTyRef());
-    UnrealizedConversionCastOp castOp =
-        rewriter.create<mlir::UnrealizedConversionCastOp>(
-            op.getLoc(), memrefType, data.getSourceRef());
-    data.setSource(castOp.getOutputs()[0]);
   }
 
   // ToDo: need to handle module scenario
@@ -1537,12 +1600,8 @@ void BlockDataParser::rewriteMakeTensorPtrOp(
   // Handle base is defined by tt.bitcast
   BlockDataParser::parse(op.getBase(), data, loc, rewriter, known);
   if (data.hasResElemTy()) {
-    auto memrefType = dyn_cast<BaseMemRefType>(data.getSourceRef().getType())
-                          .cloneWith(std::nullopt, data.getResElemTyRef());
-    UnrealizedConversionCastOp castOp =
-        rewriter.create<mlir::UnrealizedConversionCastOp>(loc, memrefType,
-                                                          data.getSourceRef());
-    data.setSource(castOp.getOutputs()[0]);
+    data.setSource(createPointerCast(data.getSourceRef(),
+                                     data.getResElemTyRef(), loc, rewriter));
   } else {
     data.setSource(rewriter.getRemappedValue(op.getBase()));
   }
@@ -2490,6 +2549,28 @@ void BlockDataParser::rewriteAddPtrToUnstrucMemAcc(
   auto &blockSizes = data.getSizesRef();
   auto &strides = data.getStridesRef();
   Value ptrOffset = adaptor.getOffset();
+  int64_t pointerBitcastDivisor = 0;
+  if (op->hasAttr(kPointerBitcastRescaledOffsetAttr)) {
+    auto divOp = op.getOffset().getDefiningOp<arith::DivSIOp>();
+    auto divisorAttr =
+        op->getAttrOfType<IntegerAttr>(kPointerBitcastOffsetDivisorAttr);
+    if (!divOp || !divisorAttr) {
+      op.emitError("pointer bitcast rescaled tensor offset is missing its "
+                   "division metadata");
+      return;
+    }
+    Value remappedOffset = rewriter.getRemappedValue(divOp.getLhs());
+    if (!remappedOffset) {
+      op.emitError("failed to remap the checked pointer bitcast tensor offset");
+      return;
+    }
+    ptrOffset = remappedOffset;
+    pointerBitcastDivisor = divisorAttr.getInt();
+    if (pointerBitcastDivisor <= 0) {
+      op.emitError("pointer bitcast tensor offset divisor must be positive");
+      return;
+    }
+  }
   Value zeroIdx =
       rewriter.create<arith::ConstantOp>(loc, rewriter.getIndexAttr(0));
   Value oneIdx =
@@ -2532,8 +2613,14 @@ void BlockDataParser::rewriteAddPtrToUnstrucMemAcc(
 
         Value scalarOffsetRaw =
             bB.create<tensor::ExtractOp>(bLoc, ptrOffset, allIVs);
+
         Value scalarOffset = bB.create<arith::IndexCastOp>(
             bLoc, bB.getIndexType(), scalarOffsetRaw);
+        if (pointerBitcastDivisor != 0) {
+          Value divisor = bB.create<arith::ConstantIndexOp>(
+              bLoc, pointerBitcastDivisor);
+          scalarOffset = bB.create<arith::DivSIOp>(bLoc, scalarOffset, divisor);
+        }
         OpFoldResult baseOffset = bB.getIndexAttr(0);
         for (auto ofr : data.getOffsetsRef()) {
           baseOffset = addOpFoldResult(baseOffset, ofr, bLoc, bB);

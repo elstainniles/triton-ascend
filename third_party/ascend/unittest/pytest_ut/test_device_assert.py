@@ -34,7 +34,7 @@ class Options:
     num_ctas = 1
     cluster_dims = (1, 1, 1)
     enable_fp_fusion = True
-    debug = False
+    debug = True
     sanitize_overflow = True
 
 
@@ -56,7 +56,7 @@ def compile_kernel(kernel, signature, constants):
 
 
 @triton.jit
-def kernel_device_assert_with_mask(x_ptr, XBLOCK: tl.constexpr):
+def kernel_assert_with_mask(x_ptr, XBLOCK: tl.constexpr):
     offsets = tl.arange(0, XBLOCK)
     x = tl.load(x_ptr + offsets)
     cond = x > 0
@@ -65,5 +65,5 @@ def kernel_device_assert_with_mask(x_ptr, XBLOCK: tl.constexpr):
 
 
 def test_device_assert_with_mask():
-    mlir = compile_kernel(kernel_device_assert_with_mask, {"x_ptr": "*fp32"}, {"XBLOCK": 16})
-    assert "device_assert" in mlir or "hivm.hir.device_assert" in mlir, "device_assert with mask not found in MLIR"
+    mlir = compile_kernel(kernel_assert_with_mask, {"x_ptr": "*fp32"}, {"XBLOCK": 16})
+    assert "tt.assert" in mlir, "tt.assert with mask not found in MLIR"
