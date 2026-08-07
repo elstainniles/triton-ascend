@@ -18,17 +18,18 @@ NPU_DEVICE=1 bash third_party/ascend/unittest/pytest_ut/pointer_bitcast_e2e_case
 ```
 
 The runner automatically prefers the current repository's `build/lib.*`
-Python package and matching `triton-opt`, uses an isolated Triton cache, and
-writes the complete result to `TEST_RESULT.md`.
+Python package and matching `triton-opt`, uses an isolated Triton cache,
+and runs later diagnostic groups after an earlier failure while preserving the\noriginal 3600-second overall timeout.
 
-Return only the result through Git:
+At the end, the terminal prints only the overall result and per-group counts.
+The same compact summary is written to `TEST_RESULT.md`. Send that file
+first; no Git push is required.
 
-```bash
-git add third_party/ascend/unittest/pytest_ut/pointer_bitcast_e2e_cases/TEST_RESULT.md
-git commit -m "[ascend](test) record pointer bitcast e2e result"
-git push
-```
+Full tracebacks, JUnit records, environment metadata, and runner diagnostics
+are kept separately under `test_results/`. See
+`test_results/README.md` for the file map and commands for returning
+only a requested slice.
 
-Acceptance requires exactly `46 passed` and `0 skipped`. The suite contains 18
-real-world/type-matrix regressions, 17 runtime-alignment cases, and 11 direct
-TritonToLinalg MLIR contracts.
+Acceptance requires exactly `46 passed` and `0 skipped`. The
+suite contains 18 real-world/type-matrix regressions, 17 runtime-alignment
+cases, and 11 direct TritonToLinalg MLIR contracts.

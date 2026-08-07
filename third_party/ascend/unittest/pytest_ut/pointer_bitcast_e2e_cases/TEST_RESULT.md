@@ -1,6 +1,8 @@
 # Pointer Bitcast E2E Result
 
-Status: not run
+## Overall
+
+**NOT RUN**
 
 Run the suite with:
 
@@ -8,5 +10,7 @@ Run the suite with:
 bash third_party/ascend/unittest/pytest_ut/pointer_bitcast_e2e_cases/run.sh
 ```
 
-This file will be replaced with the environment summary and complete pytest
-output. Commit and push only this file to return the result.
+After the run, this file contains only the overall result and per-group counts.
+Provide this file first. Detailed diagnostics remain in `test_results/`
+and do not need to be returned unless a specific file or line range is
+requested.
