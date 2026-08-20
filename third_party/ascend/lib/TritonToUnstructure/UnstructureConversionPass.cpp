@@ -52,6 +52,11 @@ bool forceSimtTemplateFlag = false;
 
 namespace {
 
+static bool isTensorOfPointers(Type type) {
+  auto tensorType = dyn_cast<RankedTensorType>(type);
+  return tensorType && isa<triton::PointerType>(tensorType.getElementType());
+}
+
 constexpr int64_t kBitsPerByte = 8;
 
 static constexpr const char *kRouteDiscreteMaskToSimtAttrName =
@@ -412,6 +417,12 @@ LogicalResult tryRewriteIndirectFastPath(MemAccOpTy op, Location loc,
                                          Value srcPtr, Value ptrOffset,
                                          ArrayRef<int64_t> resultShape,
                                          PatternRewriter &rewriter) {
+  // Indirect backend operations accept one scalar base plus lane offsets. An
+  // opaque tensor base can contain a different pointer in every lane, so it
+  // must be handled by the scalar-loop fallback below.
+  if (!isa<triton::PointerType>(srcPtr.getType()))
+    return failure();
+
   bool rankWithinIndirectLoadStoreFastPathLimit = resultShape.size() <= 5;
 
   if (!canUseIndirectFastPath(srcPtr, ptrOffset)) {
@@ -677,16 +688,65 @@ triton::StoreOp UnstructuredMemAccessConverter<triton::StoreOp>::createMemAccOp(
 
 template <>
 template <>
-void UnstructuredMemAccessConverter<triton::LoadOp>::splatAndLoadScenario<
-    triton::LoadOp>(triton::LoadOp op, int rank,
+LogicalResult
+UnstructuredMemAccessConverter<triton::LoadOp>::splatAndLoadScenario<
+    triton::LoadOp>(triton::LoadOp op, const PtrOffsetInfo &ptrOffsetInfo,
                     PatternRewriter &rewriter) const {
   auto loc = op.getLoc();
-  SmallVector<OpFoldResult> idx(rank, rewriter.getIndexAttr(0));
-  auto extractedPtr = createExtractOp(loc, op.getPtr(), rewriter, idx);
+  if (!ptrOffsetInfo.isPointerDescriptorOwned()) {
+    // Preserve the legacy scalar-like path for unmarked pointer tensors. The
+    // analyzed-base reconstruction below is a descriptor handoff contract.
+    // Provenance is carried by PtrOffsetInfo so supported pointer-preserving
+    // operations, such as an ordinary addptr after the rebuild, do not lose
+    // ownership; unrelated pointer tensors still keep this legacy path.
+    SmallVector<OpFoldResult> indices(ptrOffsetInfo.getRank(),
+                                      rewriter.getIndexAttr(0));
+    Value extractedPtr = createExtractOp(loc, op.getPtr(), rewriter, indices);
+    Value mask = op.getMask();
+    Value other = op.getOther();
+    Value loadedValue = rewriter.create<triton::LoadOp>(
+        loc, extractedPtr, /*mask=*/nullptr, /*other=*/nullptr,
+        /*boundaryCheck=*/ArrayRef<int32_t>(),
+        /*PaddingOptionAttr=*/nullptr);
+    loadedValue = rewriter.create<triton::SplatOp>(
+        loc, op.getResult().getType(), loadedValue);
+    if (mask)
+      rewriter.replaceOpWithNewOp<arith::SelectOp>(op, mask, loadedValue,
+                                                   other);
+    else
+      rewriter.replaceOp(op, loadedValue);
+    return success();
+  }
+
+  Value scalarBase = ptrOffsetInfo.getPtr();
+  Value scalarOffset = ptrOffsetInfo.getOffset();
+  if (!scalarBase || !isa<triton::PointerType>(scalarBase.getType()) ||
+      !scalarOffset)
+    return failure();
+
+  if (auto offsetType = dyn_cast<RankedTensorType>(scalarOffset.getType())) {
+    if (offsetType.getRank() != ptrOffsetInfo.getRank() ||
+        !isa<IntegerType>(offsetType.getElementType()))
+      return failure();
+    SmallVector<OpFoldResult> indices(ptrOffsetInfo.getRank(),
+                                      rewriter.getIndexAttr(0));
+    scalarOffset = createExtractOp(loc, scalarOffset, rewriter, indices);
+  } else if (!scalarOffset.getType().isIndex() &&
+             !isa<IntegerType>(scalarOffset.getType())) {
+    return failure();
+  }
+
+  // PtrOffsetInfo already represents the analyzed address as scalarBase plus
+  // scalarOffset. Rebuild that scalar pointer directly instead of extracting
+  // a pointer lane from the original tensor-of-pointers value. This keeps the
+  // pointer producer in the T2L-supported addptr family; only the numerical
+  // offset is extracted from a tensor when necessary.
+  Value ptrToLoad = rewriter.create<triton::AddPtrOp>(loc, scalarBase.getType(),
+                                                      scalarBase, scalarOffset);
   Value mask = op.getMask();
   Value other = op.getOther();
   Value loadedValue = rewriter.create<triton::LoadOp>(
-      loc, extractedPtr, /*mask=*/nullptr, /*other=*/nullptr,
+      loc, ptrToLoad, /*mask=*/nullptr, /*other=*/nullptr,
       /*boundaryCheck=*/ArrayRef<int32_t>(),
       /*PaddingOptionAttr=*/nullptr);
   loadedValue = rewriter.create<triton::SplatOp>(loc, op.getResult().getType(),
@@ -695,6 +755,7 @@ void UnstructuredMemAccessConverter<triton::LoadOp>::splatAndLoadScenario<
     rewriter.replaceOpWithNewOp<arith::SelectOp>(op, mask, loadedValue, other);
   else
     rewriter.replaceOp(op, loadedValue);
+  return success();
 }
 
 template <typename MemAccOpTy>
@@ -741,8 +802,8 @@ LogicalResult UnstructuredMemAccessConverter<MemAccOpTy>::matchAndRewrite(
   });
 
   if constexpr (std::is_same_v<MemAccOpTy, triton::LoadOp>) {
-    if (ptrOffsetInfo.isScalarLike()) {
-      splatAndLoadScenario(op, ptrOffsetInfo.getRank(), rewriter);
+    if (ptrOffsetInfo.isScalarLike() &&
+        succeeded(splatAndLoadScenario(op, ptrOffsetInfo, rewriter))) {
       return success();
     }
   }
@@ -758,6 +819,10 @@ LogicalResult UnstructuredMemAccessConverter<MemAccOpTy>::matchAndRewrite(
 
   auto srcPtr = ptrOffsetInfo.getPtr();
   auto ptrOffset = ptrOffsetInfo.getOffset();
+  if (!isa<triton::PointerType>(srcPtr.getType()) &&
+      !isTensorOfPointers(srcPtr.getType()))
+    return rewriter.notifyMatchFailure(
+        op, "expected a scalar pointer or a tensor of scalar pointers");
 
   // LoadLike is operation with result
   bool isLoadLike = !op->use_empty();
@@ -934,8 +999,20 @@ LogicalResult UnstructuredMemAccessConverter<MemAccOpTy>::matchAndRewrite(
     os << extractedOffset << "\n";
   });
 
-  assert(isa<triton::PointerType>(srcPtr.getType()) && "src must be ptr type");
-  if (!fullyUnstructured) {
+  // A tensor-of-pointers base is opaque: each lane may select a different
+  // allocation. Extract the base with the same scalar or slice coordinates as
+  // the offset, then form the access pointer lane by lane.
+  if (isTensorOfPointers(srcPtr.getType())) {
+    if (fullyUnstructured)
+      srcPtr = createExtractOp(loc, srcPtr, rewriter, offsets);
+    else
+      srcPtr = createExtractOp(loc, srcPtr, rewriter, offsets, sizes, strides);
+  }
+
+  assert((isa<triton::PointerType>(srcPtr.getType()) ||
+          isTensorOfPointers(srcPtr.getType())) &&
+         "src must be a scalar pointer or tensor of pointers");
+  if (!fullyUnstructured && isa<triton::PointerType>(srcPtr.getType())) {
     srcPtr = rewriter.create<triton::SplatOp>(
         loc, RankedTensorType::get(extractedShape, srcPtr.getType()), srcPtr);
   }

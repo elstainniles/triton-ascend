@@ -116,8 +116,7 @@ AddPtrConverter::matchAndRewrite(triton::AddPtrOp op, OpAdaptor adaptor,
   Location loc = op.getLoc();
   insertDebugNop(loc, rewriter);
   llvm::SmallDenseMap<Value, BlockData> known;
-  BlockDataParser::rewriteAddPtr(op, adaptor, rewriter, known);
-  return success();
+  return BlockDataParser::rewriteAddPtr(op, adaptor, rewriter, known);
 }
 
 LogicalResult LoadConverter::toTensorAndReplace(
@@ -417,13 +416,17 @@ LoadConverter::matchAndRewrite(triton::LoadOp op, OpAdaptor adaptor,
   ptr = *resolvedPtr;
   // handling scalar
   if (!isa<ShapedType>(op.getResult().getType())) {
-    auto scalarMemref =
+    FailureOr<Value> scalarMemref =
         BlockDataParser::getScalarMemRef(op.getPtr(), ptr, loc, rewriter);
+    if (failed(scalarMemref))
+      return rewriter.notifyMatchFailure(
+          op, "scalar pointer operand has not been converted to a memref");
+
     auto resTy = op.getResult().getType();
     auto idxZero =
         rewriter.create<arith::ConstantOp>(loc, rewriter.getIndexAttr(0));
     auto loadedValue = rewriter
-                           .create<memref::LoadOp>(loc, resTy, scalarMemref,
+                           .create<memref::LoadOp>(loc, resTy, *scalarMemref,
                                                    idxZero.getResult())
                            .getResult();
     propagateWasBoolToInt8Attr(op.getOperation(), loadedValue.getDefiningOp(),
