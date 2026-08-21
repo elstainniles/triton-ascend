@@ -23,6 +23,7 @@ import torch
 import torch_npu  # noqa: F401
 import triton
 import triton.language as tl
+import triton.language.extra.cann.extension as al
 
 BLOCK = 32
 N = 128
@@ -150,6 +151,34 @@ def opaque_tensor_ptr_loop_kernel(a, b, out, steps_ptr, n: tl.constexpr, BLOCK: 
     tl.store(out + lane, value)
 
 
+@triton.jit
+def scope_block_ptr_kernel(x, out, delta_ptr, n: tl.constexpr, BLOCK: tl.constexpr):
+    delta = tl.load(delta_ptr).to(tl.int32)
+    pointer = tl.make_block_ptr(
+        base=x,
+        shape=(n, ),
+        strides=(1, ),
+        offsets=(1, ),
+        block_shape=(BLOCK, ),
+        order=(0, ),
+    )
+    with al.scope(core_mode="vector", disable_auto_sync=True):
+        pointer = tl.advance(pointer, (delta, ))
+    value = tl.load(pointer, boundary_check=(0, ), padding_option="zero")
+    tl.store(out + tl.arange(0, BLOCK), value)
+
+
+@triton.jit
+def scope_tensor_ptr_kernel(x, out, delta_ptr, n: tl.constexpr, BLOCK: tl.constexpr):
+    lane = tl.arange(0, BLOCK)
+    delta = tl.load(delta_ptr)
+    pointers = x + lane
+    with al.scope(core_mode="vector"):
+        pointers = pointers + delta
+    value = tl.load(pointers, mask=lane + delta < n, other=0.0)
+    tl.store(out + lane, value)
+
+
 def _inputs():
     a_cpu = torch.arange(2048, dtype=torch.float32)
     b_cpu = 100000.0 + torch.arange(2048, dtype=torch.float32) * 3.0
@@ -248,3 +277,23 @@ def test_opaque_tensor_pointer_loop(steps):
         if index < N:
             expected[lane] = a_cpu[index] if (lane & 1) == 0 else b_cpu[index]
     _assert_output(out, expected)
+
+
+@pytest.mark.parametrize("delta", [0, 3, 37])
+def test_scope_block_pointer_result(delta):
+    a_cpu, _, a, _ = _inputs()
+    out = torch.empty(BLOCK, dtype=torch.float32, device="npu")
+
+    scope_block_ptr_kernel[(1, )](a, out, _device_i32(delta), n=N, BLOCK=BLOCK)
+
+    _assert_output(out, _slice(a_cpu, 0, N, 1, 1 + delta))
+
+
+@pytest.mark.parametrize("delta", [0, 2, 5])
+def test_scope_tensor_pointer_result(delta):
+    a_cpu, _, a, _ = _inputs()
+    out = torch.empty(BLOCK, dtype=torch.float32, device="npu")
+
+    scope_tensor_ptr_kernel[(1, )](a, out, _device_i32(delta), n=N, BLOCK=BLOCK)
+
+    _assert_output(out, _slice(a_cpu, 0, N, 1, delta))

@@ -139,6 +139,15 @@ public:
   virtual FailureOr<SmallVector<unsigned>>
   getLoopCandidateComponents(const AnalyzedValue &value) const = 0;
 
+  /// Components which may cross a scope.scope result boundary. Scope has no
+  /// region arguments or backedge, so the first implementation returns every
+  /// component that the policy already permits a loop to carry. A policy may
+  /// override this hook when its Scope schema differs from its loop schema.
+  virtual FailureOr<SmallVector<unsigned>>
+  getScopeCandidateComponents(const AnalyzedValue &value) const {
+    return getLoopCandidateComponents(value);
+  }
+
   virtual FailureOr<SmallVector<unsigned>>
   getLoopTransferredComponents(const AnalyzedValue &initial,
                                const AnalyzedValue &regionArgument,
@@ -183,6 +192,7 @@ private:
   FailureOr<ControlFlowOpAnalysis> analyzeFor(Operation *op);
   FailureOr<ControlFlowOpAnalysis> analyzeWhile(Operation *op);
   FailureOr<ControlFlowOpAnalysis> analyzeIf(Operation *op);
+  FailureOr<ControlFlowOpAnalysis> analyzeScope(Operation *op);
 
   void bindRegionArgument(Value argument, const AnalyzedValue &initial,
                           ArrayRef<unsigned> componentIndices);
