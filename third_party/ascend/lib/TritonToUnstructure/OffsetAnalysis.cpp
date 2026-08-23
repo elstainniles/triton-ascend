@@ -268,6 +268,33 @@ bool isPointerDescriptorBoundarySlot(Operation *loop, unsigned slot) {
   return llvm::is_contained(slots.asArrayRef(), static_cast<int32_t>(slot));
 }
 
+bool isScalarPointerOffsetBoundarySlot(Operation *loop, unsigned slot) {
+  auto slots = dyn_cast_or_null<DenseI32ArrayAttr>(
+      loop->getAttr(kScalarPointerOffsetBoundaryAttr));
+  return slots &&
+         llvm::is_contained(slots.asArrayRef(), static_cast<int32_t>(slot));
+}
+
+bool isScalarPointerOffsetBoundaryRegionArgument(LoopLikeOpInterface loopOp,
+                                                 BlockArgument regionIterArg) {
+  if (auto whileOp = dyn_cast<scf::WhileOp>(loopOp.getOperation())) {
+    if (regionIterArg.getOwner() != whileOp.getBeforeBody() &&
+        regionIterArg.getOwner() != whileOp.getAfterBody())
+      return false;
+    return isScalarPointerOffsetBoundarySlot(loopOp.getOperation(),
+                                             regionIterArg.getArgNumber());
+  }
+
+  if (auto forOp = dyn_cast<scf::ForOp>(loopOp.getOperation())) {
+    if (regionIterArg.getOwner() != forOp.getBody() ||
+        regionIterArg.getArgNumber() == 0)
+      return false;
+    return isScalarPointerOffsetBoundarySlot(loopOp.getOperation(),
+                                             regionIterArg.getArgNumber() - 1);
+  }
+  return false;
+}
+
 bool isPointerDescriptorBoundaryRegionArgument(LoopLikeOpInterface loopOp,
                                                BlockArgument regionIterArg) {
   if (auto whileOp = dyn_cast<scf::WhileOp>(loopOp.getOperation())) {
@@ -390,6 +417,16 @@ void parseLoopRegionIterArg(LoopLikeOpInterface loopOp, const Location &loc,
                             RewriterBase &rewriter,
                             llvm::DenseMap<Value, PtrOffsetInfo> &offsetMap,
                             BlockArgument regionIterArg) {
+  // This argument is a dynamic relative offset created by T2U.  Do not copy
+  // the loop init provenance here: doing so makes every backedge restart from
+  // the initial offset and drops the accumulated delta.  A scalar-like empty
+  // record lets parseAddPtr combine the live argument with the next delta.
+  if (isScalarPointerOffsetBoundaryRegionArgument(loopOp, regionIterArg)) {
+    offsetMap[regionIterArg] = PtrOffsetInfo();
+    offsetMap[regionIterArg].setScalarLike(true);
+    return;
+  }
+
   if (isScalarPointer(regionIterArg) &&
       isPointerDescriptorBoundaryRegionArgument(loopOp, regionIterArg)) {
     recordOpaqueScalarPointer(regionIterArg, offsetMap);

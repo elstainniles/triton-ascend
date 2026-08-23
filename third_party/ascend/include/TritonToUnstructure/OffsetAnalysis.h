@@ -34,9 +34,17 @@
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SmallVector.h"
+#include "llvm/ADT/StringRef.h"
 
 namespace mlir {
 namespace triton {
+
+/// Temporary T2U handoff marker for loop slots rewritten from a scalar
+/// pointer to a relative integer offset.  OffsetAnalysis uses this marker to
+/// keep the region argument's dynamic backedge value instead of replaying the
+/// original pointer-init provenance on every iteration.
+inline constexpr llvm::StringLiteral kScalarPointerOffsetBoundaryAttr =
+    "ScalarPointerOffsetBoundary";
 
 struct PtrOffsetInfo {
   /**

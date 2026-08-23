@@ -1,4 +1,5 @@
-// RUN: triton-opt --triton-control-flow-opt --triton-to-unstructure --triton-to-linalg %s -verify-each | FileCheck %s
+// RUN: triton-opt --triton-control-flow-opt %s -verify-each | FileCheck %s --check-prefix=CFO
+// RUN: triton-opt --triton-control-flow-opt --triton-to-unstructure --triton-to-linalg %s -verify-each | FileCheck %s --check-prefix=LINALG
 
 module attributes {hacc.target = #hacc.target<"Ascend910B2">} {
   tt.func public @tensor_pointer_descriptor_loop(
@@ -21,8 +22,14 @@ module attributes {hacc.target = #hacc.target<"Ascend910B2">} {
   }
 }
 
-// CHECK-LABEL: func.func @tensor_pointer_descriptor_loop
-// CHECK:       scf.for
-// CHECK-SAME:  tensor<4xi32>
-// CHECK-NOT:   tensor<4x!tt.ptr
-// CHECK-NOT:   unrealized_conversion_cast
+// CFO-LABEL: tt.func public @tensor_pointer_descriptor_loop
+// CFO:       scf.for
+// CFO-SAME:  i32
+// CFO:       tt.addptr {{.*}}PointerDescriptorOffsetForm = "strided_1d"
+// CFO-SAME:  PointerDescriptorStructuredAxes = array<i32: 1>
+
+// LINALG-LABEL: func.func @tensor_pointer_descriptor_loop
+// LINALG:       scf.for
+// LINALG-SAME:  i32
+// LINALG-NOT:   tensor<4x!tt.ptr
+// LINALG-NOT:   unrealized_conversion_cast

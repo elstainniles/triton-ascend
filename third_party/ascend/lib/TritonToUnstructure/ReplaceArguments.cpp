@@ -33,6 +33,9 @@ using namespace triton;
 
 namespace {
 
+inline constexpr llvm::StringLiteral kScalarPointerCarrierBoundaryAttr =
+    "ScalarPointerCarrierBoundary";
+
 static bool isScalarPointerType(Type type) {
   auto pointerType = dyn_cast<triton::PointerType>(type);
   return pointerType && !isa<ShapedType>(pointerType.getPointeeType());
@@ -54,7 +57,44 @@ static bool useCompleteScalarAddress(Operation *loop, unsigned slot,
                                      Type type) {
   return loop && isa<scf::ForOp, scf::WhileOp>(loop) &&
          isScalarPointerType(type) &&
-         isPointerDescriptorBoundarySlot(loop, slot);
+         (isPointerDescriptorBoundarySlot(loop, slot) ||
+          loop->hasAttr(kScalarPointerCarrierBoundaryAttr));
+}
+
+// Record the exact loop slot whose block argument is changed from a scalar
+// pointer to an i64 relative offset.  The marker is deliberately attached to
+// the cloned SCF op rather than inferred later from type alone: ordinary i64
+// loop-carried values must retain their established analysis.
+static void markScalarPointerOffsetSlot(Value value) {
+  auto blockArg = dyn_cast<BlockArgument>(value);
+  if (!blockArg)
+    return;
+  Operation *owner = blockArg.getOwner()->getParentOp();
+  if (!owner)
+    return;
+
+  unsigned slot = 0;
+  if (auto forOp = dyn_cast<scf::ForOp>(owner)) {
+    if (blockArg.getOwner() != forOp.getBody() || blockArg.getArgNumber() == 0)
+      return;
+    slot = blockArg.getArgNumber() - 1;
+  } else if (auto whileOp = dyn_cast<scf::WhileOp>(owner)) {
+    if (blockArg.getOwner() != whileOp.getBeforeBody() &&
+        blockArg.getOwner() != whileOp.getAfterBody())
+      return;
+    slot = blockArg.getArgNumber();
+  } else {
+    return;
+  }
+
+  SmallVector<int32_t> slots;
+  if (auto existing = dyn_cast_or_null<DenseI32ArrayAttr>(
+          owner->getAttr(kScalarPointerOffsetBoundaryAttr)))
+    slots.append(existing.asArrayRef().begin(), existing.asArrayRef().end());
+  if (!llvm::is_contained(slots, static_cast<int32_t>(slot)))
+    slots.push_back(static_cast<int32_t>(slot));
+  owner->setAttr(kScalarPointerOffsetBoundaryAttr,
+                 DenseI32ArrayAttr::get(owner->getContext(), slots));
 }
 
 // A scalar-pointer SCF slot is represented by one complete i64 address on all
@@ -74,10 +114,153 @@ static bool hasScalarPointerBase(const PtrOffsetInfo &info) {
   return info.getPtr() && isScalarPointerType(info.getPtr().getType());
 }
 
+// A scalar pointer can use the established T2U offset representation only if
+// analysis found both a source pointer and a displacement.  An entry whose
+// source is the value itself is an opaque complete address (for example a
+// control-flow phi or a function argument), so choosing an offset for only
+// one edge would change the meaning of the other edges.
+static bool
+canRewriteScalarPointer(Value value, RewriterBase &rewriter,
+                        llvm::DenseMap<Value, PtrOffsetInfo> &offsetMap) {
+  if (!isScalarPointerType(value.getType()))
+    return true;
+
+  parse(value, value.getLoc(), rewriter, offsetMap);
+  auto it = offsetMap.find(value);
+  if (it == offsetMap.end())
+    return false;
+  const PtrOffsetInfo &info = it->second;
+  return info.getPtr() && info.getOffset() && info.getPtr() != value;
+}
+
+// Decide the representation once for the complete SCF boundary.  The caller
+// passes this same decision to every init, region argument, yield, condition
+// operand, and result rewrite.  Thus a failed proof falls back atomically to
+// the pointer representation instead of producing a mixed-type boundary.
+static bool
+shouldPreserveScalarPointers(Operation *op, RewriterBase &rewriter,
+                             llvm::DenseMap<Value, PtrOffsetInfo> &offsetMap) {
+  SmallVector<Value> boundaryValues;
+  if (auto whileOp = dyn_cast<scf::WhileOp>(op)) {
+    boundaryValues.append(whileOp.getInits().begin(), whileOp.getInits().end());
+    boundaryValues.append(whileOp.getBeforeArguments().begin(),
+                          whileOp.getBeforeArguments().end());
+    boundaryValues.append(whileOp.getAfterArguments().begin(),
+                          whileOp.getAfterArguments().end());
+    boundaryValues.append(whileOp->getResults().begin(),
+                          whileOp->getResults().end());
+    boundaryValues.append(whileOp.getConditionOp().getArgs().begin(),
+                          whileOp.getConditionOp().getArgs().end());
+    boundaryValues.append(whileOp.getYieldOp()->getOperands().begin(),
+                          whileOp.getYieldOp()->getOperands().end());
+  } else if (auto loopOp = dyn_cast<LoopLikeOpInterface>(op)) {
+    boundaryValues.append(loopOp.getInits().begin(), loopOp.getInits().end());
+    boundaryValues.append(loopOp.getRegionIterArgs().begin(),
+                          loopOp.getRegionIterArgs().end());
+    boundaryValues.append(loopOp->getResults().begin(),
+                          loopOp->getResults().end());
+    boundaryValues.append(loopOp.getYieldedValues().begin(),
+                          loopOp.getYieldedValues().end());
+  } else if (auto ifOp = dyn_cast<scf::IfOp>(op)) {
+    boundaryValues.append(ifOp->getResults().begin(), ifOp->getResults().end());
+    boundaryValues.append(ifOp.thenYield().getResults().begin(),
+                          ifOp.thenYield().getResults().end());
+    if (ifOp.elseBlock())
+      boundaryValues.append(ifOp.elseYield().getResults().begin(),
+                            ifOp.elseYield().getResults().end());
+  } else {
+    return false;
+  }
+
+  for (Value value : boundaryValues) {
+    if (!isScalarPointerType(value.getType()))
+      continue;
+    if (!canRewriteScalarPointer(value, rewriter, offsetMap))
+      return true;
+  }
+  return false;
+}
+
+static bool hasScalarPointerResult(scf::IfOp op) {
+  return llvm::any_of(op->getResultTypes(),
+                      [](Type type) { return isScalarPointerType(type); });
+}
+
+static bool hasScalarPointerBoundary(Operation *op) {
+  SmallVector<Value> values;
+  if (auto whileOp = dyn_cast<scf::WhileOp>(op)) {
+    values.append(whileOp.getInits().begin(), whileOp.getInits().end());
+    values.append(whileOp.getBeforeArguments().begin(),
+                  whileOp.getBeforeArguments().end());
+    values.append(whileOp.getAfterArguments().begin(),
+                  whileOp.getAfterArguments().end());
+    values.append(whileOp->getResults().begin(), whileOp->getResults().end());
+    values.append(whileOp.getConditionOp().getArgs().begin(),
+                  whileOp.getConditionOp().getArgs().end());
+    values.append(whileOp.getYieldOp()->getOperands().begin(),
+                  whileOp.getYieldOp()->getOperands().end());
+  } else if (auto forOp = dyn_cast<scf::ForOp>(op)) {
+    values.append(forOp.getInitArgs().begin(), forOp.getInitArgs().end());
+    values.append(forOp.getRegionIterArgs().begin(),
+                  forOp.getRegionIterArgs().end());
+    values.append(forOp->getResults().begin(), forOp->getResults().end());
+    values.append(forOp.getYieldedValues().begin(),
+                  forOp.getYieldedValues().end());
+  } else {
+    return false;
+  }
+  return llvm::any_of(
+      values, [](Value value) { return isScalarPointerType(value.getType()); });
+}
+
+static void markOpaqueScalarPointerBoundary(Operation *op) {
+  if (hasScalarPointerBoundary(op))
+    op->setAttr(kScalarPointerCarrierBoundaryAttr,
+                UnitAttr::get(op->getContext()));
+}
+
+// `shouldPreserveScalarPointers` analyzes every value on the SCF boundary to
+// choose one representation.  When the choice is relative offsets, those
+// cached entries describe the old pointer-typed boundary and must be removed
+// before replaceArgs/replaceOperands rebuild the boundary.  Keeping even one
+// stale yield or result entry is enough to bypass the live backedge analysis.
+static void invalidateScalarPointerBoundaryAnalysis(
+    Operation *op, llvm::DenseMap<Value, PtrOffsetInfo> &offsetMap) {
+  auto eraseScalarPointers = [&](ValueRange values) {
+    for (Value value : values)
+      if (isScalarPointerType(value.getType()))
+        offsetMap.erase(value);
+  };
+
+  if (auto whileOp = dyn_cast<scf::WhileOp>(op)) {
+    eraseScalarPointers(whileOp.getInits());
+    eraseScalarPointers(whileOp.getBeforeArguments());
+    eraseScalarPointers(whileOp.getAfterArguments());
+    eraseScalarPointers(whileOp->getResults());
+    eraseScalarPointers(whileOp.getConditionOp().getArgs());
+    eraseScalarPointers(whileOp.getYieldOp()->getOperands());
+    return;
+  }
+  if (auto loopOp = dyn_cast<LoopLikeOpInterface>(op)) {
+    eraseScalarPointers(loopOp.getInits());
+    eraseScalarPointers(loopOp.getRegionIterArgs());
+    eraseScalarPointers(loopOp->getResults());
+    eraseScalarPointers(loopOp.getYieldedValues());
+    return;
+  }
+  if (auto ifOp = dyn_cast<scf::IfOp>(op)) {
+    eraseScalarPointers(ifOp->getResults());
+    eraseScalarPointers(ifOp.thenYield().getResults());
+    if (ifOp.elseBlock())
+      eraseScalarPointers(ifOp.elseYield().getResults());
+  }
+}
+
 } // namespace
 
 void replaceOperands(MutableArrayRef<OpOperand> oprs, RewriterBase &rewriter,
-                     llvm::DenseMap<Value, PtrOffsetInfo> &offsetMap) {
+                     llvm::DenseMap<Value, PtrOffsetInfo> &offsetMap,
+                     bool preserveScalarPointers) {
   for (auto it = oprs.begin(); it != oprs.end(); ++it) {
     auto &opr = *it;
     auto operand = opr.get();
@@ -92,6 +275,11 @@ void replaceOperands(MutableArrayRef<OpOperand> oprs, RewriterBase &rewriter,
         opr.set(info.getOffset());
     } else if (auto ptrType =
                    dyn_cast<triton::PointerType>(operand.getType())) {
+      // An unmarked scalar pointer has no complete structural carrier schema.
+      // Keep it as a pointer on every SCF edge instead of changing only this
+      // operand to a relative offset and invalidating the parent operation.
+      if (preserveScalarPointers && isScalarPointerType(operand.getType()))
+        continue;
       parse(operand, operand.getLoc(), rewriter, offsetMap);
       if (auto tensorType =
               dyn_cast<RankedTensorType>(ptrType.getPointeeType())) {
@@ -113,7 +301,8 @@ void replaceOperands(MutableArrayRef<OpOperand> oprs, RewriterBase &rewriter,
 }
 
 void replaceArgs(ValueRange args, RewriterBase &rewriter,
-                 llvm::DenseMap<Value, PtrOffsetInfo> &offsetMap) {
+                 llvm::DenseMap<Value, PtrOffsetInfo> &offsetMap,
+                 bool preserveScalarPointers) {
   for (auto it = args.begin(); it != args.end(); ++it) {
     auto arg = *it;
     if (auto tensorType = dyn_cast<RankedTensorType>(arg.getType());
@@ -145,6 +334,10 @@ void replaceArgs(ValueRange args, RewriterBase &rewriter,
       rewriter.replaceOpWithNewOp<triton::AddPtrOp>(
           tempVar.getDefiningOp(), tempVar.getType(), src, arg);
     } else if (auto ptrType = dyn_cast<triton::PointerType>(arg.getType())) {
+      // Region arguments and results must use the same representation as the
+      // corresponding init/condition/yield operands.
+      if (preserveScalarPointers && isScalarPointerType(arg.getType()))
+        continue;
       parse(arg, arg.getLoc(), rewriter, offsetMap);
       if (!isa<RankedTensorType>(ptrType.getPointeeType()) &&
           offsetMap.at(arg).getPtr() == arg)
@@ -177,6 +370,7 @@ void replaceArgs(ValueRange args, RewriterBase &rewriter,
             srcOp.getShape(), srcOp.getStrides(), newOffsets, srcOp.getOrder());
       } else {
         auto src = offsetMap.at(arg).getPtr();
+        offsetMap.erase(arg);
         arg.setType(rewriter.getIntegerType(64));
         rewriter.replaceOpWithNewOp<triton::AddPtrOp>(
             tempVar.getDefiningOp(), tempVar.getType(), src, arg);
@@ -191,21 +385,56 @@ void convertTensorPtrPre(Operation *op, RewriterBase &rewriter,
     auto &os = llvm::dbgs();
     os << "[convertTensorPtr]: Preorder start\n" << *op << "\n";
   });
+  bool preserveScalarPointers =
+      shouldPreserveScalarPointers(op, rewriter, offsetMap);
+  if (!preserveScalarPointers)
+    invalidateScalarPointerBoundaryAnalysis(op, offsetMap);
+  SmallVector<Value> scalarPointerOffsetArgs;
   if (auto whileOp = dyn_cast<scf::WhileOp>(op)) {
-    replaceArgs(whileOp.getBeforeArguments(), rewriter, offsetMap);
-    replaceOperands(whileOp.getInitsMutable(), rewriter, offsetMap);
-    replaceArgs(whileOp.getAfterArguments(), rewriter, offsetMap);
-    replaceArgs(whileOp->getResults(), rewriter, offsetMap);
+    if (!preserveScalarPointers)
+      llvm::copy_if(whileOp.getBeforeArguments(),
+                    std::back_inserter(scalarPointerOffsetArgs), [](Value arg) {
+                      return isScalarPointerType(arg.getType());
+                    });
+    replaceArgs(whileOp.getBeforeArguments(), rewriter, offsetMap,
+                preserveScalarPointers);
+    replaceOperands(whileOp.getInitsMutable(), rewriter, offsetMap,
+                    preserveScalarPointers);
+    replaceArgs(whileOp.getAfterArguments(), rewriter, offsetMap,
+                preserveScalarPointers);
+    replaceArgs(whileOp->getResults(), rewriter, offsetMap,
+                preserveScalarPointers);
     replaceOperands(whileOp.getConditionOp().getArgsMutable(), rewriter,
-                    offsetMap);
+                    offsetMap, preserveScalarPointers);
   } else if (auto loopOp = dyn_cast<LoopLikeOpInterface>(op)) {
-    replaceArgs(loopOp.getRegionIterArgs(), rewriter, offsetMap);
-    replaceOperands(loopOp.getInitsMutable(), rewriter, offsetMap);
+    if (!preserveScalarPointers)
+      llvm::copy_if(loopOp.getRegionIterArgs(),
+                    std::back_inserter(scalarPointerOffsetArgs), [](Value arg) {
+                      return isScalarPointerType(arg.getType());
+                    });
+    replaceArgs(loopOp.getRegionIterArgs(), rewriter, offsetMap,
+                preserveScalarPointers);
+    replaceOperands(loopOp.getInitsMutable(), rewriter, offsetMap,
+                    preserveScalarPointers);
   } else if (auto ifOp = dyn_cast<scf::IfOp>(op)) {
-    replaceArgs(ifOp->getResults(), rewriter, offsetMap);
-    replaceOperands(ifOp.thenYield().getResultsMutable(), rewriter, offsetMap);
-    replaceOperands(ifOp.elseYield().getResultsMutable(), rewriter, offsetMap);
+    if (preserveScalarPointers && hasScalarPointerResult(ifOp))
+      ifOp->setAttr(kScalarPointerCarrierBoundaryAttr,
+                    UnitAttr::get(ifOp.getContext()));
+    replaceArgs(ifOp->getResults(), rewriter, offsetMap,
+                preserveScalarPointers);
+    replaceOperands(ifOp.thenYield().getResultsMutable(), rewriter, offsetMap,
+                    preserveScalarPointers);
+    replaceOperands(ifOp.elseYield().getResultsMutable(), rewriter, offsetMap,
+                    preserveScalarPointers);
   }
+  // Publish the offset-carrier schema only after every structural edge has
+  // been rewritten. In particular, a While before argument and its paired
+  // after argument must both retain their original base provenance while they
+  // are converted. Publishing after the first region would make parsing the
+  // second region treat its still-pointer-typed argument as a base-less i64
+  // offset and attempt to rebuild tt.addptr from a null source.
+  for (Value arg : scalarPointerOffsetArgs)
+    markScalarPointerOffsetSlot(arg);
   LLVM_DEBUG({
     auto &os = llvm::dbgs();
     os << "[convertTensorPtr]: Preorder end\n" << *op << "\n";
@@ -218,11 +447,16 @@ void convertTensorPtrPost(Operation *op, RewriterBase &rewriter,
     auto &os = llvm::dbgs();
     os << "[convertTensorPtr]: Postorder start\n" << *op << "\n";
   });
+  bool preserveScalarPointers =
+      shouldPreserveScalarPointers(op, rewriter, offsetMap);
   if (auto whileOp = dyn_cast<scf::WhileOp>(op)) {
-    replaceOperands(whileOp.getYieldOp()->getOpOperands(), rewriter, offsetMap);
+    replaceOperands(whileOp.getYieldOp()->getOpOperands(), rewriter, offsetMap,
+                    preserveScalarPointers);
   } else if (auto loopOp = dyn_cast<LoopLikeOpInterface>(op)) {
-    replaceArgs(loopOp->getResults(), rewriter, offsetMap);
-    replaceOperands(*loopOp.getYieldedValuesMutable(), rewriter, offsetMap);
+    replaceArgs(loopOp->getResults(), rewriter, offsetMap,
+                preserveScalarPointers);
+    replaceOperands(*loopOp.getYieldedValuesMutable(), rewriter, offsetMap,
+                    preserveScalarPointers);
   }
   LLVM_DEBUG({
     auto &os = llvm::dbgs();
@@ -290,6 +524,15 @@ void replacePtrArguments(triton::FuncOp funcOp,
     // replacement immediately before the old op and erase the old op last.
     rewriter.setInsertionPoint(op);
     if (auto forOp = dyn_cast<scf::ForOp>(op)) {
+      // An opaque scalar-pointer boundary cannot be represented by the
+      // relative-offset protocol: one edge may come from an if/select and
+      // therefore has no single static base.  Convert every scalar pointer
+      // slot to a complete i64 address before constructing the replacement
+      // loop, so the loop signature is pointer-free and T2L never has to
+      // materialize a pointer from an unresolved SCF value.
+      if (shouldPreserveScalarPointers(forOp.getOperation(), rewriter,
+                                       offsetMap))
+        markOpaqueScalarPointerBoundary(forOp.getOperation());
       SmallVector<Value> newInitArgs = constructOperands(
           forOp.getInitArgs(), tempVar, mapping, rewriter, forOp);
       newOp = rewriter.create<scf::ForOp>(
@@ -318,12 +561,20 @@ void replacePtrArguments(triton::FuncOp funcOp,
                                                      forOp));
           });
     } else if (auto whileOp = dyn_cast<scf::WhileOp>(op)) {
+      // Keep ordinary While on the established relative-offset path.  Its
+      // before/after regions are analyzed again by convertTensorPtrPre after
+      // the clone, where the full boundary cache invalidation can observe the
+      // live backedge.  Complete i64 carriers are still selected for For and
+      // explicitly marked descriptor slots; applying the opaque fallback to
+      // every While here changes the two-region T2U contract before that
+      // reanalysis can run.
       SmallVector<Value> newInits = constructOperands(
           whileOp.getInits(), tempVar, mapping, rewriter, whileOp);
       newOp = rewriter.create<scf::WhileOp>(
           whileOp.getLoc(), constructTypes(whileOp->getResultTypes(), whileOp),
           newInits,
           [&](OpBuilder &b, Location loc, ValueRange args) {
+            IRMapping beforeMapping;
             auto newArgIter = args.begin();
             for (auto [slot, oldArg] :
                  llvm::enumerate(whileOp.getBeforeArguments())) {
@@ -331,21 +582,22 @@ void replacePtrArguments(triton::FuncOp funcOp,
               if (useCompleteScalarAddress(whileOp, slot, oldArg.getType()))
                 mappedArg =
                     rebuildScalarPointer(mappedArg, oldArg.getType(), b, loc);
-              mapping.map(oldArg, mappedArg);
+              beforeMapping.map(oldArg, mappedArg);
               std::advance(newArgIter,
                            std::max(getPtrTensorRank(oldArg.getType()), 1));
             }
             for (auto &bodyOp : whileOp.getBeforeBody()->without_terminator()) {
-              b.clone(bodyOp, mapping);
+              b.clone(bodyOp, beforeMapping);
             }
             auto conditionOp = whileOp.getConditionOp();
             b.create<scf::ConditionOp>(
                 conditionOp.getLoc(),
-                mapping.lookup(conditionOp.getCondition()),
-                constructOperands(conditionOp.getArgs(), tempVar, mapping, b,
-                                  whileOp));
+                beforeMapping.lookup(conditionOp.getCondition()),
+                constructOperands(conditionOp.getArgs(), tempVar, beforeMapping,
+                                  b, whileOp));
           },
           [&](OpBuilder &b, Location loc, ValueRange args) {
+            IRMapping afterMapping;
             auto newArgIter = args.begin();
             for (auto [slot, oldArg] :
                  llvm::enumerate(whileOp.getAfterArguments())) {
@@ -353,17 +605,17 @@ void replacePtrArguments(triton::FuncOp funcOp,
               if (useCompleteScalarAddress(whileOp, slot, oldArg.getType()))
                 mappedArg =
                     rebuildScalarPointer(mappedArg, oldArg.getType(), b, loc);
-              mapping.map(oldArg, mappedArg);
+              afterMapping.map(oldArg, mappedArg);
               std::advance(newArgIter,
                            std::max(getPtrTensorRank(oldArg.getType()), 1));
             }
             for (auto &bodyOp : whileOp.getAfterBody()->without_terminator()) {
-              b.clone(bodyOp, mapping);
+              b.clone(bodyOp, afterMapping);
             }
             auto yieldOp = whileOp.getYieldOp();
             b.create<scf::YieldOp>(yieldOp.getLoc(),
                                    constructOperands(yieldOp.getOperands(),
-                                                     tempVar, mapping, b,
+                                                     tempVar, afterMapping, b,
                                                      whileOp));
           });
     } else if (auto ifOp = dyn_cast<scf::IfOp>(op);

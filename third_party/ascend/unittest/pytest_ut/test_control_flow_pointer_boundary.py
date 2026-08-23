@@ -140,6 +140,20 @@ def scalar_base_tensor_ptr_loop_kernel(x, out, steps_ptr, n: tl.constexpr, BLOCK
 
 
 @triton.jit
+def dense_splat_tensor_ptr_loop_kernel(x, out, steps_ptr, n: tl.constexpr, BLOCK: tl.constexpr):
+    steps = tl.load(steps_ptr)
+    lane = tl.arange(0, BLOCK)
+    # Keep the loop delta tensor-valued so TTIR materializes a dense splat.
+    delta = tl.full((BLOCK, ), BLOCK, tl.int32)
+    pointers = x + lane
+    for _ in tl.range(0, steps):
+        pointers = pointers + delta
+    index = lane + BLOCK * steps
+    value = tl.load(pointers, mask=index < n, other=0.0)
+    tl.store(out + lane, value)
+
+
+@triton.jit
 def opaque_tensor_ptr_loop_kernel(a, b, out, steps_ptr, n: tl.constexpr, BLOCK: tl.constexpr):
     steps = tl.load(steps_ptr)
     lane = tl.arange(0, BLOCK)
@@ -262,6 +276,16 @@ def test_scalar_base_tensor_pointer_loop(steps):
     scalar_base_tensor_ptr_loop_kernel[(1, )](a, out, _device_i32(steps), n=N, BLOCK=BLOCK)
 
     _assert_output(out, _slice(a_cpu, 0, N, 1, 3 + 2 * steps))
+
+
+@pytest.mark.parametrize("steps", [0, 1, 3])
+def test_dense_splat_tensor_pointer_loop(steps):
+    a_cpu, _, a, _ = _inputs()
+    out = torch.empty(BLOCK, dtype=torch.float32, device="npu")
+
+    dense_splat_tensor_ptr_loop_kernel[(1, )](a, out, _device_i32(steps), n=N, BLOCK=BLOCK)
+
+    _assert_output(out, _slice(a_cpu, 0, N, 1, BLOCK * steps))
 
 
 @pytest.mark.parametrize("steps", [0, 2, 4])

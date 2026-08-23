@@ -320,6 +320,9 @@ IfConverter::matchAndRewrite(scf::IfOp op, OpAdaptor adaptor,
     return rewriter.notifyMatchFailure(op, "requires a type converter");
   if (!hasScalarPointerResult(op))
     return failure();
+  if (!op->hasAttr(kScalarPointerCarrierBoundaryAttr))
+    return rewriter.notifyMatchFailure(
+        op, "scalar-pointer if is missing its carrier boundary marker");
 
   SmallVector<Type> convertedResultTypes;
   convertedResultTypes.reserve(op.getNumResults());

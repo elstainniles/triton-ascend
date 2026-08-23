@@ -26,6 +26,7 @@
 #include "bishengir/Dialect/Scope/IR/Scope.h"
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/Builders.h"
+#include "mlir/IR/Diagnostics.h"
 #include "mlir/IR/IRMapping.h"
 #include "mlir/IR/PatternMatch.h"
 #include "mlir/Interfaces/SideEffectInterfaces.h"
@@ -1356,10 +1357,9 @@ tryDecoupleControlFlowOp(Operation *op, IRRewriter &rewriter,
 
 namespace mlir::triton::controlflow {
 
-LogicalResult
-applyControlFlowRewritePlan(ModuleOp module,
-                            const ControlFlowRewritePolicy &policy,
-                            const ControlFlowRewritePlan &plan) {
+LogicalResult applyControlFlowRewritePlan(
+    ModuleOp module, const ControlFlowRewritePolicy &policy,
+    const ControlFlowRewritePlan &plan, bool emitDiagnostics) {
   IRRewriter rewriter(module.getContext());
   // Analysis and application are consecutive and no IR mutation occurs in
   // between, so rediscover the roots from the module instead of duplicating
@@ -1367,13 +1367,15 @@ applyControlFlowRewritePlan(ModuleOp module,
   for (Operation *root : collectOutermostControlFlowOps(module)) {
     const ControlFlowOpAnalysis *rootAnalysis = plan.lookup(root);
     if (!rootAnalysis) {
-      root->emitError("missing frozen control-flow rewrite decision");
+      if (emitDiagnostics)
+        root->emitError("missing frozen control-flow rewrite decision");
       return failure();
     }
     if (!rootAnalysis->needsRewrite())
       continue;
     if (failed(tryDecoupleControlFlowOp(root, rewriter, policy, plan))) {
-      root->emitError("failed to apply analyzed pointer decomposition");
+      if (emitDiagnostics)
+        root->emitError("failed to apply analyzed pointer decomposition");
       return failure();
     }
   }
@@ -1381,7 +1383,32 @@ applyControlFlowRewritePlan(ModuleOp module,
 }
 
 LogicalResult rewriteControlFlow(ModuleOp module,
-                                 const ControlFlowRewritePolicy &policy) {
+                                 const ControlFlowRewritePolicy &policy,
+                                 bool allowUnsupportedFallback) {
+  // Tensor-pointer decomposition is an optimization, not the only legal
+  // representation of a TensorPtr. Probe the complete rewrite on a detached
+  // clone before mutating the real module. If analysis or application rejects
+  // any root, discard the clone and keep the original TensorPtr graph intact;
+  // this prevents a partially materialized descriptor from reaching T2L.
+  if (allowUnsupportedFallback) {
+    Operation *probeOperation = module->clone();
+    auto probeModule = cast<ModuleOp>(probeOperation);
+    bool probeSucceeded = false;
+    {
+      ScopedDiagnosticHandler suppressDiagnostics(
+          module.getContext(), [](Diagnostic &) { return success(); });
+      FailureOr<ControlFlowRewritePlan> probePlan =
+          analyzeControlFlow(probeModule, policy);
+      probeSucceeded =
+          succeeded(probePlan) &&
+          succeeded(applyControlFlowRewritePlan(probeModule, policy, *probePlan,
+                                                /*emitDiagnostics=*/false));
+    }
+    probeModule->erase();
+    if (!probeSucceeded)
+      return success();
+  }
+
   FailureOr<ControlFlowRewritePlan> plan = analyzeControlFlow(module, policy);
   if (failed(plan))
     return failure();

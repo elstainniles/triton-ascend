@@ -1,4 +1,4 @@
-// RUN: not triton-opt --triton-control-flow-opt %s -verify-each 2>&1 | FileCheck %s --check-prefix=ERR
+// RUN: triton-opt --triton-control-flow-opt %s -verify-each | FileCheck %s --check-prefix=FALLBACK
 
 module {
   tt.func public @scope_internal_opaque_tensor_pointer(%lhs_base: !tt.ptr<f32>, %rhs_base: !tt.ptr<f32>, %cond: i1) -> tensor<4x!tt.ptr<f32>> {
@@ -13,7 +13,8 @@ module {
   }
 }
 
-// ERR: failed to analyze pointer components across control flow
-// ERR-NOT: Assertion
-// ERR-NOT: LLVM ERROR
-// ERR-NOT: Segmentation fault
+// FALLBACK-LABEL: tt.func public @scope_internal_opaque_tensor_pointer
+// FALLBACK:       scope.scope
+// FALLBACK-SAME:  tensor<4x!tt.ptr<f32>>
+// FALLBACK:       arith.select
+// FALLBACK:       tt.return

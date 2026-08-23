@@ -157,17 +157,21 @@ public:
 /// Signature expansion, region cloning, terminator rewriting, nested recursion
 /// and result replacement are driven solely by operation-level decisions in
 /// `plan`.
-LogicalResult
-applyControlFlowRewritePlan(ModuleOp module,
-                            const ControlFlowRewritePolicy &policy,
-                            const ControlFlowRewritePlan &plan);
+/// Set `emitDiagnostics` to false for a speculative rewrite on a detached
+/// clone whose failure is intentionally treated as an unsupported case.
+LogicalResult applyControlFlowRewritePlan(
+    ModuleOp module, const ControlFlowRewritePolicy &policy,
+    const ControlFlowRewritePlan &plan, bool emitDiagnostics = true);
 
 /// Analyzes the complete decomposition stage before mutating the IR, then
 /// applies the frozen plan from outermost to innermost. Pointer semantics
 /// remain selected by `policy` so different decompositions share the same SCF
 /// plumbing.
+/// When `allowUnsupportedFallback` is true, a failed complete rewrite is
+/// treated as an unsupported optimization and leaves the input module intact.
 LogicalResult rewriteControlFlow(ModuleOp module,
-                                 const ControlFlowRewritePolicy &policy);
+                                 const ControlFlowRewritePolicy &policy,
+                                 bool allowUnsupportedFallback = false);
 
 } // namespace mlir::triton::controlflow
 

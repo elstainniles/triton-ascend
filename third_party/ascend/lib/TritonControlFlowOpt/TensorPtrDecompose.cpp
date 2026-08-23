@@ -282,6 +282,29 @@ static FailureOr<RankedTensorType> getRank1IntegerTensorType(Value value,
   return tensorType;
 }
 
+struct DenseIntegerSplat {
+  APInt value;
+};
+
+/// Returns the exact scalar bit pattern represented by an integer dense splat.
+/// Lane-varying dense constants deliberately fail this check and remain opaque.
+static FailureOr<DenseIntegerSplat> getDenseIntegerSplat(Value value) {
+  auto tensorType = dyn_cast<RankedTensorType>(value.getType());
+  auto constant = value.getDefiningOp<arith::ConstantOp>();
+  if (!tensorType || tensorType.getRank() == 0 ||
+      !tensorType.hasStaticShape() ||
+      !isa<IntegerType>(tensorType.getElementType()) || !constant)
+    return failure();
+  auto dense = dyn_cast<DenseIntElementsAttr>(constant.getValue());
+  if (!dense || !dense.isSplat() || dense.getType() != tensorType)
+    return failure();
+  APInt splatValue = dense.getSplatValue<APInt>();
+  if (splatValue.getBitWidth() !=
+      cast<IntegerType>(tensorType.getElementType()).getWidth())
+    return failure();
+  return DenseIntegerSplat{std::move(splatValue)};
+}
+
 static Rank1AnalyzedOffset getFallbackAnalyzedOffset(Value value, Type) {
   auto tensorType = cast<RankedTensorType>(value.getType());
   Type scalarType = tensorType.getElementType();
@@ -301,7 +324,8 @@ static FailureOr<Value> getSplatScalar(Value value) {
 static bool isSafeIntegerExtensionLeaf(Value value) {
   if (value.getDefiningOp<triton::MakeRangeOp>())
     return true;
-  return succeeded(getSplatScalar(value));
+  return succeeded(getSplatScalar(value)) ||
+         succeeded(getDenseIntegerSplat(value));
 }
 
 static FailureOr<Rank1AnalyzedOffset> analyzeRank1Offset(Value value,
@@ -333,6 +357,18 @@ static FailureOr<Rank1AnalyzedOffset> analyzeRank1Offset(Value value,
         getScalarConstant(splat.getSrc()) == std::optional<int64_t>(0)
             ? ComponentIdentity::zero(kOffsetComponent)
             : ComponentIdentity::fromValue(splat.getSrc(), kOffsetComponent);
+    return Rank1AnalyzedOffset{
+        {scalarType, ComponentIdentity::zero(kStrideComponent)},
+        {scalarType, offsetIdentity},
+        {*tensorType, ComponentIdentity::zero(kResidualComponent)}};
+  }
+
+  if (FailureOr<DenseIntegerSplat> dense = getDenseIntegerSplat(value);
+      succeeded(dense)) {
+    ComponentIdentity offsetIdentity =
+        dense->value.isZero()
+            ? ComponentIdentity::zero(kOffsetComponent)
+            : ComponentIdentity::fromValue(value, kOffsetComponent);
     return Rank1AnalyzedOffset{
         {scalarType, ComponentIdentity::zero(kStrideComponent)},
         {scalarType, offsetIdentity},
@@ -452,6 +488,15 @@ static Value createScalarConstant(OpBuilder &builder, Location loc, Type type,
     return nullptr;
   return builder.create<arith::ConstantOp>(
       loc, builder.getIntegerAttr(intType, value));
+}
+
+static Value createScalarConstant(OpBuilder &builder, Location loc, Type type,
+                                  const APInt &value) {
+  auto intType = dyn_cast<IntegerType>(type);
+  if (!intType || intType.getWidth() != value.getBitWidth())
+    return nullptr;
+  return builder.create<arith::ConstantOp>(loc,
+                                           IntegerAttr::get(intType, value));
 }
 
 static Value createZeroOffsets(OpBuilder &builder, Location loc,
@@ -582,6 +627,16 @@ static FailureOr<Rank1OffsetValues> materializeRank1Offset(Value value,
     if (failed(offset) || !stride || !residual)
       return failure();
     return Rank1OffsetValues{stride, *offset, residual};
+  }
+
+  if (FailureOr<DenseIntegerSplat> dense = getDenseIntegerSplat(value);
+      succeeded(dense)) {
+    Value stride = createScalarConstant(builder, loc, scalarType, 0);
+    Value offset = createScalarConstant(builder, loc, scalarType, dense->value);
+    Value residual = createZeroOffsets(builder, loc, *tensorType);
+    if (!stride || !offset || !residual)
+      return failure();
+    return Rank1OffsetValues{stride, offset, residual};
   }
 
   if (auto extension = value.getDefiningOp<arith::ExtSIOp>()) {
@@ -822,6 +877,15 @@ static FailureOr<AnalyzedTensorOffset> analyzeTensorOffset(Value value) {
     if (getScalarConstant(splat.getSrc()) != std::optional<int64_t>(0))
       result.uniformOffset.identity = ComponentIdentity::fromValue(
           splat.getSrc(), getUniformOffsetComponent(rank));
+    return result;
+  }
+
+  if (FailureOr<DenseIntegerSplat> dense = getDenseIntegerSplat(value);
+      succeeded(dense)) {
+    AnalyzedTensorOffset result = makeStructuredZero();
+    if (!dense->value.isZero())
+      result.uniformOffset.identity =
+          ComponentIdentity::fromValue(value, getUniformOffsetComponent(rank));
     return result;
   }
 
@@ -1084,6 +1148,21 @@ materializeTensorOffsetFields(Value value, OpBuilder &builder, Location loc) {
     if (failed(uniform))
       return failure();
     result->uniformOffset = *uniform;
+    return result;
+  }
+
+  if (FailureOr<DenseIntegerSplat> dense = getDenseIntegerSplat(value);
+      succeeded(dense)) {
+    OpBuilder::InsertionGuard insertionGuard(builder);
+    builder.setInsertionPointAfter(value.getDefiningOp());
+    FailureOr<TensorOffsetValues> result = makeZero(AxisKind::Structured);
+    if (failed(result))
+      return failure();
+    Value uniform =
+        createScalarConstant(builder, loc, scalarType, dense->value);
+    if (!uniform)
+      return failure();
+    result->uniformOffset = uniform;
     return result;
   }
 
@@ -1949,7 +2028,7 @@ namespace mlir::triton::controlflow {
 
 LogicalResult runTensorPtrDecompose(ModuleOp module) {
   TensorPtrDecomposePolicy policy;
-  return rewriteControlFlow(module, policy);
+  return rewriteControlFlow(module, policy, /*allowUnsupportedFallback=*/true);
 }
 
 } // namespace mlir::triton::controlflow

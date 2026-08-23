@@ -127,8 +127,8 @@ public:
   void removeSource();
 
   int64_t getRank() const;
-  MemRefType getResultMemrefType(int64_t offset,
-                                 ArrayRef<int64_t> resultShape) const;
+  FailureOr<MemRefType>
+  getResultMemrefType(int64_t offset, ArrayRef<int64_t> resultShape) const;
 
   void addBlock(BlockData &lBlock, BlockData &rBlock, Location loc,
                 ConversionPatternRewriter &rewriter);
@@ -139,9 +139,9 @@ public:
   void divBlock(BlockData &lBlock, BlockData &rBlock, Location loc,
                 ConversionPatternRewriter &rewriter);
 
-  memref::ReinterpretCastOp createCastOp(ArrayRef<int64_t> resultShape,
-                                         const Location &loc,
-                                         OpBuilder &builder) const;
+  FailureOr<memref::ReinterpretCastOp>
+  createCastOp(ArrayRef<int64_t> resultShape, const Location &loc,
+               OpBuilder &builder) const;
 
   void setResElemTy(const Type &);
   void setSource(const Value &);
@@ -359,10 +359,9 @@ public:
   rewriteLoopOp(LoopLikeOpInterface op, ConversionPatternRewriter &rewriter,
                 llvm::SmallDenseMap<Value, BlockData> &known);
 
-  static void rewriteAddPtrToUnstrucMemAcc(triton::AddPtrOp op,
-                                           triton::AddPtrOp::Adaptor &adaptor,
-                                           ConversionPatternRewriter &rewriter,
-                                           BlockData &data);
+  static LogicalResult rewriteAddPtrToUnstrucMemAcc(
+      triton::AddPtrOp op, triton::AddPtrOp::Adaptor &adaptor,
+      ConversionPatternRewriter &rewriter, BlockData &data);
 };
 
 template <typename OpTy>

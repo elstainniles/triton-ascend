@@ -1215,6 +1215,11 @@ void TritonToUnstructurePass::runOnOperation() {
     signalPassFailure();
   }
 
+  // The offset-boundary marker is only an intra-pass analysis handoff.  Do
+  // not expose it to T2L or let it inhibit later canonicalization.
+  moduleOp->walk(
+      [](Operation *op) { op->removeAttr(kScalarPointerOffsetBoundaryAttr); });
+
   PassManager pm(&getContext(), moduleOp.getOperationName());
   pm.addPass(createCSEPass());
   pm.addPass(createCanonicalizerPass());

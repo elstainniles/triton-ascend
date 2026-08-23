@@ -96,6 +96,28 @@ static bool isScalarPointerCarrierSource(Value source) {
   return pointerCast && pointerCast->hasAttr(kScalarPointerCarrierAttr);
 }
 
+// Dialect conversion may temporarily materialize a scalar Triton pointer from
+// a memref carrier so that an operation which has not been rewritten yet can
+// keep its original type.  Scalar pointer transport must consume the carrier
+// directly; otherwise the conversion driver is forced to leave a live
+// memref-to-!tt.ptr cast next to tt.load/tt.store.  Only peel the narrow,
+// one-to-one UCC form whose input is already a BaseMemRefType.  Unknown casts,
+// multi-value casts, and non-memref inputs remain unsupported and therefore
+// continue through the existing diagnostics.
+static Value unwrapScalarPointerMemRefCarrier(Value value) {
+  while (auto castOp = value.getDefiningOp<UnrealizedConversionCastOp>()) {
+    if (castOp.getInputs().size() != 1 || castOp.getOutputs().size() != 1)
+      break;
+    Value input = castOp.getInputs().front();
+    Value output = castOp.getOutputs().front();
+    if (!isa<BaseMemRefType>(input.getType()) ||
+        !isa<triton::PointerType, BaseMemRefType>(output.getType()))
+      break;
+    value = input;
+  }
+  return value;
+}
+
 // MemAccType selectMaxMemAccTy(const MemAccType &v1, const MemAccType &v2) {
 //   return (v1 > v2) ? v1 : v2;
 // }
@@ -191,15 +213,18 @@ OpFoldResult BlockData::inferBlockOffset(const Location &loc,
   return retOffset;
 }
 
-MemRefType BlockData::getResultMemrefType(int64_t offset,
-                                          ArrayRef<int64_t> resultShape) const {
+FailureOr<MemRefType>
+BlockData::getResultMemrefType(int64_t offset,
+                               ArrayRef<int64_t> resultShape) const {
   SmallVector<int64_t> staticStrides;
   SmallVector<Value> dynamicStrides;
   dispatchIndexOpFoldResults(strides, dynamicStrides, staticStrides);
 
+  if (!this->source)
+    return failure();
   auto baseMemrefType = dyn_cast<BaseMemRefType>(this->source.getType());
-  assert(baseMemrefType &&
-         "Invalid element type. It should be a base memref type.");
+  if (!baseMemrefType)
+    return failure();
   auto elementType = baseMemrefType.getElementType();
   auto layout =
       StridedLayoutAttr::get(this->source.getContext(), offset, staticStrides);
@@ -370,14 +395,21 @@ void BlockData::divBlock(BlockData &lBlock, BlockData &rBlock, Location loc,
   // rBlock.getMemAccType()));
 }
 
-memref::ReinterpretCastOp BlockData::createCastOp(ArrayRef<int64_t> resultShape,
-                                                  const Location &loc,
-                                                  OpBuilder &builder) const {
+FailureOr<memref::ReinterpretCastOp>
+BlockData::createCastOp(ArrayRef<int64_t> resultShape, const Location &loc,
+                        OpBuilder &builder) const {
   OpFoldResult resOffset = this->inferBlockOffset(loc, builder);
-  auto resultType = this->getResultMemrefType(
-      isa<Attribute>(resOffset) ? getConstantIntValue(resOffset).value()
-                                : ShapedType::kDynamic,
-      resultShape);
+  int64_t staticOffset = ShapedType::kDynamic;
+  if (isa<Attribute>(resOffset)) {
+    auto constantOffset = getConstantIntValue(resOffset);
+    if (!constantOffset)
+      return failure();
+    staticOffset = *constantOffset;
+  }
+  FailureOr<MemRefType> resultType =
+      this->getResultMemrefType(staticOffset, resultShape);
+  if (failed(resultType))
+    return failure();
 
   SmallVector<OpFoldResult> strides(this->strides);
   for (size_t i = 0; i < strides.size(); i++) {
@@ -392,7 +424,7 @@ memref::ReinterpretCastOp BlockData::createCastOp(ArrayRef<int64_t> resultShape,
   }
 
   return builder.create<memref::ReinterpretCastOp>(
-      loc, resultType, this->source, resOffset, this->sizes, strides);
+      loc, *resultType, this->source, resOffset, this->sizes, strides);
 }
 
 void BlockData::dump() const {
@@ -428,10 +460,59 @@ BlockDataParser::getScalarMemRef(Value ptr, Value memref, const Location &loc,
   if (!pointerType || isa<ShapedType>(pointerType.getPointeeType()))
     return failure();
 
+  memref = unwrapScalarPointerMemRefCarrier(memref);
+
+  // A complete scalar address reconstructed after an SCF boundary is exposed
+  // as tt.int_to_ptr in the Triton IR.  Its converted operand is already the
+  // canonical ScalarPointerCarrier memref; handle it before the legacy
+  // block-argument path so a direct load/store does not request a reverse
+  // memref-to-pointer materialization.
+  if (ptr.getDefiningOp<triton::IntToPtrOp>()) {
+    if (!isa<BaseMemRefType>(memref.getType()))
+      return failure();
+    if (auto memrefType = dyn_cast<MemRefType>(memref.getType());
+        memrefType && memrefType.getRank() == 1)
+      return memref;
+    BlockData data;
+    data.setSource(memref);
+    data.getOffsetsRef().push_back(rewriter.getIndexAttr(0));
+    data.getSizesRef().push_back(rewriter.getIndexAttr(1));
+    data.getStridesRef().push_back(rewriter.getIndexAttr(1));
+    auto castOp = data.createCastOp(SmallVector<int64_t>(1, 1), loc, rewriter);
+    if (failed(castOp))
+      return failure();
+    return (*castOp).getResult();
+  }
+
   if (ptr.getDefiningOp<triton::AddPtrOp>()) {
     if (auto castOp = memref.getDefiningOp<memref::ReinterpretCastOp>())
       return castOp.getResult();
+    if (auto pointerCast = memref.getDefiningOp<hivm::PointerCastOp>();
+        pointerCast && pointerCast->hasAttr(kScalarPointerCarrierAttr))
+      return memref;
     return failure();
+  }
+
+  // A scalar pointer produced by structured control flow or select is already
+  // represented by a converted memref. Give it the same one-element view used
+  // for a scalar block argument so direct tt.load/tt.store users can consume
+  // the transport result without attempting memref-to-pointer materialization.
+  if (auto definingOp = ptr.getDefiningOp();
+      definingOp && isScalarPointerTransport(definingOp)) {
+    if (!isa<BaseMemRefType>(memref.getType()))
+      return failure();
+    if (auto memrefType = dyn_cast<MemRefType>(memref.getType());
+        memrefType && memrefType.getRank() == 1)
+      return memref;
+    BlockData data;
+    data.setSource(memref);
+    data.getOffsetsRef().push_back(rewriter.getIndexAttr(0));
+    data.getSizesRef().push_back(rewriter.getIndexAttr(1));
+    data.getStridesRef().push_back(rewriter.getIndexAttr(1));
+    auto castOp = data.createCastOp(SmallVector<int64_t>(1, 1), loc, rewriter);
+    if (failed(castOp))
+      return failure();
+    return (*castOp).getResult();
   }
 
   if (!isa<BlockArgument>(ptr) || !isa<BaseMemRefType>(memref.getType()))
@@ -443,7 +524,9 @@ BlockDataParser::getScalarMemRef(Value ptr, Value memref, const Location &loc,
   data.getSizesRef().push_back(rewriter.getIndexAttr(1));
   data.getStridesRef().push_back(rewriter.getIndexAttr(1));
   auto castOp = data.createCastOp(SmallVector<int64_t>(1, 1), loc, rewriter);
-  return castOp.getResult();
+  if (failed(castOp))
+    return failure();
+  return (*castOp).getResult();
 }
 
 LogicalResult
@@ -471,6 +554,10 @@ BlockDataParser::parse(Value operand, BlockData &data, const Location &loc,
                      << operand;
       return failure();
     }
+    // A not-yet-rewritten pointer user may be represented by a one-to-one
+    // UCC from a converted memref.  Consume that memref as the transport
+    // source instead of asking the driver to materialize the pointer back.
+    remappedPtr = unwrapScalarPointerMemRefCarrier(remappedPtr);
     if (auto op = operand.getDefiningOp()) {
       if (auto addPtrOp = dyn_cast<triton::AddPtrOp>(op)) {
         return parseAddPtr(addPtrOp, data, loc, rewriter, known);
@@ -484,7 +571,19 @@ BlockDataParser::parse(Value operand, BlockData &data, const Location &loc,
         // ptr_1 = tl.advance(ptr_0)
         return parseTensorPtr(advanceOp, data, loc, rewriter, known);
       } else if (auto intToPtrOp = dyn_cast<triton::IntToPtrOp>(op)) {
+        if (!isa<BaseMemRefType>(remappedPtr.getType())) {
+          return op->emitError(
+              "int_to_ptr did not convert to a memref carrier");
+        }
         data.setSource(remappedPtr);
+        // An address reconstructed from an i64 is a complete scalar pointer,
+        // but AddPtr still needs the ordinary one-element BlockData schema to
+        // form a memref.reinterpret_cast for a later load/store.  Without
+        // this identity view the generic path sees an empty rank and may
+        // attempt to materialize a pointer from a non-memref source.
+        data.getOffsetsRef().push_back(rewriter.getIndexAttr(0));
+        data.getSizesRef().push_back(rewriter.getIndexAttr(1));
+        data.getStridesRef().push_back(rewriter.getIndexAttr(1));
       } else if (isDistributedTypeCustomOp(op)) {
         data.setSource(remappedPtr);
       } else if (isScalarPointerTransport(op)) {
@@ -493,6 +592,13 @@ BlockDataParser::parse(Value operand, BlockData &data, const Location &loc,
               "scalar pointer transport did not convert to a memref");
         }
         data.setSource(remappedPtr);
+        // Transport producers carry a complete scalar address but do not
+        // expose BlockData dimensions. Model the address as a one-element
+        // identity view so a following addptr can add a scalar offset without
+        // falling into the rank-mismatch/materialization failure path.
+        data.getOffsetsRef().push_back(rewriter.getIndexAttr(0));
+        data.getSizesRef().push_back(rewriter.getIndexAttr(1));
+        data.getStridesRef().push_back(rewriter.getIndexAttr(1));
       } else {
         return op->emitError()
                << "unsupported scalar pointer producer '" << op->getName()
@@ -893,6 +999,25 @@ LogicalResult BlockDataParser::parseSplat(
   if (failed(parse(src, data, loc, rewriter, known)))
     return failure();
 
+  // A ScalarPointerCarrier stores the complete integer address passed to
+  // tt.int_to_ptr, so an addptr displacement exists only in BlockData and must
+  // survive the following splat. Ordinary scalar pointers already carry their
+  // displacement in the converted memref descriptor; retain the established
+  // behavior of resetting those offsets while constructing the tensor layout.
+  OpFoldResult splatOffset;
+  if (isa<triton::PointerType>(src.getType()) &&
+      isScalarPointerCarrierSource(data.getSource())) {
+    SmallVector<OpFoldResult> pointerOffsets = data.getOffsets();
+    if (pointerOffsets.size() > 1)
+      return op.emitOpError(
+          "scalar pointer carrier splat requires at most one BlockData offset");
+    splatOffset = pointerOffsets.empty()
+                      ? OpFoldResult(rewriter.getIndexAttr(0))
+                      : pointerOffsets.front();
+  } else if (data.isScalar()) {
+    splatOffset = data.getScalarRef();
+  }
+
   if (isa<IntegerType>(src.getType()) ||
       isa<triton::PointerType>(src.getType())) {
     if (!data.isEmpty()) {
@@ -908,9 +1033,8 @@ LogicalResult BlockDataParser::parseSplat(
   } else {
     return op.emitOpError("BlockDataParser does not support this splat source");
   }
-  if (data.isScalar()) {
-    data.getOffsetsRef()[0] = data.getScalarRef();
-  }
+  if (!splatOffset.isNull())
+    data.getOffsetsRef()[0] = splatOffset;
   return success();
 }
 
@@ -1416,7 +1540,8 @@ BlockDataParser::rewriteAddPtr(triton::AddPtrOp op,
   if (data.getMemAccTypeRef().isUnstructured() &&
       !isScalarPointerCarrierSource(data.getSource())) {
     // TODO: Based on more info, try to create a performant IR
-    rewriteAddPtrToUnstrucMemAcc(op, adaptor, rewriter, data);
+    if (failed(rewriteAddPtrToUnstrucMemAcc(op, adaptor, rewriter, data)))
+      return failure();
     LLVM_DEBUG({ llvm::dbgs() << *getModuleOpFromOperation(op) << "\n"; });
     return success();
   }
@@ -1496,13 +1621,16 @@ BlockDataParser::rewriteAddPtr(triton::AddPtrOp op,
 
   // ToDo: need to handle module scenario
 
-  memref::ReinterpretCastOp castOp =
+  FailureOr<memref::ReinterpretCastOp> castOp =
       data.createCastOp(resultShape, op.getLoc(), rewriter);
-  Value src = castOp.getResult();
+  if (failed(castOp))
+    return op.emitOpError(
+        "could not materialize a memref from the source type");
+  Value src = (*castOp).getResult();
   LLVM_DEBUG({
     llvm::dbgs() << "cast MemRefType:\n";
-    castOp.getOperation()->print(llvm::dbgs(),
-                                 OpPrintingFlags().printGenericOpForm());
+    (*castOp).getOperation()->print(llvm::dbgs(),
+                                    OpPrintingFlags().printGenericOpForm());
     llvm::dbgs() << "\n";
   });
 
@@ -1603,7 +1731,11 @@ FailureOr<Value> BlockDataParser::materializePointer(
     }
   }
 
-  return data.createCastOp(resultShape, ptr.getLoc(), rewriter).getResult();
+  FailureOr<memref::ReinterpretCastOp> castOp =
+      data.createCastOp(resultShape, ptr.getLoc(), rewriter);
+  if (failed(castOp))
+    return failure();
+  return (*castOp).getResult();
 }
 
 static FailureOr<OpFoldResult>
@@ -1668,13 +1800,21 @@ LogicalResult BlockDataParser::rewriteCustomOp(
       if (failed(parse(in, blockData, loc, rewriter, known)))
         return failure();
       convertIntToPtr(blockData);
-      curInput = blockData.createCastOp({ShapedType::kDynamic}, loc, rewriter);
+      FailureOr<memref::ReinterpretCastOp> castOp =
+          blockData.createCastOp({ShapedType::kDynamic}, loc, rewriter);
+      if (failed(castOp))
+        return failure();
+      curInput = (*castOp).getResult();
     } else if (auto tensor = llvm::dyn_cast<RankedTensorType>(in.getType())) {
       if (llvm::isa<triton::PointerType>(tensor.getElementType())) {
         if (failed(parse(in, blockData, loc, rewriter, known)))
           return failure();
         convertIntToPtr(blockData);
-        curInput = blockData.createCastOp(tensor.getShape(), loc, rewriter);
+        FailureOr<memref::ReinterpretCastOp> castOp =
+            blockData.createCastOp(tensor.getShape(), loc, rewriter);
+        if (failed(castOp))
+          return failure();
+        curInput = (*castOp).getResult();
       }
     }
     newInputs.emplace_back(curInput);
@@ -1716,10 +1856,9 @@ LogicalResult BlockDataParser::rewriteCustomOp(
 }
 
 // Design for load/store boundary_check.
-memref::ReinterpretCastOp createRedundantOp(triton::MakeTensorPtrOp op,
-                                            OpFoldResult sourceBaseOffset,
-                                            ConversionPatternRewriter &rewriter,
-                                            BlockData &data) {
+FailureOr<memref::ReinterpretCastOp>
+createRedundantOp(triton::MakeTensorPtrOp op, OpFoldResult sourceBaseOffset,
+                  ConversionPatternRewriter &rewriter, BlockData &data) {
   auto loc = op.getLoc();
   // to do boundary_check in tt.load, we need to keep the parent tensor's
   // shape info in the IR.
@@ -1915,17 +2054,23 @@ LogicalResult BlockDataParser::rewriteMakeTensorPtrOp(
 
   // special handling for davinci
   // create redundant reinterpret_cast op for record shape info
-  auto redundantOp = createRedundantOp(op, *sourceBaseOffset, rewriter, data);
-  redundantOp->setAttr("tensor_ptr_full_shape", rewriter.getUnitAttr());
+  FailureOr<memref::ReinterpretCastOp> redundantOp =
+      createRedundantOp(op, *sourceBaseOffset, rewriter, data);
+  if (failed(redundantOp))
+    return op.emitOpError("could not materialize the full tensor pointer");
+  (*redundantOp)->setAttr("tensor_ptr_full_shape", rewriter.getUnitAttr());
 
   // create reinterpret_cast op for the target block
-  data.setSource(redundantOp.getResult());
+  data.setSource((*redundantOp).getResult());
   known[op.getResult()] = data;
-  auto castOp = data.createCastOp(resultShape, loc, rewriter);
-  rewriter.replaceOp(op, castOp.getResult());
+  FailureOr<memref::ReinterpretCastOp> castOp =
+      data.createCastOp(resultShape, loc, rewriter);
+  if (failed(castOp))
+    return op.emitOpError("could not materialize the block pointer");
+  rewriter.replaceOp(op, (*castOp).getResult());
 
   if (nd2nzFlag) {
-    auto basePtr = castOp.getResult();
+    auto basePtr = (*castOp).getResult();
     int original_rank = op.getShape().size() + 1;
     std::string shapeStr;
 
@@ -2069,10 +2214,13 @@ LogicalResult BlockDataParser::rewriteAdvanceOp(
     assert(blockData.getRank() == 1);
   }
 
-  auto newOp = blockData.createCastOp(resultShape, loc, rewriter);
-  rewriter.replaceOp(op, newOp.getResult());
+  FailureOr<memref::ReinterpretCastOp> newOp =
+      blockData.createCastOp(resultShape, loc, rewriter);
+  if (failed(newOp))
+    return op.emitOpError("could not materialize the advanced pointer");
+  rewriter.replaceOp(op, (*newOp).getResult());
 
-  known[newOp.getResult()] = blockData;
+  known[(*newOp).getResult()] = blockData;
   return success();
 }
 
@@ -2360,6 +2508,34 @@ bool needsLegacyBlockDataLoopRewrite(LoopLikeOpInterface loopOp) {
       return containsLegacyTritonPointer(value.getType());
     });
   };
+
+  auto isScalarPointerValue = [](Value value) {
+    auto pointerType = dyn_cast<triton::PointerType>(value.getType());
+    return pointerType && !isa<ShapedType>(pointerType.getPointeeType());
+  };
+  auto isTensorPointerValue = [](Value value) {
+    auto pointerType = dyn_cast<triton::PointerType>(value.getType());
+    return pointerType && isa<ShapedType>(pointerType.getPointeeType());
+  };
+
+  SmallVector<Value> boundaryValues;
+  boundaryValues.append(loopOp.getInits().begin(), loopOp.getInits().end());
+  boundaryValues.append(loopOp.getRegionIterArgs().begin(),
+                        loopOp.getRegionIterArgs().end());
+  boundaryValues.append(loopOp->getResults().begin(),
+                        loopOp->getResults().end());
+  if (auto whileOp = dyn_cast<scf::WhileOp>(loopOp.getOperation()))
+    boundaryValues.append(whileOp.getAfterArguments().begin(),
+                          whileOp.getAfterArguments().end());
+
+  bool hasScalarPointer = llvm::any_of(boundaryValues, isScalarPointerValue);
+  bool hasTensorPointer = llvm::any_of(boundaryValues, isTensorPointerValue);
+  // An opaque scalar-pointer loop has no legacy BlockData schema.  Leave it
+  // untouched so the conversion driver reports an ordinary unsupported
+  // boundary instead of entering the descriptor parser with a non-memref
+  // source. Tensor-pointer loops continue through their established path.
+  if (hasScalarPointer && !hasTensorPointer)
+    return false;
 
   // Inspect the original SCF boundary, before the dialect converter remaps a
   // Triton pointer to a reinterpret-cast memref. Such loops still belong to the
@@ -2657,26 +2833,30 @@ BlockDataParser::rewriteLoopOp(LoopLikeOpInterface op,
 
       // In current block data layout info, strides and offsets must be dynamic
       // value
-      auto castOp = data.createCastOp(resultShape, op.getLoc(), rewriter);
+      FailureOr<memref::ReinterpretCastOp> castOp =
+          data.createCastOp(resultShape, op.getLoc(), rewriter);
+      if (failed(castOp))
+        return op.emitOpError(
+            "could not materialize a loop-carried memref from the source type");
       if (resultShape.size() > 1) {
         auto originalOffset = dyn_cast<Value>(data.getOffsetsRef()[0]);
         for (auto &offsets : newInitArgs) {
           if (offsets == originalOffset) {
-            offsets = castOp.getOffsets()[0];
+            offsets = (*castOp).getOffsets()[0];
             break;
           }
         }
-        data.getOffsetsRef()[0] = castOp.getOffsets()[0];
+        data.getOffsetsRef()[0] = (*castOp).getOffsets()[0];
       }
 
       LLVM_DEBUG({
         llvm::dbgs() << "new reinterpret_cast with dynamic sizes "
                         "and offsets:";
-        castOp->print(llvm::dbgs(), OpPrintingFlags().printGenericOpForm());
+        (*castOp).print(llvm::dbgs(), OpPrintingFlags().printGenericOpForm());
         llvm::dbgs() << "\n";
       });
 
-      newInitArgs[i] = castOp.getResult();
+      newInitArgs[i] = (*castOp).getResult();
     }
   }
 
@@ -2967,7 +3147,7 @@ BlockDataParser::rewriteLoopOp(LoopLikeOpInterface op,
 /// @param adaptor The adaptor of the triton::AddPtrOp, used to get operands.
 /// @param rewriter The pattern rewriter used to modify the IR.
 /// @param data The BlockData containing information about the memory access.
-void BlockDataParser::rewriteAddPtrToUnstrucMemAcc(
+LogicalResult BlockDataParser::rewriteAddPtrToUnstrucMemAcc(
     triton::AddPtrOp op, triton::AddPtrOp::Adaptor &adaptor,
     ConversionPatternRewriter &rewriter, BlockData &data) {
   auto loc = op.getLoc();
@@ -3006,6 +3186,7 @@ void BlockDataParser::rewriteAddPtrToUnstrucMemAcc(
     forSteps.push_back(oneIdx);
   }
   SmallVector<Value> ivs;
+  bool castFailed = false;
   OpBuilder builder(op);
   auto loop = createNestedLoops(
       builder, loc, 0, blockSizes.size(), forLBs, forUBs, forSteps, ivs,
@@ -3034,13 +3215,21 @@ void BlockDataParser::rewriteAddPtrToUnstrucMemAcc(
         data.getSizesRef().push_back(bB.getIndexAttr(1));
         data.getStridesRef().clear();
         data.getStridesRef().push_back(bB.getIndexAttr(1));
-        memref::ReinterpretCastOp castOp = data.createCastOp({1}, bLoc, bB);
-        rewriter.replaceOp(op, castOp);
+        FailureOr<memref::ReinterpretCastOp> castOp =
+            data.createCastOp({1}, bLoc, bB);
+        if (failed(castOp)) {
+          castFailed = true;
+          return;
+        }
+        rewriter.replaceOp(op, (*castOp).getResult());
         // Move tt.load using this tt.addptr into this block
-        loadOp->moveAfter(castOp);
+        loadOp->moveAfter((*castOp).getOperation());
         loadOp->setAttr("IndirectLoad", UnitAttr::get(op.getContext()));
         bB.create<scf::YieldOp>(bLoc, iterArgs);
       });
+  if (castFailed)
+    return op.emitOpError("could not materialize the indirect pointer source");
+  return success();
 }
 
 } // namespace triton

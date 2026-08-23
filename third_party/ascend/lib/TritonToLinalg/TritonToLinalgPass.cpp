@@ -1041,8 +1041,8 @@ void TritonToLinalgPass::addDynamicLegal(
     Operation *parent = op->getParentOp();
     if (parent &&
         parent->hasAttr(TTOpConverters::kScalarPointerCarrierBoundaryAttr)) {
-      auto parentIf = cast<scf::IfOp>(parent);
-      return llvm::equal(op->getOperandTypes(), parentIf.getResultTypes());
+      if (auto parentIf = dyn_cast<scf::IfOp>(parent))
+        return llvm::equal(op->getOperandTypes(), parentIf.getResultTypes());
     }
 
     if (parent && parent->hasAttr(controlflow::kPointerDescriptorBoundaryAttr))
@@ -1669,8 +1669,8 @@ void TritonToLinalgPass::runOnOperation() {
     op->removeAttr(controlflow::kPointerDescriptorOffsetFormAttr);
     op->removeAttr(controlflow::kPointerDescriptorStructuredAxesAttr);
   });
-  moduleOp.walk([](scf::IfOp ifOp) {
-    ifOp->removeAttr(TTOpConverters::kScalarPointerCarrierBoundaryAttr);
+  moduleOp.walk([](Operation *op) {
+    op->removeAttr(TTOpConverters::kScalarPointerCarrierBoundaryAttr);
   });
 
   // 7.1 Workaround: fold duplicated one-hot reconstruction emitted after
