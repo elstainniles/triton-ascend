@@ -584,8 +584,10 @@ static void eraseDeadRangeCarriers(ModuleOp moduleOp) {
     if (!loop || loop->getParentOp() == nullptr)
       continue;
     llvm::BitVector dead(loop.getInitArgs().size());
-    for (unsigned i = 0; i < dead.size(); ++i)
-      dead.set(i, isDeadRangeCarrier(loop, i));
+    for (unsigned i = 0; i < dead.size(); ++i) {
+      if (isDeadRangeCarrier(loop, i))
+        dead.set(i);
+    }
     if (dead.none())
       continue;
 
