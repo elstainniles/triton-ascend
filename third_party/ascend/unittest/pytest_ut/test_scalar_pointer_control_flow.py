@@ -23,6 +23,11 @@ import torch
 import torch_npu  # noqa: F401
 import triton
 import triton.language as tl
+from triton.compiler.code_generator import ast_to_ttir
+from triton.compiler.compiler import ASTSource
+from triton._C.libtriton import ir
+from triton._C.libtriton.ascend import ir as ascend_ir
+from triton.backends.ascend.compiler import NPUOptions, ttir_to_linalg
 
 BLOCK = 16
 INPUT_SIZE = 256
@@ -133,6 +138,34 @@ def _device_i32(value):
 def _assert_output(actual, expected):
     torch.npu.synchronize()
     torch.testing.assert_close(actual.cpu(), expected, rtol=0, atol=0)
+
+
+def _compile_scalar_pointer_while_to_linalg():
+    """Compile the while-carried scalar pointer through the complete IR path.
+
+    The regression was a malformed T2U ``scf.while`` whose init operand kept
+    ``!tt.ptr`` while its before/after region argument had already become
+    ``i64``.  Running the normal compiler entry point is the useful assertion:
+    it verifies that all while boundary edges agree before T2L starts.
+    """
+    source = ASTSource(
+        scalar_pointer_while_kernel,
+        {"x": "*fp32", "out": "*fp32", "steps_ptr": "*i32"},
+        {},
+    )
+    context = ir.context()
+    ir.load_dialects(context)
+    ascend_ir.load_dialects(context)
+    options = NPUOptions()
+    ttir = ast_to_ttir(scalar_pointer_while_kernel, source, context, options,
+                       {}, {})
+    return str(ttir_to_linalg(ttir, {**options.__dict__}, options,
+                              named_ops=True))
+
+
+def test_scalar_pointer_while_boundary_types():
+    adapter = _compile_scalar_pointer_while_to_linalg()
+    assert "!tt.ptr" not in adapter
 
 
 @pytest.mark.parametrize("predicate", [0, 1])

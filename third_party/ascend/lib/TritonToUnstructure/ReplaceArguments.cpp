@@ -171,9 +171,67 @@ shouldPreserveScalarPointers(Operation *op, RewriterBase &rewriter,
   return false;
 }
 
+static int getPtrTensorRank(Type type);
+
+// Compute one representation for every scalar-pointer slot of a While.  A
+// mismatch is present when the init is an opaque complete pointer (it cannot
+// be reduced to a relative offset) but one of the region arguments can be
+// reduced.  Converting only the region argument would create an invalid SCF
+// edge: the parent operand stays !tt.ptr while the region argument becomes
+// i64.  Such a slot is carried as a complete i64 address on every edge.
+static SmallVector<bool> getCompleteScalarSlots(
+    scf::WhileOp whileOp, RewriterBase &rewriter,
+    llvm::DenseMap<Value, PtrOffsetInfo> &offsetMap,
+    bool detectRepresentationMismatch) {
+  SmallVector<bool> complete(whileOp.getInits().size(), false);
+  unsigned resultTypeIndex = 0;
+  for (auto [slot, init] : llvm::enumerate(whileOp.getInits())) {
+    unsigned carriedWidth = std::max(getPtrTensorRank(init.getType()), 1);
+    if (!isScalarPointerType(init.getType())) {
+      resultTypeIndex += carriedWidth;
+      continue;
+    }
+
+    complete[slot] = useCompleteScalarAddress(
+        whileOp.getOperation(), slot, init.getType());
+    if (resultTypeIndex < whileOp->getResultTypes().size() &&
+        isa<IntegerType>(whileOp->getResultTypes()[resultTypeIndex]))
+      complete[slot] = true;
+
+    if (detectRepresentationMismatch &&
+        slot < whileOp.getBeforeArguments().size()) {
+      bool initIsRelative =
+          canRewriteScalarPointer(init, rewriter, offsetMap);
+      bool beforeIsRelative = canRewriteScalarPointer(
+          whileOp.getBeforeArguments()[slot], rewriter, offsetMap);
+      bool afterIsRelative =
+          slot < whileOp.getAfterArguments().size() &&
+          canRewriteScalarPointer(whileOp.getAfterArguments()[slot],
+                                  rewriter, offsetMap);
+      if (!initIsRelative && (beforeIsRelative || afterIsRelative))
+        complete[slot] = true;
+    }
+    resultTypeIndex += carriedWidth;
+  }
+  return complete;
+}
+
+static bool anyCompleteScalarSlot(ArrayRef<bool> slots) {
+  return llvm::any_of(slots, [](bool value) { return value; });
+}
+
 static bool hasScalarPointerResult(scf::IfOp op) {
   return llvm::any_of(op->getResultTypes(),
                       [](Type type) { return isScalarPointerType(type); });
+}
+
+static int getPtrTensorRank(Type type) {
+  if (auto ptrType = dyn_cast<triton::PointerType>(type)) {
+    if (auto tensorType =
+            dyn_cast<RankedTensorType>(ptrType.getPointeeType()))
+      return tensorType.getRank();
+  }
+  return 0;
 }
 
 static bool hasScalarPointerBoundary(Operation *op) {
@@ -250,10 +308,12 @@ static void invalidateScalarPointerBoundaryAnalysis(
 
 void replaceOperands(MutableArrayRef<OpOperand> oprs, RewriterBase &rewriter,
                      llvm::DenseMap<Value, PtrOffsetInfo> &offsetMap,
-                     bool preserveScalarPointers) {
+                     bool preserveScalarPointers,
+                     ArrayRef<bool> completeScalarSlots = {}) {
   for (auto it = oprs.begin(); it != oprs.end(); ++it) {
     auto &opr = *it;
     auto operand = opr.get();
+    unsigned slot = std::distance(oprs.begin(), it);
     if (auto tensorType = dyn_cast<RankedTensorType>(operand.getType());
         tensorType && isa<triton::PointerType>(tensorType.getElementType())) {
       parse(operand, operand.getLoc(), rewriter, offsetMap);
@@ -265,6 +325,17 @@ void replaceOperands(MutableArrayRef<OpOperand> oprs, RewriterBase &rewriter,
         opr.set(info.getOffset());
     } else if (auto ptrType =
                    dyn_cast<triton::PointerType>(operand.getType())) {
+      bool useCompleteAddress =
+          !completeScalarSlots.empty() && slot < completeScalarSlots.size()
+              ? completeScalarSlots[slot]
+              : false;
+      if (useCompleteAddress && isScalarPointerType(operand.getType())) {
+        RewriterBase::InsertionGuard guard(rewriter);
+        rewriter.setInsertionPoint(opr.getOwner());
+        opr.set(materializeScalarPointerAddress(operand, rewriter,
+                                                 operand.getLoc()));
+        continue;
+      }
       // An unmarked scalar pointer has no complete structural carrier schema.
       // Keep it as a pointer on every SCF edge instead of changing only this
       // operand to a relative offset and invalidating the parent operation.
@@ -292,7 +363,8 @@ void replaceOperands(MutableArrayRef<OpOperand> oprs, RewriterBase &rewriter,
 
 void replaceArgs(ValueRange args, RewriterBase &rewriter,
                  llvm::DenseMap<Value, PtrOffsetInfo> &offsetMap,
-                 bool preserveScalarPointers) {
+                 bool preserveScalarPointers,
+                 ArrayRef<bool> completeScalarSlots = {}) {
   for (auto it = args.begin(); it != args.end(); ++it) {
     auto arg = *it;
     if (auto tensorType = dyn_cast<RankedTensorType>(arg.getType());
@@ -326,6 +398,28 @@ void replaceArgs(ValueRange args, RewriterBase &rewriter,
     } else if (auto ptrType = dyn_cast<triton::PointerType>(arg.getType())) {
       // Region arguments and results must use the same representation as the
       // corresponding init/condition/yield operands.
+      bool useCompleteAddress =
+          !completeScalarSlots.empty() &&
+                  static_cast<unsigned>(std::distance(args.begin(), it)) <
+                      completeScalarSlots.size()
+              ? completeScalarSlots[std::distance(args.begin(), it)]
+              : false;
+      if (useCompleteAddress && isScalarPointerType(arg.getType())) {
+        RewriterBase::InsertionGuard guard(rewriter);
+        if (auto blockArg = dyn_cast<BlockArgument>(arg))
+          rewriter.setInsertionPointToStart(blockArg.getOwner());
+        else
+          rewriter.setInsertionPointAfterValue(arg);
+        auto tempVar = rewriter
+                           .create<UnrealizedConversionCastOp>(
+                               arg.getLoc(), arg.getType(), ValueRange({}))
+                           ->getResult(0);
+        rewriter.replaceAllUsesWith(arg, tempVar);
+        arg.setType(rewriter.getI64Type());
+        rewriter.replaceOpWithNewOp<triton::IntToPtrOp>(
+            tempVar.getDefiningOp(), tempVar.getType(), arg);
+        continue;
+      }
       if (preserveScalarPointers && isScalarPointerType(arg.getType()))
         continue;
       parse(arg, arg.getLoc(), rewriter, offsetMap);
@@ -381,21 +475,27 @@ void convertTensorPtrPre(Operation *op, RewriterBase &rewriter,
     invalidateScalarPointerBoundaryAnalysis(op, offsetMap);
   SmallVector<Value> scalarPointerOffsetArgs;
   if (auto whileOp = dyn_cast<scf::WhileOp>(op)) {
+    SmallVector<bool> completeScalarSlots =
+        getCompleteScalarSlots(whileOp, rewriter, offsetMap,
+                               !preserveScalarPointers);
+    if (anyCompleteScalarSlot(completeScalarSlots))
+      op->setAttr(kScalarPointerCarrierBoundaryAttr,
+                  UnitAttr::get(op->getContext()));
     if (!preserveScalarPointers)
       llvm::copy_if(whileOp.getBeforeArguments(),
                     std::back_inserter(scalarPointerOffsetArgs), [](Value arg) {
                       return isScalarPointerType(arg.getType());
                     });
     replaceArgs(whileOp.getBeforeArguments(), rewriter, offsetMap,
-                preserveScalarPointers);
+                preserveScalarPointers, completeScalarSlots);
     replaceOperands(whileOp.getInitsMutable(), rewriter, offsetMap,
-                    preserveScalarPointers);
+                    preserveScalarPointers, completeScalarSlots);
     replaceArgs(whileOp.getAfterArguments(), rewriter, offsetMap,
-                preserveScalarPointers);
+                preserveScalarPointers, completeScalarSlots);
     replaceArgs(whileOp->getResults(), rewriter, offsetMap,
-                preserveScalarPointers);
+                preserveScalarPointers, completeScalarSlots);
     replaceOperands(whileOp.getConditionOp().getArgsMutable(), rewriter,
-                    offsetMap, preserveScalarPointers);
+                    offsetMap, preserveScalarPointers, completeScalarSlots);
   } else if (auto loopOp = dyn_cast<LoopLikeOpInterface>(op)) {
     if (!preserveScalarPointers)
       llvm::copy_if(loopOp.getRegionIterArgs(),
@@ -445,8 +545,11 @@ void convertTensorPtrPost(Operation *op, RewriterBase &rewriter,
   bool preserveScalarPointers =
       shouldPreserveScalarPointers(op, rewriter, offsetMap);
   if (auto whileOp = dyn_cast<scf::WhileOp>(op)) {
+    SmallVector<bool> completeScalarSlots;
+    if (op->hasAttr(kScalarPointerCarrierBoundaryAttr))
+      completeScalarSlots.resize(whileOp.getInits().size(), true);
     replaceOperands(whileOp.getYieldOp()->getOpOperands(), rewriter, offsetMap,
-                    preserveScalarPointers);
+                    preserveScalarPointers, completeScalarSlots);
   } else if (auto loopOp = dyn_cast<LoopLikeOpInterface>(op)) {
     replaceArgs(loopOp->getResults(), rewriter, offsetMap,
                 preserveScalarPointers);
@@ -459,23 +562,20 @@ void convertTensorPtrPost(Operation *op, RewriterBase &rewriter,
   });
 }
 
-int getPtrTensorRank(Type type) {
-  if (auto ptrType = dyn_cast<triton::PointerType>(type)) {
-    if (auto tensorType =
-            dyn_cast<RankedTensorType>(ptrType.getPointeeType())) {
-      return tensorType.getRank();
-    }
-  }
-  return 0;
-}
-
 SmallVector<Value> constructOperands(ValueRange operands, Value tempVar,
                                      IRMapping mapping, OpBuilder &builder,
-                                     Operation *loop) {
+                                     Operation *loop,
+                                     ArrayRef<bool> completeScalarSlots = {}) {
   SmallVector<Value> newOperands;
   for (auto [slot, originalOperand] : llvm::enumerate(operands)) {
     Value mappedOperand = mapping.lookupOrDefault(originalOperand);
-    if (useCompleteScalarAddress(loop, slot, originalOperand.getType()))
+    bool useCompleteAddress =
+        !completeScalarSlots.empty() && slot < completeScalarSlots.size()
+            ? completeScalarSlots[slot]
+            : useCompleteScalarAddress(loop, slot, originalOperand.getType());
+    // A partially rewritten edge may already carry the complete i64 address.
+    // Never apply ptr-to-int to that integer value a second time.
+    if (useCompleteAddress && isScalarPointerType(originalOperand.getType()))
       mappedOperand = materializeScalarPointerAddress(mappedOperand, builder,
                                                       originalOperand.getLoc());
     newOperands.push_back(mappedOperand);
@@ -515,6 +615,11 @@ void replacePtrArguments(triton::FuncOp funcOp,
   std::function<WalkResult(Operation *)> convertTensorPtr = [&](Operation *op) {
     IRMapping mapping;
     Operation *newOp = nullptr;
+    // While reconstruction may encounter an already partially rewritten
+    // operation: its result types can already be integer carriers while its
+    // init operands are still scalar pointers.  Keep the per-slot decision so
+    // every edge is rebuilt with one representation.
+    SmallVector<bool> completeScalarSlots;
     // Address carriers used by the replacement op must dominate it. Build the
     // replacement immediately before the old op and erase the old op last.
     rewriter.setInsertionPoint(op);
@@ -563,18 +668,35 @@ void replacePtrArguments(triton::FuncOp funcOp,
       // explicitly marked descriptor slots; applying the opaque fallback to
       // every While here changes the two-region T2U contract before that
       // reanalysis can run.
+      SmallVector<Type> newResultTypes =
+          constructTypes(whileOp->getResultTypes(), whileOp);
+      completeScalarSlots.resize(whileOp.getInits().size(), false);
+      unsigned resultTypeIndex = 0;
+      for (auto [slot, init] : llvm::enumerate(whileOp.getInits())) {
+        unsigned carriedWidth = std::max(getPtrTensorRank(init.getType()), 1);
+        if (isScalarPointerType(init.getType()) &&
+            resultTypeIndex < newResultTypes.size() &&
+            isa<IntegerType>(newResultTypes[resultTypeIndex]))
+          completeScalarSlots[slot] = true;
+        completeScalarSlots[slot] =
+            completeScalarSlots[slot] ||
+            useCompleteScalarAddress(whileOp, slot, init.getType());
+        resultTypeIndex += carriedWidth;
+      }
+
       SmallVector<Value> newInits = constructOperands(
-          whileOp.getInits(), tempVar, mapping, rewriter, whileOp);
+          whileOp.getInits(), tempVar, mapping, rewriter, whileOp,
+          completeScalarSlots);
       newOp = rewriter.create<scf::WhileOp>(
-          whileOp.getLoc(), constructTypes(whileOp->getResultTypes(), whileOp),
-          newInits,
+          whileOp.getLoc(), newResultTypes, newInits,
           [&](OpBuilder &b, Location loc, ValueRange args) {
             IRMapping beforeMapping;
             auto newArgIter = args.begin();
             for (auto [slot, oldArg] :
                  llvm::enumerate(whileOp.getBeforeArguments())) {
               Value mappedArg = *newArgIter;
-              if (useCompleteScalarAddress(whileOp, slot, oldArg.getType()))
+              if (slot < completeScalarSlots.size() &&
+                  completeScalarSlots[slot])
                 mappedArg =
                     rebuildScalarPointer(mappedArg, oldArg.getType(), b, loc);
               beforeMapping.map(oldArg, mappedArg);
@@ -589,7 +711,7 @@ void replacePtrArguments(triton::FuncOp funcOp,
                 conditionOp.getLoc(),
                 beforeMapping.lookup(conditionOp.getCondition()),
                 constructOperands(conditionOp.getArgs(), tempVar, beforeMapping,
-                                  b, whileOp));
+                                  b, whileOp, completeScalarSlots));
           },
           [&](OpBuilder &b, Location loc, ValueRange args) {
             IRMapping afterMapping;
@@ -597,7 +719,8 @@ void replacePtrArguments(triton::FuncOp funcOp,
             for (auto [slot, oldArg] :
                  llvm::enumerate(whileOp.getAfterArguments())) {
               Value mappedArg = *newArgIter;
-              if (useCompleteScalarAddress(whileOp, slot, oldArg.getType()))
+              if (slot < completeScalarSlots.size() &&
+                  completeScalarSlots[slot])
                 mappedArg =
                     rebuildScalarPointer(mappedArg, oldArg.getType(), b, loc);
               afterMapping.map(oldArg, mappedArg);
@@ -611,7 +734,8 @@ void replacePtrArguments(triton::FuncOp funcOp,
             b.create<scf::YieldOp>(yieldOp.getLoc(),
                                    constructOperands(yieldOp.getOperands(),
                                                      tempVar, afterMapping, b,
-                                                     whileOp));
+                                                     whileOp,
+                                                     completeScalarSlots));
           });
     } else if (auto ifOp = dyn_cast<scf::IfOp>(op);
                ifOp && ifOp->getNumResults() > 0) {
@@ -649,7 +773,11 @@ void replacePtrArguments(triton::FuncOp funcOp,
       auto resIter = newOp->result_begin();
       for (auto [slot, res] : llvm::enumerate(op->getResults())) {
         Value replacement = *resIter;
-        if (useCompleteScalarAddress(op, slot, res.getType())) {
+        bool useCompleteAddress =
+            !completeScalarSlots.empty() && slot < completeScalarSlots.size()
+                ? completeScalarSlots[slot]
+                : useCompleteScalarAddress(op, slot, res.getType());
+        if (useCompleteAddress && isScalarPointerType(res.getType())) {
           rewriter.setInsertionPointAfter(newOp);
           replacement = rebuildScalarPointer(replacement, res.getType(),
                                              rewriter, res.getLoc());
