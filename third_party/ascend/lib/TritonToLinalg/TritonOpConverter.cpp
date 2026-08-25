@@ -140,6 +140,33 @@ static bool isIntToPtrBasedScalarPointer(Value value) {
   return false;
 }
 
+// A volatile indirect load whose scalar source is obtained through a Triton
+// pointer bitcast needs the same one-element identity descriptor as the
+// scalar-pointer path. Restrict this provenance check to scalar pointers and
+// a pointer-preserving bitcast/addptr chain so ordinary dynamic memrefs and
+// tensor-of-pointers keep their established ABI.
+static bool isVolatileBitcastScalarPointer(Value value) {
+  auto pointerType = dyn_cast<triton::PointerType>(value.getType());
+  if (!pointerType || isa<ShapedType>(pointerType.getPointeeType()))
+    return false;
+
+  SmallPtrSet<Value, 8> visited;
+  bool sawBitcast = false;
+  while (value && visited.insert(value).second) {
+    if (auto bitcast = value.getDefiningOp<triton::BitcastOp>()) {
+      sawBitcast = true;
+      value = bitcast.getSrc();
+      continue;
+    }
+    if (auto addPtr = value.getDefiningOp<triton::AddPtrOp>()) {
+      value = addPtr.getPtr();
+      continue;
+    }
+    break;
+  }
+  return sawBitcast;
+}
+
 LogicalResult
 BitcastConverter::matchAndRewrite(triton::BitcastOp op, OpAdaptor adaptor,
                                   ConversionPatternRewriter &rewriter) const {
@@ -3641,7 +3668,8 @@ LogicalResult IndirectLoadConverter::matchAndRewrite(
   // IntToPtrConverter.  Re-materialize that narrow provenance before the
   // MemRefType fast path, otherwise the indirect helper receives memref<?xT>
   // instead of the required one-element identity descriptor.
-  if (isIntToPtrBasedScalarPointer(op.getSrc())) {
+  if (isIntToPtrBasedScalarPointer(op.getSrc()) ||
+      (op.getIsVolatile() && isVolatileBitcastScalarPointer(op.getSrc()))) {
     llvm::SmallDenseMap<Value, BlockData> known;
     FailureOr<Value> materialized =
         BlockDataParser::materializePointer(op.getSrc(), rewriter, known);
