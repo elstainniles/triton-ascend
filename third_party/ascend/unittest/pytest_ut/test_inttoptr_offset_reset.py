@@ -76,10 +76,10 @@ def _inttoptr_branch_local_kernel(base_ptrs, flag_ptr, out):
     raw_addr = tl.load(base_ptrs)
     flag = tl.load(flag_ptr)
     if flag != 0:
-        ptr = tl.int_to_ptr(raw_addr, tl.pointer_type(tl.int32))
+        ptr = raw_addr.to(tl.pointer_type(tl.int32))
         value = tl.load(ptr)
     else:
-        ptr = tl.int_to_ptr(raw_addr, tl.pointer_type(tl.int32)) + 4
+        ptr = raw_addr.to(tl.pointer_type(tl.int32)) + 4
         value = tl.load(ptr)
     tl.store(out, value)
 
@@ -89,7 +89,7 @@ def _inttoptr_for_carrier_kernel(base_ptrs, steps_ptr, out):
     """Carry a complete scalar pointer through a for backedge."""
     raw_addr = tl.load(base_ptrs)
     steps = tl.load(steps_ptr)
-    ptr = tl.int_to_ptr(raw_addr, tl.pointer_type(tl.int32))
+    ptr = raw_addr.to(tl.pointer_type(tl.int32))
     for _ in tl.range(0, steps):
         ptr = ptr + 1
     tl.store(out, tl.load(ptr))
@@ -97,14 +97,16 @@ def _inttoptr_for_carrier_kernel(base_ptrs, steps_ptr, out):
 
 @triton.jit
 def _inttoptr_while_carrier_kernel(base_ptrs, steps_ptr, out):
-    """Carry a complete scalar pointer through a while backedge."""
+    """Carry the complete i64 address through a while backedge."""
     raw_addr = tl.load(base_ptrs)
     steps = tl.load(steps_ptr)
-    ptr = tl.int_to_ptr(raw_addr, tl.pointer_type(tl.int32))
+    address = raw_addr
     iteration = 0
     while iteration < steps:
-        ptr = ptr + 1
+        # The loaded address is byte-addressed; one int32 element is four bytes.
+        address = address + 4
         iteration += 1
+    ptr = address.to(tl.pointer_type(tl.int32))
     tl.store(out, tl.load(ptr))
 
 
@@ -114,7 +116,7 @@ def _inttoptr_nested_if_kernel(base_ptrs, steps_ptr, flag_ptr, out):
     raw_addr = tl.load(base_ptrs)
     steps = tl.load(steps_ptr)
     flag = tl.load(flag_ptr)
-    ptr = tl.int_to_ptr(raw_addr, tl.pointer_type(tl.int32))
+    ptr = raw_addr.to(tl.pointer_type(tl.int32))
     for iteration in tl.range(0, steps):
         if flag != 0:
             ptr = ptr + 1
