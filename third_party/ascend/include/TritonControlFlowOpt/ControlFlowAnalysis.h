@@ -75,25 +75,21 @@ struct AnalyzedComponent {
 struct AnalyzedValue {
   Type originalType;
   SmallVector<AnalyzedComponent> components;
+  SmallVector<Value> invariants;
   SmallVector<Attribute> attributes;
 };
 
-/// Signature decision for one original result/iter-argument position. The slot
-/// itself means the original value is removed from the SCF signature;
-/// componentIndices may be empty when every component is invariant and no
-/// replacement operand/result is required.
+/// Signature decision for one original result/iter-argument position.
 struct ControlFlowSlotAnalysis {
   unsigned oldIndex = 0;
   SmallVector<ComponentTransferKind> componentKinds;
   SmallVector<unsigned> componentIndices;
   SmallVector<Type> componentTypes;
-  /// Policy metadata after all incoming paths have been joined.
-  SmallVector<Attribute> resultAttributes;
 };
 
 /// Cached decision for one structured control-flow operation.
 struct ControlFlowOpAnalysis {
-  SmallVector<ControlFlowSlotAnalysis, 0> slots;
+  SmallVector<ControlFlowSlotAnalysis> slots;
   bool hasNestedRewrite = false;
 
   bool rewritesOwnSignature() const { return !slots.empty(); }
@@ -139,15 +135,6 @@ public:
   virtual FailureOr<SmallVector<unsigned>>
   getLoopCandidateComponents(const AnalyzedValue &value) const = 0;
 
-  /// Components which may cross a scope.scope result boundary. Scope has no
-  /// region arguments or backedge, so the first implementation returns every
-  /// component that the policy already permits a loop to carry. A policy may
-  /// override this hook when its Scope schema differs from its loop schema.
-  virtual FailureOr<SmallVector<unsigned>>
-  getScopeCandidateComponents(const AnalyzedValue &value) const {
-    return getLoopCandidateComponents(value);
-  }
-
   virtual FailureOr<SmallVector<unsigned>>
   getLoopTransferredComponents(const AnalyzedValue &initial,
                                const AnalyzedValue &regionArgument,
@@ -159,16 +146,6 @@ public:
 
   /// Selects the component type used in the replacement SCF signature.
   virtual FailureOr<Type> joinComponentTypes(Type lhs, Type rhs) const = 0;
-
-  /// Joins policy-owned metadata across one control-flow boundary. The
-  /// default requires exact equality, which preserves BlockPtr behavior.
-  virtual FailureOr<SmallVector<Attribute>>
-  mergeControlFlowAttributes(const AnalyzedValue &lhs,
-                             const AnalyzedValue &rhs) const {
-    if (lhs.attributes != rhs.attributes)
-      return failure();
-    return lhs.attributes;
-  }
 };
 
 /// Stage-scoped transient cache used while computing a rewrite plan. One
@@ -192,7 +169,6 @@ private:
   FailureOr<ControlFlowOpAnalysis> analyzeFor(Operation *op);
   FailureOr<ControlFlowOpAnalysis> analyzeWhile(Operation *op);
   FailureOr<ControlFlowOpAnalysis> analyzeIf(Operation *op);
-  FailureOr<ControlFlowOpAnalysis> analyzeScope(Operation *op);
 
   void bindRegionArgument(Value argument, const AnalyzedValue &initial,
                           ArrayRef<unsigned> componentIndices);

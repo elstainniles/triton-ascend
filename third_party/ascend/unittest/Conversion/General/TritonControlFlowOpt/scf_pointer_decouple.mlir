@@ -24,11 +24,11 @@ module {
 // CHECK-LABEL: tt.func public @for_block_ptr_dynamic_step
 // CHECK:       %[[FOR:.*]] = scf.for {{.*}} iter_args(%[[OFF:.*]] = %{{.*}}) -> (i32) {
 // CHECK-NOT:     arith.muli
-// CHECK:         tt.make_tensor_ptr %{{.*}}, [%{{.*}}], [%{{.*}}], [%[[OFF]]] {{.*}}order = array<i32: 0>{{.*}} : <tensor<32xf16>>
+// CHECK:         tt.make_tensor_ptr %{{.*}}, [%{{.*}}], [%{{.*}}], [%[[OFF]]] {order = array<i32: 0>} : <tensor<32xf16>>
 // CHECK:         %[[NEXT:.*]] = arith.addi %[[OFF]], %{{.*}} : i32
 // CHECK:         scf.yield %[[NEXT]] : i32
 // CHECK:       }
-// CHECK:       tt.make_tensor_ptr %{{.*}}, [%{{.*}}], [%{{.*}}], [%[[FOR]]] {{.*}}order = array<i32: 0>{{.*}} : <tensor<32xf16>>
+// CHECK:       tt.make_tensor_ptr %{{.*}}, [%{{.*}}], [%{{.*}}], [%[[FOR]]] {order = array<i32: 0>} : <tensor<32xf16>>
 
 // -----
 
@@ -51,16 +51,13 @@ module {
   }
 }
 
-// CHECK-LABEL: tt.func public @for_block_ptr_invariant_delta_carried(
-// CHECK-SAME:  %[[BASE:[^ ,]+]]: !tt.ptr<f16>
-// CHECK:       %[[BASE_ADDRESS:.*]] = tt.ptr_to_int %[[BASE]]
+// CHECK-LABEL: tt.func public @for_block_ptr_invariant_delta_carried
 // CHECK:       %[[FOR:[^:]+]]:2 = scf.for
-// CHECK-SAME:  {{.*}} -> (i32, tensor<32xf16>) {
+// CHECK-SAME:  {{.*}} iter_args(%{{.*}} = %{{.*}}, %{{.*}} = %{{.*}}) -> (i32, tensor<32xf16>) {
 // CHECK-NOT:     arith.index_cast
 // CHECK-NOT:     arith.muli
 // CHECK:         %[[NEXT:.*]] = arith.addi %{{.*}}, %{{.*}} : i32
-// CHECK-NOT:     tt.int_to_ptr %[[BASE_ADDRESS]]
-// CHECK:         %[[LOAD_PTR:.*]] = tt.make_tensor_ptr %[[BASE]], [%{{.*}}], [%{{.*}}], [%[[NEXT]]] {order = array<i32: 0>} : <tensor<32xf16>>
+// CHECK:         %[[LOAD_PTR:.*]] = tt.make_tensor_ptr %{{.*}}, [%{{.*}}], [%{{.*}}], [%[[NEXT]]] {order = array<i32: 0>} : <tensor<32xf16>>
 // CHECK:         %[[LOADED:.*]] = tt.load %[[LOAD_PTR]] : !tt.ptr<tensor<32xf16>>
 // CHECK:         scf.yield %[[NEXT]], %[[LOADED]] : i32, tensor<32xf16>
 // CHECK:       }
@@ -88,7 +85,7 @@ module {
 // CHECK:         %[[NEXT:.*]] = arith.addi %[[OFF]], %{{.*}} : i32
 // CHECK:         scf.yield %[[NEXT]] : i32
 // CHECK:       }
-// CHECK:       tt.make_tensor_ptr %{{.*}}, [%{{.*}}], [%{{.*}}], [%[[FOR]]] {{.*}}order = array<i32: 0>{{.*}} : <tensor<32xf16>>
+// CHECK:       tt.make_tensor_ptr %{{.*}}, [%{{.*}}], [%{{.*}}], [%[[FOR]]] {order = array<i32: 0>} : <tensor<32xf16>>
 
 // -----
 
@@ -116,7 +113,7 @@ module {
 // CHECK:         %[[NEXT_DELTA:.*]] = arith.addi %[[DELTA]], %{{.*}} : i32
 // CHECK:         scf.yield %[[NEXT_PTR]], %[[NEXT_DELTA]] : i32, i32
 // CHECK:       }
-// CHECK:       tt.make_tensor_ptr %{{.*}}, [%{{.*}}], [%{{.*}}], [%[[FOR]]#0] {{.*}}order = array<i32: 0>{{.*}} : <tensor<32xf16>>
+// CHECK:       tt.make_tensor_ptr %{{.*}}, [%{{.*}}], [%{{.*}}], [%[[FOR]]#0] {order = array<i32: 0>} : <tensor<32xf16>>
 
 // -----
 
@@ -142,12 +139,12 @@ module {
 }
 
 // CHECK-LABEL: tt.func public @for_block_ptr_multidim_delta
-// CHECK:       %[[FOR:.*]]:2 = scf.for {{.*}} iter_args(%[[OFF0:.*]] = %{{.*}}, %[[OFF1:.*]] = %{{.*}})
+// CHECK:       %[[FOR:.*]]:2 = scf.for {{.*}} iter_args(%[[OFF0:.*]] = %{{.*}}, %[[OFF1:.*]] = %{{.*}}) -> (i32, i32) {
 // CHECK:         %[[NEXT0:.*]] = arith.addi %[[OFF0]], %{{.*}} : i32
 // CHECK:         %[[NEXT1:.*]] = arith.addi %[[OFF1]], %{{.*}} : i32
 // CHECK:         scf.yield %[[NEXT0]], %[[NEXT1]] : i32, i32
 // CHECK:       }
-// CHECK:       tt.make_tensor_ptr %{{.*}}, [%{{.*}}, %{{.*}}], [%{{.*}}, %{{.*}}], [%[[FOR]]#0, %[[FOR]]#1] {{.*}}order = array<i32: 1, 0>{{.*}} : <tensor<16x32xf16>>
+// CHECK:       tt.make_tensor_ptr %{{.*}}, [%{{.*}}, %{{.*}}], [%{{.*}}, %{{.*}}], [%[[FOR]]#0, %[[FOR]]#1] {order = array<i32: 1, 0>} : <tensor<16x32xf16>>
 
 // -----
 
@@ -174,7 +171,7 @@ module {
 // CHECK:         %[[NEXT:.*]] = arith.addi %[[OFF]], %{{.*}} : i32
 // CHECK:         scf.yield %[[NEXT]] : i32
 // CHECK:       }
-// CHECK:       tt.make_tensor_ptr %{{.*}}, [%{{.*}}], [%{{.*}}], [%[[FOR]]] {{.*}}order = array<i32: 0>{{.*}} : <tensor<32xf16>>
+// CHECK:       tt.make_tensor_ptr %{{.*}}, [%{{.*}}], [%{{.*}}], [%[[FOR]]] {order = array<i32: 0>} : <tensor<32xf16>>
 
 // -----
 
@@ -199,14 +196,13 @@ module {
 }
 
 // CHECK-LABEL: tt.func public @while_block_ptr_basic
-// CHECK:       %[[WHILE:.*]]:2 = scf.while
-// CHECK-SAME:  : (i32, i32) -> (i32, i32) {
+// CHECK:       %[[WHILE:.*]]:2 = scf.while (%{{.*}} = %{{.*}}, %{{.*}} = %{{.*}}) : (i32, i32) -> (i32, i32) {
 // CHECK:       scf.condition(%{{.*}}) %{{.*}}, %{{.*}} : i32, i32
 // CHECK:       } do {
-// CHECK:       tt.make_tensor_ptr %{{.*}}, [%{{.*}}], [%{{.*}}], [%{{.*}}] {{.*}}order = array<i32: 0>{{.*}} : <tensor<32xf16>>
+// CHECK:       tt.make_tensor_ptr %{{.*}}, [%{{.*}}], [%{{.*}}], [%{{.*}}] {order = array<i32: 0>} : <tensor<32xf16>>
 // CHECK:       scf.yield %{{.*}}, %{{.*}} : i32, i32
 // CHECK:       }
-// CHECK:       tt.make_tensor_ptr %{{.*}}, [%{{.*}}], [%{{.*}}], [%[[WHILE]]#1] {{.*}}order = array<i32: 0>{{.*}} : <tensor<32xf16>>
+// CHECK:       tt.make_tensor_ptr %{{.*}}, [%{{.*}}], [%{{.*}}], [%[[WHILE]]#1] {order = array<i32: 0>} : <tensor<32xf16>>
 
 // -----
 
@@ -235,7 +231,7 @@ module {
 // CHECK:       } else {
 // CHECK:         scf.yield %{{.*}} : i32
 // CHECK:       }
-// CHECK:       tt.make_tensor_ptr %{{.*}}, [%{{.*}}], [%{{.*}}], [%[[OFF]]] {{.*}}order = array<i32: 0>{{.*}} : <tensor<32xf16>>
+// CHECK:       tt.make_tensor_ptr %{{.*}}, [%{{.*}}], [%{{.*}}], [%[[OFF]]] {order = array<i32: 0>} : <tensor<32xf16>>
 
 // -----
 
@@ -259,14 +255,13 @@ module {
 }
 
 // CHECK-LABEL: tt.func public @if_tensor_ptr_same_base_offsets
-// CHECK:       %[[OFF:.*]] = scf.if %{{.*}} -> (i32) {
-// CHECK:         scf.yield %{{.*}} : i32
+// CHECK:       %[[OFF:.*]] = scf.if %{{.*}} -> (tensor<4xi32>) {
+// CHECK:         scf.yield %{{.*}} : tensor<4xi32>
 // CHECK:       } else {
-// CHECK:         scf.yield %{{.*}} : i32
+// CHECK:         scf.yield %{{.*}} : tensor<4xi32>
 // CHECK:       }
 // CHECK:       tt.splat %{{.*}} : !tt.ptr<f32> -> tensor<4x!tt.ptr<f32>>
-// CHECK:       PointerDescriptorOffsetForm = "strided_1d"
-// CHECK-SAME:  PointerDescriptorRebuild
+// CHECK:       tt.addptr %{{.*}}, %[[OFF]] : tensor<4x!tt.ptr<f32>>, tensor<4xi32>
 
 // -----
 
@@ -293,8 +288,6 @@ module {
 
 // CHECK-LABEL: tt.func public @while_block_ptr_large_step
 // CHECK-DAG:   %[[C37:.*]] = arith.constant 37 : i32
-// CHECK:       %[[WHILE:.*]]:2 = scf.while
-// CHECK-SAME:  : (i32, i32) -> (i32, i32)
 // CHECK:       } do {
 // CHECK:         %[[NEXT_OFF:.*]] = arith.addi %{{.*}}, %[[C37]] : i32
 // CHECK:         scf.yield %{{.*}}, %[[NEXT_OFF]] : i32, i32
@@ -322,14 +315,12 @@ module {
 }
 
 // CHECK-LABEL: tt.func public @while_tensor_ptr_addptr_step
-// CHECK-DAG:   %[[C4:.*]] = arith.constant 4 : i32
 // CHECK:       scf.while
-// CHECK-SAME:  i32
+// CHECK-SAME:  tensor<4xi32>
 // CHECK:       } do {
 // CHECK:         %[[STEP:.*]] = tt.splat %{{.*}} : i32 -> tensor<4xi32>
-// CHECK:         %[[NEXT_I:.*]] = arith.addi %{{.*}}, %{{.*}} : i32
-// CHECK:         %[[NEXT_OFF:.*]] = arith.addi %{{.*}}, %[[C4]] : i32
-// CHECK:         scf.yield %[[NEXT_I]], %[[NEXT_OFF]] : i32, i32
+// CHECK:         %[[NEXT_OFF:.*]] = arith.addi %{{.*}}, %[[STEP]] : tensor<4xi32>
+// CHECK:         scf.yield %{{.*}}, %[[NEXT_OFF]] : i32, tensor<4xi32>
 
 // -----
 
@@ -352,16 +343,14 @@ module {
 }
 
 // CHECK-LABEL: tt.func public @for_tensor_ptr_preserves_wide_loop_offset
-// CHECK:       %[[STEP32:.*]] = arith.constant 1 : i32
-// CHECK:       %[[INITIAL:.*]] = arith.constant 8 : i64
+// CHECK:       %[[STEP32:.*]] = tt.splat %{{.*}} : i32 -> tensor<4xi32>
 // CHECK:       %[[FOR:.*]] = scf.for
-// CHECK-SAME:  iter_args(%[[LOOP_OFFSET:.*]] = %[[INITIAL]]) -> (i64) {
-// CHECK:         %[[STEP64:.*]] = arith.extsi %[[STEP32]] : i32 to i64
-// CHECK:         %[[NEXT:.*]] = arith.addi %[[LOOP_OFFSET]], %[[STEP64]] : i64
-// CHECK:         scf.yield %[[NEXT]] : i64
-// CHECK:       } {PointerDescriptorBoundary = array<i32: 0>}
-// CHECK:       %[[TENSOR_OFFSET:.*]] = tt.splat %[[FOR]] : i64 -> tensor<4xi64>
-// CHECK:       tt.addptr %{{.*}}, %{{.*}} {{.*}}PointerDescriptorRebuild{{.*}} : tensor<4x!tt.ptr<f32>>, tensor<4xi64>
+// CHECK-SAME:  -> (tensor<4xi64>) {
+// CHECK:         %[[STEP64:.*]] = arith.extsi %[[STEP32]] : tensor<4xi32> to tensor<4xi64>
+// CHECK:         %[[NEXT:.*]] = arith.addi %{{.*}}, %[[STEP64]] : tensor<4xi64>
+// CHECK:         scf.yield %[[NEXT]] : tensor<4xi64>
+// CHECK:       }
+// CHECK:       tt.addptr %{{.*}}, %[[FOR]] : tensor<4x!tt.ptr<f32>>, tensor<4xi64>
 
 // -----
 
@@ -404,7 +393,7 @@ module {
 // CHECK:         %[[NEXT:.*]] = arith.addi %[[SELECTED]], %{{.*}} : i32
 // CHECK:         scf.yield %[[NEXT]] : i32
 // CHECK:       }
-// CHECK:       tt.make_tensor_ptr %{{.*}}, [%{{.*}}], [%{{.*}}], [%[[FOR]]] {{.*}}order = array<i32: 0>{{.*}} : <tensor<32xf16>>
+// CHECK:       tt.make_tensor_ptr %{{.*}}, [%{{.*}}], [%{{.*}}], [%[[FOR]]] {order = array<i32: 0>} : <tensor<32xf16>>
 
 // -----
 
@@ -450,7 +439,7 @@ module {
 // CHECK:         %[[NEXT:.*]] = arith.addi %[[SELECTED]], %{{.*}} : i32
 // CHECK:         scf.yield %{{.*}}, %[[NEXT]] : i32, i32
 // CHECK:       }
-// CHECK:       tt.make_tensor_ptr %{{.*}}, [%{{.*}}], [%{{.*}}], [%[[WHILE]]#1] {{.*}}order = array<i32: 0>{{.*}} : <tensor<32xf16>>
+// CHECK:       tt.make_tensor_ptr %{{.*}}, [%{{.*}}], [%{{.*}}], [%[[WHILE]]#1] {order = array<i32: 0>} : <tensor<32xf16>>
 
 // -----
 
@@ -484,21 +473,19 @@ module {
 // CHECK-LABEL: tt.func public @for_if_tensor_ptr_same_base_post_addptr
 // CHECK-DAG:   %[[C2:.*]] = arith.constant 2 : i32
 // CHECK-DAG:   %[[POST_STEP:.*]] = tt.splat %[[C2]] : i32 -> tensor<4xi32>
-// CHECK:       %[[FOR:.*]] = scf.for {{.*}} iter_args(%[[OFF:.*]] = %{{.*}}) -> (i32) {
-// CHECK:         %[[SELECTED:.*]] = scf.if %{{.*}} -> (i32) {
-// CHECK:           arith.addi %{{.*}}, %{{.*}} : i32
-// CHECK:           scf.yield %{{.*}} : i32
+// CHECK:       %[[FOR:.*]] = scf.for {{.*}} iter_args(%[[OFF:.*]] = %{{.*}}) -> (tensor<4xi32>) {
+// CHECK:         %[[SELECTED:.*]] = scf.if %{{.*}} -> (tensor<4xi32>) {
+// CHECK:           arith.addi %{{.*}}, %{{.*}} : tensor<4xi32>
+// CHECK:           scf.yield %{{.*}} : tensor<4xi32>
 // CHECK:         } else {
-// CHECK:           arith.addi %{{.*}}, %{{.*}} : i32
-// CHECK:           scf.yield %{{.*}} : i32
+// CHECK:           arith.addi %{{.*}}, %{{.*}} : tensor<4xi32>
+// CHECK:           scf.yield %{{.*}} : tensor<4xi32>
 // CHECK:         }
-// CHECK:         %[[NEXT:.*]] = arith.addi %[[SELECTED]], %{{.*}} : i32
-// CHECK:         scf.yield %[[NEXT]] : i32
+// CHECK:         %[[SELECTED_OFFSET:.*]] = arith.addi %{{.*}}, %[[SELECTED]] : tensor<4xi32>
+// CHECK:         %[[NEXT:.*]] = arith.addi %[[SELECTED_OFFSET]], %[[POST_STEP]] : tensor<4xi32>
+// CHECK:         scf.yield %[[NEXT]] : tensor<4xi32>
 // CHECK:       }
-// CHECK:       PointerDescriptorOffsetForm = "strided_1d"
-// CHECK-SAME:  PointerDescriptorRebuild
-
-// -----
+// CHECK:       tt.addptr %{{.*}}, %[[FOR]] : tensor<4x!tt.ptr<f32>>, tensor<4xi32>
 
 module {
   tt.func public @for_if_block_ptr_load_after_post_advance(%base: !tt.ptr<f16>, %cond: i1) -> tensor<32xf16> {
@@ -531,7 +518,7 @@ module {
 }
 
 // CHECK-LABEL: tt.func public @for_if_block_ptr_load_after_post_advance
-// CHECK:       %[[FOR:.*]]:2 = scf.for {{.*}} iter_args(%[[OFF:.*]] = %{{.*}}, %{{.*}} = %{{.*}})
+// CHECK:       %[[FOR:.*]]:2 = scf.for {{.*}} iter_args(%[[OFF:.*]] = %{{.*}}, %{{.*}} = %{{.*}}) -> (i32, tensor<32xf16>) {
 // CHECK:         %[[SELECTED:.*]] = scf.if %{{.*}} -> (i32) {
 // CHECK:           arith.addi %[[OFF]], %{{.*}} : i32
 // CHECK:           scf.yield %{{.*}} : i32
@@ -594,7 +581,7 @@ module {
 }
 
 // CHECK-LABEL: tt.func public @for_nested_if_block_ptr_load_after_post_advance
-// CHECK:       %[[FOR:.*]]:2 = scf.for {{.*}} iter_args(%[[OFF:.*]] = %{{.*}}, %{{.*}} = %{{.*}})
+// CHECK:       %[[FOR:.*]]:2 = scf.for {{.*}} iter_args(%[[OFF:.*]] = %{{.*}}, %{{.*}} = %{{.*}}) -> (i32, tensor<16xf32>) {
 // CHECK:         %[[SELECTED:.*]] = scf.if %{{.*}} -> (i32) {
 // CHECK:           %[[THEN_INNER:.*]] = scf.if %{{.*}} -> (i32) {
 // CHECK:             scf.yield %{{.*}} : i32
@@ -668,30 +655,28 @@ module {
 
 // CHECK-LABEL: tt.func public @for_nested_if_tensor_ptr_load_after_post_addptr
 // CHECK:       %[[FOR:.*]]:2 = scf.for
-// CHECK-SAME:  i32
-// CHECK:         %[[SELECTED:.*]] = scf.if %{{.*}} -> (i32) {
-// CHECK:           %[[THEN_INNER:.*]] = scf.if %{{.*}} -> (i32) {
-// CHECK:             scf.yield %{{.*}} : i32
+// CHECK-SAME:  tensor<4xi32>
+// CHECK:         %[[SELECTED:.*]] = scf.if %{{.*}} -> (tensor<4xi32>) {
+// CHECK:           %[[THEN_INNER:.*]] = scf.if %{{.*}} -> (tensor<4xi32>) {
+// CHECK:             scf.yield %{{.*}} : tensor<4xi32>
 // CHECK:           } else {
-// CHECK:             scf.yield %{{.*}} : i32
+// CHECK:             scf.yield %{{.*}} : tensor<4xi32>
 // CHECK:           }
-// CHECK:           PointerDescriptorOffsetForm = "strided_1d"
-// CHECK-SAME:      PointerDescriptorRebuild
-// CHECK:           scf.yield %[[THEN_INNER]] : i32
+// CHECK:           tt.addptr %{{.*}}, %[[THEN_INNER]] : tensor<4x!tt.ptr<f32>>, tensor<4xi32>
+// CHECK:           scf.yield %[[THEN_INNER]] : tensor<4xi32>
 // CHECK:         } else {
-// CHECK:           %[[ELSE_INNER:.*]] = scf.if %{{.*}} -> (i32) {
-// CHECK:             scf.yield %{{.*}} : i32
+// CHECK:           %[[ELSE_INNER:.*]] = scf.if %{{.*}} -> (tensor<4xi32>) {
+// CHECK:             scf.yield %{{.*}} : tensor<4xi32>
 // CHECK:           } else {
-// CHECK:             scf.yield %{{.*}} : i32
+// CHECK:             scf.yield %{{.*}} : tensor<4xi32>
 // CHECK:           }
-// CHECK:           PointerDescriptorOffsetForm = "strided_1d"
-// CHECK-SAME:      PointerDescriptorRebuild
-// CHECK:           scf.yield %[[ELSE_INNER]] : i32
+// CHECK:           tt.addptr %{{.*}}, %[[ELSE_INNER]] : tensor<4x!tt.ptr<f32>>, tensor<4xi32>
+// CHECK:           scf.yield %[[ELSE_INNER]] : tensor<4xi32>
 // CHECK:         }
-// CHECK:         arith.addi %{{.*}}, %{{.*}} : i32
+// CHECK:         arith.addi %{{.*}}, %{{.*}} : tensor<4xi32>
 // CHECK:         tt.addptr %{{.*}}, %{{.*}} : tensor<4x!tt.ptr<f32>>, tensor<4xi32>
 // CHECK:         %[[LOADED:.*]] = tt.load %{{.*}} : tensor<4x!tt.ptr<f32>>
-// CHECK:         scf.yield %{{.*}}, %[[LOADED]] : i32, tensor<4xf32>
+// CHECK:         scf.yield %{{.*}}, %[[LOADED]] : tensor<4xi32>, tensor<4xf32>
 // CHECK:       }
 // CHECK:       tt.return %[[FOR]]#1 : tensor<4xf32>
 
@@ -712,21 +697,16 @@ module {
   }
 }
 
-// CHECK-LABEL: tt.func public @if_block_ptr_same_base_dynamic_shape(
-// CHECK-SAME:  %[[BASE:[^ ,]+]]: !tt.ptr<f32>
-// CHECK:       %[[BASE_ADDRESS:.*]] = tt.ptr_to_int %[[BASE]]
+// CHECK-LABEL: tt.func public @if_block_ptr_same_base_dynamic_shape
 // CHECK:       %[[SHAPE:.*]] = scf.if %{{.*}} -> (i64) {
 // CHECK:         scf.yield %{{.*}} : i64
 // CHECK:       } else {
 // CHECK:         scf.yield %{{.*}} : i64
 // CHECK:       }
-// CHECK-NOT:   tt.int_to_ptr %[[BASE_ADDRESS]]
-// CHECK:       tt.make_tensor_ptr %[[BASE]], [%[[SHAPE]]], [%{{.*}}], [%{{.*}}] {PointerDescriptorRebuild, order = array<i32: 0>} : <tensor<16xf32>>
-
-// -----
+// CHECK:       tt.make_tensor_ptr %{{.*}}, [%[[SHAPE]]], [%{{.*}}], [%{{.*}}] {order = array<i32: 0>} : <tensor<16xf32>>
 
 module {
-  tt.func public @if_same_nested_result_fully_decoupled(%base: !tt.ptr<f32>, %cond0: i1, %cond1: i1) -> !tt.ptr<tensor<16xf32>> {
+  tt.func public @if_same_nested_result_not_decoupled(%base: !tt.ptr<f32>, %cond0: i1, %cond1: i1) -> !tt.ptr<tensor<16xf32>> {
     %c0_i32 = arith.constant 0 : i32
     %c1_i32 = arith.constant 1 : i32
     %c2_i32 = arith.constant 2 : i32
@@ -749,17 +729,19 @@ module {
   }
 }
 
-// CHECK-LABEL: tt.func public @if_same_nested_result_fully_decoupled
+// CHECK-LABEL: tt.func public @if_same_nested_result_not_decoupled
 // CHECK:       %[[INNER_OFF:.*]] = scf.if %{{.*}} -> (i32) {
 // CHECK:         scf.yield %{{.*}} : i32
 // CHECK:       } else {
 // CHECK:         scf.yield %{{.*}} : i32
 // CHECK:       }
-// CHECK:       scf.if %{{.*}} {
-// CHECK-NEXT:  } else {
-// CHECK-NEXT:  }
-// CHECK:       %[[OUTER_PTR:.*]] = tt.make_tensor_ptr %{{.*}}, [%{{.*}}], [%{{.*}}], [%[[INNER_OFF]]] {PointerDescriptorRebuild, order = array<i32: 0>}
-// CHECK:       tt.return %[[OUTER_PTR]] : !tt.ptr<tensor<16xf32>>
+// CHECK:       %[[INNER_PTR:.*]] = tt.make_tensor_ptr %{{.*}}, [%{{.*}}], [%{{.*}}], [%[[INNER_OFF]]] {order = array<i32: 0>} : <tensor<16xf32>>
+// CHECK:       %[[OUTER:.*]] = scf.if %{{.*}} -> (!tt.ptr<tensor<16xf32>>) {
+// CHECK:         scf.yield %[[INNER_PTR]] : !tt.ptr<tensor<16xf32>>
+// CHECK:       } else {
+// CHECK:         scf.yield %[[INNER_PTR]] : !tt.ptr<tensor<16xf32>>
+// CHECK:       }
+// CHECK:       tt.return %[[OUTER]] : !tt.ptr<tensor<16xf32>>
 
 // -----
 
@@ -788,13 +770,13 @@ module {
 }
 
 // CHECK-LABEL: tt.func public @if_mixed_block_and_tensor_ptr
-// CHECK:       %[[RESULT:.*]]:2 = scf.if %{{.*}} -> (i32, i32) {
-// CHECK:         scf.yield %{{.*}}, %{{.*}} : i32, i32
+// CHECK:       %[[RESULT:.*]]:2 = scf.if %{{.*}} -> (i32, tensor<4xi32>) {
+// CHECK:         scf.yield %{{.*}}, %{{.*}} : i32, tensor<4xi32>
 // CHECK:       } else {
-// CHECK:         scf.yield %{{.*}}, %{{.*}} : i32, i32
+// CHECK:         scf.yield %{{.*}}, %{{.*}} : i32, tensor<4xi32>
 // CHECK:       }
-// CHECK-DAG:   %[[BLOCK:.*]] = tt.make_tensor_ptr %{{.*}}, [%{{.*}}], [%{{.*}}], [%[[RESULT]]#0] {PointerDescriptorRebuild, order = array<i32: 0>} : <tensor<16xf16>>
-// CHECK-DAG:   %[[TENSOR:.*]] = tt.addptr %{{.*}}, %{{.*}} {{.*}}PointerDescriptorOffsetForm = "strided_1d"{{.*}}PointerDescriptorRebuild{{.*}} : tensor<4x!tt.ptr<f32>>, tensor<4xi32>
+// CHECK-DAG:   %[[BLOCK:.*]] = tt.make_tensor_ptr %{{.*}}, [%{{.*}}], [%{{.*}}], [%[[RESULT]]#0] {order = array<i32: 0>} : <tensor<16xf16>>
+// CHECK-DAG:   %[[TENSOR:.*]] = tt.addptr %{{.*}}, %[[RESULT]]#1 : tensor<4x!tt.ptr<f32>>, tensor<4xi32>
 // CHECK:       tt.return %[[BLOCK]], %[[TENSOR]] : !tt.ptr<tensor<16xf16>>, tensor<4x!tt.ptr<f32>>
 
 // -----
@@ -827,7 +809,7 @@ module {
 // CHECK-SAME:    -> (i32) {
 // CHECK:           scf.yield %{{.*}} : i32
 // CHECK:         }
-// CHECK:         %[[PTR:.*]] = tt.make_tensor_ptr %{{.*}}, [%{{.*}}], [%{{.*}}], [%[[FOR]]] {{.*}}order = array<i32: 0>{{.*}} : <tensor<16xf16>>
+// CHECK:         %[[PTR:.*]] = tt.make_tensor_ptr %{{.*}}, [%{{.*}}], [%{{.*}}], [%[[FOR]]] {order = array<i32: 0>} : <tensor<16xf16>>
 // CHECK:         tt.load %[[PTR]] : !tt.ptr<tensor<16xf16>>
 // CHECK:       }
 
@@ -860,16 +842,15 @@ module {
 }
 
 // CHECK-LABEL: tt.func public @sibling_if_result_initializes_for_tensor_ptr
-// CHECK:       %[[IF_OFFSETS:.*]] = scf.if %{{.*}} -> (i32) {
-// CHECK:         scf.yield %{{.*}} : i32
+// CHECK:       %[[IF_OFFSETS:.*]] = scf.if %{{.*}} -> (tensor<4xi32>) {
+// CHECK:         scf.yield %{{.*}} : tensor<4xi32>
 // CHECK:       } else {
-// CHECK:         scf.yield %{{.*}} : i32
+// CHECK:         scf.yield %{{.*}} : tensor<4xi32>
 // CHECK:       }
-// CHECK:       PointerDescriptorOffsetForm = "strided_1d"
-// CHECK-SAME:  PointerDescriptorRebuild
+// CHECK:       tt.addptr %{{.*}}, %[[IF_OFFSETS]] : tensor<4x!tt.ptr<f32>>, tensor<4xi32>
 // CHECK:       %[[FOR_OFFSETS:.*]] = scf.for
-// CHECK-SAME:  -> (i32) {
-// CHECK:         scf.yield %{{.*}} : i32
+// CHECK-SAME:  -> (tensor<4xi32>) {
+// CHECK:         scf.yield %{{.*}} : tensor<4xi32>
 // CHECK:       }
-// CHECK:       %[[FINAL:.*]] = tt.addptr %{{.*}}, %{{.*}} {{.*}}PointerDescriptorOffsetForm = "strided_1d"{{.*}}PointerDescriptorRebuild{{.*}} : tensor<4x!tt.ptr<f32>>, tensor<4xi32>
+// CHECK:       %[[FINAL:.*]] = tt.addptr %{{.*}}, %[[FOR_OFFSETS]] : tensor<4x!tt.ptr<f32>>, tensor<4xi32>
 // CHECK:       tt.return %[[FINAL]] : tensor<4x!tt.ptr<f32>>

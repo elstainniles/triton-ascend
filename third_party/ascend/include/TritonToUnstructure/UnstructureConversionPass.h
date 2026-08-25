@@ -107,9 +107,8 @@ private:
                         ArrayRef<OpFoldResult> sizes,
                         ArrayRef<OpFoldResult> strides) const;
   template <typename U = MemAccOpTy>
-  typename std::enable_if<std::is_same_v<U, triton::LoadOp>,
-                          LogicalResult>::type
-  splatAndLoadScenario(MemAccOpTy op, const PtrOffsetInfo &ptrOffsetInfo,
+  typename std::enable_if<std::is_same_v<U, triton::LoadOp>, void>::type
+  splatAndLoadScenario(MemAccOpTy op, int rank,
                        PatternRewriter &rewriter) const;
 
   template <typename... Args>
