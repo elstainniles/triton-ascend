@@ -556,13 +556,13 @@ void replacePtrArguments(triton::FuncOp funcOp,
                                                      forOp));
           });
     } else if (auto whileOp = dyn_cast<scf::WhileOp>(op)) {
-      // Keep ordinary While on the established relative-offset path.  Its
-      // before/after regions are analyzed again by convertTensorPtrPre after
-      // the clone, where the full boundary cache invalidation can observe the
-      // live backedge.  Complete i64 carriers are still selected for For and
-      // explicitly marked descriptor slots; applying the opaque fallback to
-      // every While here changes the two-region T2U contract before that
-      // reanalysis can run.
+      // Keep analyzable scalar pointers on the established relative-offset
+      // path. If any boundary edge has no stable base-plus-offset form, switch
+      // all scalar pointer edges atomically to complete i64 addresses so the
+      // before/after regions cannot acquire a mixed pointer/integer contract.
+      if (shouldPreserveScalarPointers(whileOp.getOperation(), rewriter,
+                                       offsetMap))
+        markOpaqueScalarPointerBoundary(whileOp.getOperation());
       SmallVector<Value> newInits = constructOperands(
           whileOp.getInits(), tempVar, mapping, rewriter, whileOp);
       newOp = rewriter.create<scf::WhileOp>(
