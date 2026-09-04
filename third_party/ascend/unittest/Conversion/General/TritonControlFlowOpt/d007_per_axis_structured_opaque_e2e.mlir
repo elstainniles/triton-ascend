@@ -153,7 +153,7 @@ module attributes {hacc.target = #hacc.target<"Ascend910B2">} {
 // E2E: return
 // E2E-LABEL: func.func @d007_rank2_mixed_uniform_loop
 // E2E: scf.for
-// E2E-NOT: tensor<2x4xi32>
+// E2E-SAME: iter_args(%{{.*}} = %{{.*}}) -> (i32)
 // E2E: memref.load
 // E2E: bufferization.materialize_in_destination
 // E2E: return
