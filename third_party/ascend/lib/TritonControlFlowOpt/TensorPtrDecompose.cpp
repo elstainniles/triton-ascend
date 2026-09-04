@@ -1854,8 +1854,8 @@ public:
       }
       bool preserveMixedUniform =
           hasMixedAxisKinds(resultKinds) && isPureUniformUpdate(*delta) &&
-          result->components[getOpaqueContributionComponent(rank)].type
-              .isa<RankedTensorType>();
+          isa<RankedTensorType>(
+              result->components[getOpaqueContributionComponent(rank)].type);
       if (preserveMixedUniform) {
         result->components[getUniformOffsetComponent(rank)] = {
             scalarType,
@@ -2265,7 +2265,7 @@ public:
             FailureOr<Value> opaque = castIntegerLike(
                 builder, addPtr.getLoc(),
                 result->components[getOpaqueContributionComponent(rank)],
-                *joinedOpaqueType);
+                joinedOpaqueType);
             if (failed(opaque))
               compatible = false;
             else
