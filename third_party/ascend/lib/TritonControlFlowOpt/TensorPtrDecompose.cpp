@@ -2094,8 +2094,13 @@ public:
     auto targetKinds =
         dyn_cast<DenseI32ArrayAttr>(targetAttributes[kAxisKindsAttribute]);
     unsigned rank = cast<RankedTensorType>(value.originalType).getRank();
-    if (!targetBase || !targetBase.getValue() || !targetKinds ||
-        targetKinds.size() != rank)
+    // Keep the base representation selected by analysis.  Loop normalization
+    // may use the compact mixed-uniform path only for scalar bases, but tensor
+    // bases must remain valid loop values and follow the regular normalization
+    // below instead of being rejected solely because the target attribute is
+    // false.
+    if (!targetBase || !targetKinds || targetKinds.size() != rank ||
+        targetBase.getValue() != hasScalarBase(value))
       return failure();
 
     SmallVector<AxisKind> kinds;
@@ -2107,7 +2112,7 @@ public:
     }
 
     bool preserveMixedUniform =
-        carriedComponents.size() == 1 &&
+        hasScalarBase(value) && carriedComponents.size() == 1 &&
         carriedComponents.front() == getUniformOffsetComponent(rank);
     if (failed(normalizeOffsetComponents(value, kinds, builder, loc,
                                          preserveMixedUniform)))
@@ -2251,6 +2256,8 @@ public:
             succeeded(deltaUniform)) {
           Value uniform = createIntegerAdd(builder, addPtr.getLoc(),
                                            *currentUniform, *deltaUniform);
+          SmallVector<Value> normalizedStrides;
+          normalizedStrides.reserve(rank);
           bool compatible = static_cast<bool>(uniform);
           for (unsigned axis = 0; axis < rank && compatible; ++axis) {
             FailureOr<Value> stride = castIntegerLike(
@@ -2259,8 +2266,9 @@ public:
               compatible = false;
               break;
             }
-            result->components[getStrideComponent(axis)] = *stride;
+            normalizedStrides.push_back(*stride);
           }
+          Value normalizedOpaque;
           if (compatible) {
             FailureOr<Value> opaque = castIntegerLike(
                 builder, addPtr.getLoc(),
@@ -2269,10 +2277,14 @@ public:
             if (failed(opaque))
               compatible = false;
             else
-              result->components[getOpaqueContributionComponent(rank)] =
-                  *opaque;
+              normalizedOpaque = *opaque;
           }
           if (compatible) {
+            for (unsigned axis = 0; axis < rank; ++axis)
+              result->components[getStrideComponent(axis)] =
+                  normalizedStrides[axis];
+            result->components[getOpaqueContributionComponent(rank)] =
+                normalizedOpaque;
             result->components[getUniformOffsetComponent(rank)] = uniform;
             result->originalType = value.getType();
             result->attributes[kAxisKindsAttribute] =
