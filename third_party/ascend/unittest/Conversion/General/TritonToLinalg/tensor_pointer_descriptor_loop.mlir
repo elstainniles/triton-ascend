@@ -1,6 +1,6 @@
 // RUN: triton-opt --triton-control-flow-opt %s -verify-each | FileCheck %s --check-prefix=CFO
 // RUN: triton-opt --triton-control-flow-opt --triton-to-unstructure %s -verify-each | FileCheck %s --check-prefix=T2U
-// RUN: triton-opt --triton-control-flow-opt --triton-to-unstructure --triton-to-linalg %s -verify-each | FileCheck %s --check-prefix=LINALG
+// RUN: triton-opt --triton-control-flow-opt --triton-to-unstructure --bubble-up-operation --triton-to-linalg %s -verify-each | FileCheck %s --check-prefix=LINALG
 
 module attributes {hacc.target = #hacc.target<"Ascend910B2">} {
   tt.func public @tensor_pointer_descriptor_loop(
@@ -54,6 +54,44 @@ module attributes {hacc.target = #hacc.target<"Ascend910B2">} {
     }
     tt.return
   }
+  // A pointer broadcast after opaque i64 row indexing must retain contiguous
+  // i32 columns. Keep the invariant rows outside the loop and load each row
+  // with a contiguous copy after advancing only a scalar uniform offset.
+  tt.func public @mixed_pointer_broadcast_load(
+      %base: !tt.ptr<f32>, %output: !tt.ptr<f32>,
+      %row_source: !tt.ptr<i64>, %upper: index) {
+    %c0 = arith.constant 0 : index
+    %c1 = arith.constant 1 : index
+    %delta = arith.constant dense<32> : tensor<2x32xi32>
+    %row_lanes = tt.make_range {end = 2 : i32, start = 0 : i32} : tensor<2xi32>
+    %row_base = tt.splat %row_source : !tt.ptr<i64> -> tensor<2x!tt.ptr<i64>>
+    %row_ptr = tt.addptr %row_base, %row_lanes : tensor<2x!tt.ptr<i64>>, tensor<2xi32>
+    %rows = tt.load %row_ptr : tensor<2x!tt.ptr<i64>>
+    %row_offsets = tt.expand_dims %rows {axis = 1 : i32} : tensor<2xi64> -> tensor<2x1xi64>
+    %base_tensor = tt.splat %base : !tt.ptr<f32> -> tensor<2x1x!tt.ptr<f32>>
+    %row_ptrs = tt.addptr %base_tensor, %row_offsets : tensor<2x1x!tt.ptr<f32>>, tensor<2x1xi64>
+    %broadcast = tt.broadcast %row_ptrs : tensor<2x1x!tt.ptr<f32>> -> tensor<2x32x!tt.ptr<f32>>
+    %range = tt.make_range {end = 32 : i32, start = 0 : i32} : tensor<32xi32>
+    %columns = tt.expand_dims %range {axis = 0 : i32} : tensor<32xi32> -> tensor<1x32xi32>
+    %column_offsets = tt.broadcast %columns : tensor<1x32xi32> -> tensor<2x32xi32>
+    %initial = tt.addptr %broadcast, %column_offsets : tensor<2x32x!tt.ptr<f32>>, tensor<2x32xi32>
+    %final = scf.for %iv = %c0 to %upper step %c1
+        iter_args(%pointer = %initial) -> (tensor<2x32x!tt.ptr<f32>>) {
+      %next = tt.addptr %pointer, %delta : tensor<2x32x!tt.ptr<f32>>, tensor<2x32xi32>
+      scf.yield %next : tensor<2x32x!tt.ptr<f32>>
+    }
+    %loaded = tt.load %final : tensor<2x32x!tt.ptr<f32>>
+    %out_row_range = tt.make_range {end = 2 : i32, start = 0 : i32} : tensor<2xi32>
+    %out_rows = tt.expand_dims %out_row_range {axis = 1 : i32} : tensor<2xi32> -> tensor<2x1xi32>
+    %out_stride = arith.constant dense<32> : tensor<2x1xi32>
+    %out_scaled_rows = arith.muli %out_rows, %out_stride : tensor<2x1xi32>
+    %out_row_offsets = tt.broadcast %out_scaled_rows : tensor<2x1xi32> -> tensor<2x32xi32>
+    %out_offsets = arith.addi %out_row_offsets, %column_offsets : tensor<2x32xi32>
+    %out_base = tt.splat %output : !tt.ptr<f32> -> tensor<2x32x!tt.ptr<f32>>
+    %out_ptrs = tt.addptr %out_base, %out_offsets : tensor<2x32x!tt.ptr<f32>>, tensor<2x32xi32>
+    tt.store %out_ptrs, %loaded : tensor<2x32x!tt.ptr<f32>>
+    tt.return
+  }
 }
 
 // CFO-LABEL: tt.func public @tensor_pointer_descriptor_loop
@@ -83,4 +121,24 @@ module attributes {hacc.target = #hacc.target<"Ascend910B2">} {
 // LINALG-LABEL: func.func @marked_affine_index_carrier
 // LINALG:       scf.for
 // LINALG-NOT:   triton_indirect_load
+// LINALG:       return
+
+// CFO-LABEL: tt.func public @mixed_pointer_broadcast_load
+// CFO:       tt.broadcast {{.*}} : tensor<2x1xi64> -> tensor<2x32xi64>
+// CFO-NOT:   arith.subi
+// CFO:       scf.for {{.*}} iter_args(%{{.*}} = %{{.*}}) -> (i64)
+// CFO:       scf.yield {{.*}} : i64
+// CFO:       PointerDescriptorStructuredAxes = array<i32: 0, 1>
+
+// T2U-LABEL: tt.func public @mixed_pointer_broadcast_load
+// T2U:       scf.for {{.*}} iter_args(%{{.*}} = %{{.*}}) -> (i64)
+// T2U:       tt.load {{.*}} : tensor<1x32x!tt.ptr<f32>>
+
+// LINALG-LABEL: func.func @mixed_pointer_broadcast_load
+// LINALG:       scf.for {{.*}} iter_args(%{{.*}} = %{{.*}}) -> (i64)
+// LINALG-NOT:   triton_indirect_load
+// LINALG-NOT:   memref.load
+// LINALG:       memref.copy
+// LINALG-NOT:   triton_indirect_load
+// LINALG-NOT:   memref.load
 // LINALG:       return
