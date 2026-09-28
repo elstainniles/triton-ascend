@@ -1324,6 +1324,9 @@ static void specializeFullRowCopies(ModuleOp moduleOp) {
     fastCopy->setOperand(0, mapping.lookupOrDefault(src.getSource()));
     fastCopy->setOperand(1, mapping.lookupOrDefault(dst.getSource()));
     loop->moveBefore(branch.elseBlock()->getTerminator());
+    // The A5 backend must be able to specialize the full-width library call
+    // independently of the dynamic tail call that shares its callee.
+    moduleOp->setAttr("tt.full_row_copy", rewriter.getUnitAttr());
   }
 }
 

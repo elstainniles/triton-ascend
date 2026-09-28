@@ -3,6 +3,7 @@
 // Full rows recover a static copy; the tail keeps the exact original extent.
 // The condition and allocation must stay outside both row loops.
 
+// CHECK: module attributes {{.*}}tt.full_row_copy
 // CHECK-LABEL: func.func @full_row_copy
 // CHECK: %[[BUFFER:.*]] = memref.alloc() : memref<32x64xf32>
 // CHECK: %[[FULL:.*]] = arith.cmpi eq,
@@ -42,6 +43,7 @@ module attributes {hacc.target = #hacc.target<"Ascend910B4">} {
 // -----
 
 // The source row may already have been hoisted. Cloning must reuse that value.
+// CHECK: module attributes {{.*}}tt.full_row_copy
 // CHECK-LABEL: func.func @invariant_source
 // CHECK: %[[SOURCE:.*]] = memref.reinterpret_cast
 // CHECK: scf.if
@@ -67,6 +69,8 @@ module attributes {hacc.target = #hacc.target<"Ascend910B4">} {
 
 // -----
 
+// CHECK: module attributes
+// CHECK-NOT: tt.full_row_copy
 // CHECK-LABEL: func.func @row_dependent_extent
 // CHECK-NOT: scf.if
 // CHECK: scf.for
