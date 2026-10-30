@@ -11,7 +11,7 @@ import threading
 from collections import namedtuple
 from pathlib import Path
 
-from .block_batching import (BatchingRejected, LayoutTargetRejected, BatchRequest, IMPLEMENTATION_VERSION,
+from .block_batching import (BatchingRejected, LayoutTargetRejected, IMPLEMENTATION_VERSION,
                              _capture_state, _freeze_source, _internal_backend_error, _layout_resource_refusal,
                              _runtime_positions)
 
@@ -194,6 +194,8 @@ def compile_auto_bundle(backend, src, options, compile_variant):
             raise BatchingRejected('SIMT_NOT_SUPPORTED')
         if backend_policy not in (None, 'torch_npu'):
             raise BatchingRejected('FRAMEWORK_NOT_VALIDATED')
+        if not hasattr(src, 'fn'):
+            raise BatchingRejected('AST_SOURCE_REQUIRED')
         positions = _runtime_positions(src)
         # Serialize the plan and refusal writes across independent JIT processes.
         lock_path = Path(cache.cache_dir) / 'auto-plan.lock'

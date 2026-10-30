@@ -1,14 +1,13 @@
 # Copyright (c) Huawei Technologies Co., Ltd. 2026. All rights reserved.
 """Host tests for resource rejection, exact artifact dispatch and bounded search."""
 from collections import namedtuple
-from pathlib import Path
 import subprocess
 from types import SimpleNamespace
 
 import pytest
 
 from triton.backends.ascend import block_batching_auto as auto
-from triton.backends.ascend.block_batching import BatchingRejected, BatchRequest, LayoutTargetRejected
+from triton.backends.ascend.block_batching import BatchingRejected, BatchRequest
 from triton.backends.ascend.compiler import NPUOptions
 
 pytestmark = pytest.mark.backend('native')
@@ -48,6 +47,22 @@ def test_planning_is_not_capped_at_four():
             for f in auto.FACTORS]
     assert [r['factor'] for r in auto.rank_candidates(rows, 256*1024)] == [2, 16, 8]
     assert auto.rank_candidates(rows, 0) == []
+
+
+def test_native_resource_summary_is_only_a_planning_estimate(tmp_path):
+    import json
+    from triton._C.libtriton import ascend
+    from test_block_batching_rewrite import parse, pointwise
+    module = parse(tmp_path, pointwise(0))
+    before = dict(ascend.passes.ttir.block_batching_resource_summary(module))
+    assert before['used_axes'] == [0]
+    assert before['largest_tensor_bytes'] == 16
+    assert not before['unknown_tensor_size'] and not before['is_allocation_bound']
+    report = dict(ascend.passes.ttir.rewrite_block_batching(module, 8, 0))
+    assert report['compile_status'] == 'REWRITTEN'
+    after = dict(ascend.passes.ttir.block_batching_resource_summary(module))
+    assert after['largest_tensor_bytes'] == 128
+    json.dumps(after)  # report and planning cache must be serializable
 
 
 class Cache:
