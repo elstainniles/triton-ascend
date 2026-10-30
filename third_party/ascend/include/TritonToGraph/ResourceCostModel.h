@@ -66,7 +66,7 @@ struct ResourceSnapshot {
                                        uint64_t reservedUBBytes = 0);
 
   static ResourceSnapshot
-  fromHardwareConfig(const ascend::HardwareConfig &hardware,
+  fromHardwareConfig(const mlir::ascend::HardwareConfig &hardware,
                      unsigned ubSafetyPercent = 80,
                      uint64_t reservedUBBytes = 0);
 };

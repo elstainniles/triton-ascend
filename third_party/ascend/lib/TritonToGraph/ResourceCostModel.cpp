@@ -286,7 +286,7 @@ ResourceSnapshot ResourceSnapshot::fromExplicit(uint64_t ubCapacity,
 }
 
 ResourceSnapshot
-ResourceSnapshot::fromHardwareConfig(const ascend::HardwareConfig &hardware,
+ResourceSnapshot::fromHardwareConfig(const mlir::ascend::HardwareConfig &hardware,
                                      unsigned safetyPercent,
                                      uint64_t reservedUB) {
 #if TRITON_ASCEND_HAS_INPROC_COSTMODEL
