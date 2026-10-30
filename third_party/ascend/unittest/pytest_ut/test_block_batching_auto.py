@@ -37,7 +37,7 @@ def test_auto_preserves_layout_and_has_separate_cache_identity():
 @pytest.mark.parametrize('grid,factor,cores,accepted', [
     ((2048, 1, 1), 4, 56, True), ((256, 1, 1), 2, 56, True),
     ((256, 1, 1), 4, 56, False), ((9, 100, 1), 4, 56, False),
-    ((1024, 1, 1), 4, 0, False), ((2**31-1, 2**31-1, 4), 2, 56, False)])
+    ((1024, 1, 1), 4, 0, False), ((2**31-1, 2**31-1, 5), 2, 56, False)])
 def test_dynamic_grid_policy(grid, factor, cores, accepted):
     assert auto.runtime_eligibility(grid, factor, 0, cores)[0] is accepted
 
@@ -61,7 +61,8 @@ def test_native_resource_summary_is_only_a_planning_estimate(tmp_path):
     report = dict(ascend.passes.ttir.rewrite_block_batching(module, 8, 0))
     assert report['compile_status'] == 'REWRITTEN'
     after = dict(ascend.passes.ttir.block_batching_resource_summary(module))
-    assert after['largest_tensor_bytes'] == 128
+    # The layout rewrite widens its 32-element address vector to i64.
+    assert after['largest_tensor_bytes'] == 256
     json.dumps(after)  # report and planning cache must be serializable
 
 
