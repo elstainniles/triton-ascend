@@ -249,7 +249,7 @@ def _freeze_source(backend, src, baseline_options, backend_revision):
     from triton._C.libtriton import ir
     from triton.compiler.compiler import ASTSource
     from triton.runtime.cache import get_cache_manager
-    if not isinstance(src, ASTSource):
+    if not isinstance(src, ASTSource) or hasattr(src, "block_batching_source_hash"):
         return src
     options = backend.parse_options(baseline_options)
     context = ir.context()
@@ -283,6 +283,9 @@ def _freeze_source(backend, src, baseline_options, backend_revision):
 
 
 def compile_bundle(backend, src, options, compile_variant):
+    if options.get("block_batching_auto", False):
+        from .block_batching_auto import compile_auto_bundle
+        return compile_auto_bundle(backend, src, options, compile_variant)
     import subprocess
     import hashlib
     from triton.compiler.errors import MLIRCompilationError

@@ -332,10 +332,8 @@ def _serialize_module(mod, opt):
     return mod.str_nodebug()
 
 
-def make_ttir(mod, metadata, opt):
-    if "hash" not in metadata:
-        metadata["hash"] = hashlib.sha256(f"{mod}-{metadata}".encode()).hexdigest()
-    # the same optimize pass for triton-ir as all other backends
+def block_batching_frontend_passes(mod):
+    """Shared normalization for candidate planning and actual compilation."""
     pm = ir.pass_manager(mod.context)
     pm.enable_debug()
     passes.common.add_inliner(pm)
@@ -348,6 +346,13 @@ def make_ttir(mod, metadata, opt):
     passes.common.add_licm(pm)
     passes.common.add_symbol_dce(pm)
     passes.ttir.add_loop_unroll(pm)
+    return pm
+
+
+def make_ttir(mod, metadata, opt):
+    if "hash" not in metadata:
+        metadata["hash"] = hashlib.sha256(f"{mod}-{metadata}".encode()).hexdigest()
+    pm = block_batching_frontend_passes(mod)
     if getattr(opt, "block_batching_factor", 1) > 1:
         # Rewrite only the candidate's normalized frontend IR. The bundle
         # controller retains an independently compiled original baseline.
@@ -1290,6 +1295,8 @@ class NPUOptions:
     instrumentation_mode: str = ""
     enable_graph_optimize: bool = True
     block_batching_factor: int = 1
+    block_batching_auto: bool = False
+    block_batching_auto_version: int = field(default=1, init=False)
     block_batching_axis: int = -1
     block_batching_layout: str = "auto"
     block_batching_implementation: int = field(default=IMPLEMENTATION_VERSION, init=False)
@@ -1416,11 +1423,15 @@ class NPUOptions:
 
     def __post_init__(self, arch, rule_mask):
         BatchRequest(self.block_batching_factor, self.block_batching_axis)
+        if type(self.block_batching_auto) is not bool:
+            raise ValueError("block_batching_auto must be bool")
+        if self.block_batching_auto and self.block_batching_factor != 1:
+            raise ValueError("block_batching_auto conflicts with explicit factor")
         if self.block_batching_layout not in ("auto", "semantic_only"):
             raise ValueError("block_batching_layout must be auto or semantic_only")
-        if self.block_batching_factor == 1:
+        if self.block_batching_factor == 1 and not self.block_batching_auto:
             object.__setattr__(self, "block_batching_layout", "semantic_only")
-        if self.block_batching_factor > 1:
+        if self.block_batching_factor > 1 or self.block_batching_auto:
             compiler_path, _ = _get_npucompiler_path()
             object.__setattr__(self, "block_batching_backend_revision", _batching_backend_revision(compiler_path))
         from triton.backends.ascend import _apply_ascend_patch

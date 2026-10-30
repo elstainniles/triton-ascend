@@ -19,6 +19,7 @@
 #include "ascend/include/TritonToGraph/GraphOptimization.h"
 #include "ascend/include/TritonToGraph/LayoutMemoryOptimization.h"
 #include "ascend/include/TritonToGraph/Passes.h"
+#include "ascend/include/TritonToGraph/ResourceCostModel.h"
 #include "ascend/include/TritonToHFusion/Passes.h"
 #include "ascend/include/TritonToHIVM/Passes.h"
 #include "ascend/include/TritonToLLVM/Passes.h"
@@ -38,7 +39,9 @@
 #include <pybind11/stl.h>
 
 #include <cstdint>
+#include <algorithm>
 #include <limits>
+#include <set>
 #include <string>
 
 #if TRITON_ASCEND_HAS_INPROC_COSTMODEL
@@ -62,6 +65,42 @@ namespace py = pybind11;
 using namespace mlir;
 
 void init_triton_ascend_passes_ttir(py::module &&m) {
+  m.def("block_batching_resource_summary", [](mlir::ModuleOp module) {
+    // Planning diagnostics only. The standard backend allocator remains the
+    // resource admission authority for every executable candidate.
+    uint64_t largest = 0;
+    bool unknown = false, controlFlow = false;
+    std::set<int> axes;
+    module.walk([&](Operation *op) {
+      if (auto pid = dyn_cast<triton::GetProgramIdOp>(op))
+        axes.insert(static_cast<int>(pid.getAxis()));
+      auto name = op->getName().getStringRef();
+      controlFlow |= name.starts_with("scf.") || name.starts_with("cf.");
+      for (Value value : op->getResults()) {
+        auto tensor = dyn_cast<RankedTensorType>(value.getType());
+        if (!tensor || isa<triton::PointerType>(tensor.getElementType()))
+          continue;
+        auto bytes = triton::cfg::getStaticTensorBytes(value.getType());
+        if (!bytes)
+          unknown = true;
+        else
+          largest = std::max(largest, *bytes);
+      }
+    });
+    auto live = triton::cfg::estimatePeakLiveBytes(module);
+    py::dict result;
+    py::list usedAxes;
+    for (int axis : axes)
+      usedAxes.append(axis);
+    result["used_axes"] = usedAxes;
+    result["has_control_flow"] = controlFlow;
+    result["largest_tensor_bytes"] = largest;
+    result["unknown_tensor_size"] = unknown;
+    result["float_live_estimate_known"] = live.known;
+    result["float_peak_live_bytes"] = live.peakLiveBytes;
+    result["is_allocation_bound"] = false;
+    return result;
+  });
   m.def("block_batching_registry", []() {
     py::list result;
     for (const auto &descriptor : mlir::triton::cfg::getBatchOpRegistry()) {

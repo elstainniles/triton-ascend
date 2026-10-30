@@ -692,7 +692,7 @@ index d4872a4..e9c8909 100644
 +    assert isinstance(target, GPUTarget), "target must be of GPUTarget type"
 +    backend = make_backend(target)
 +    hook = getattr(backend, "compile_bundle", None)
-+    if hook is not None and options and options.get("block_batching_factor", 1) != 1:
++    if hook is not None and options and (options.get("block_batching_auto", False) or options.get("block_batching_factor", 1) != 1):
 +        return hook(src, options, lambda variant, frozen_src=None: _compile(src if frozen_src is None else frozen_src, target, variant, _env_vars))
 +    return _compile(src, target, options, _env_vars)
 +
