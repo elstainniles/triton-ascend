@@ -549,6 +549,15 @@ def _run_linalg_to_npubin(compiler, monkeypatch, function_name, has_blacklist_op
         def has_device_limit(self):
             return False
 
+        def get_device_core(self):
+            return 28, 56
+
+        def get_aicore_num(self):
+            return 28
+
+        def get_aivector_core_num(self):
+            return 56
+
         def get_arch(self):
             return "Ascend910B"
 
