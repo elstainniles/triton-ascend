@@ -836,3 +836,29 @@ def test_success_without_candidate_object_is_internal(tmp_path, empty):
     output.write_bytes(b'vendor payload')
     vendor.require_candidate_binary(output, result)
     assert output.read_bytes() == b'vendor payload'
+
+
+@pytest.mark.parametrize("changed", [None, "variant", "plan_id", "candidate_factor", "requested_axis"])
+def test_selected_ttir_binds_to_the_exact_candidate(changed):
+    prepared = dict(
+        variant='candidate', digest='bytes', path='private.ttir',
+        report=dict(plan_id='candidate', owner='block_batching', compile_status='REWRITTEN', candidate_factor=2,
+                    requested_axis=-1, selected_axis=0))
+    options = SimpleNamespace(block_batching_factor=2, block_batching_axis=-1)
+    if changed is None:
+        worker._check_ttir(prepared, 'candidate', options)
+    else:
+        target = prepared if changed == 'variant' else prepared['report']
+        target[changed] = 'wrong'
+        with pytest.raises(worker.BatchCompileError) as error:
+            worker._check_ttir(prepared, 'candidate', options)
+        assert (error.value.kind, error.value.stage) == ('InvalidArtifact', 'ttir')
+
+
+def test_selected_ttir_rejects_changed_bytes_before_parsing(tmp_path):
+    path = tmp_path / 'selected.ttir'
+    path.write_bytes(b'replaced')
+    prepared = dict(variant='candidate', digest='original', path=str(path), report={})
+    with pytest.raises(worker.BatchCompileError) as error:
+        worker._restore_ttir(prepared, dict(hash='candidate'), None, tmp_path)
+    assert (error.value.kind, error.value.stage) == ('InvalidArtifact', 'ttir')

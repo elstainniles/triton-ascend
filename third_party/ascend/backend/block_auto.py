@@ -147,9 +147,10 @@ def compile_auto_bundle(backend, src, options, compile_variant, *, env_vars):
         except compilation.BatchCompileError as error:
             if error.kind != "Timeout":
                 raise
-            report = dict(selection=dict(factor=1, selected_axis=-1, selected_key="unmerged", reason="TTIR_SELECTION_TIMEOUT",
-                                         failure_kind=error.kind, candidates={}, model_complete=False, device_timing_used=False),
-                          plan=dict(candidates=[]), prepared=None)
+            report = dict(
+                selection=dict(factor=1, selected_axis=-1, selected_key="unmerged", reason="TTIR_SELECTION_TIMEOUT",
+                               failure_kind=error.kind, candidates={}, model_complete=False, device_timing_used=False),
+                plan=dict(candidates=[]), prepared=None)
         return _compile_selected(backend, frozen, common, baseline_options, compile_variant, env_vars, positions,
                                  contract, report, output)
 
@@ -186,8 +187,10 @@ def _compile_selected(backend, frozen, common, baseline_options, compile_variant
         values = dict(common, block_batching_factor=factor, block_batching_axis=requested_axis,
                       block_batching_grid=tuple(contract["grid"]))
         request = batching.BatchRequest(factor, requested_axis)
-        candidate = CandidateCompiler(backend, frozen, env_vars, prepared=dict(prepared, path=str(output))).compile(
-            baseline, values, request, positions, allow_layout_retry=False)
+        candidate = CandidateCompiler(backend, frozen, env_vars,
+                                      prepared=dict(prepared,
+                                                    path=str(output))).compile(baseline, values, request, positions,
+                                                                               allow_layout_retry=False)
         if candidate.candidate is None:
             declines.append(dict(key=key, reason=candidate.block_batching["reason"]))
             selection["reason"] = "BASELINE_AFTER_CANDIDATE_REJECTION"

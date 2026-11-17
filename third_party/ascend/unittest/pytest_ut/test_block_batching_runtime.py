@@ -394,6 +394,7 @@ def boundary(packaged_entries, bundle_environment, monkeypatch):  # noqa: F811
     monkeypatch.setattr(worker.CandidateCompiler, 'compile', observe_candidate)
     compile_fn = public(
         dict(make_backend=lambda _: backend, GPUTarget=object, _compile=single,
+             get_cache_invalidating_env_vars=lambda: dict(current),
              driver=SimpleNamespace(active=SimpleNamespace(get_current_target=lambda: target))))
     return SimpleNamespace(compile=compile_fn, jit=jit, cache_key=cache_key, backend=backend, target=target, src=source,
                            current=current, groups=groups, candidates=candidates, worker=worker)
@@ -411,6 +412,25 @@ def test_cold_and_cached_baseline_prove_exact_environment(boundary, submitted):
         assert b.candidates[-1] == (standard.hash, submitted)
         assert result.metadata == standard.metadata
     assert len(b.candidates) == 2 and len(b.groups) == 1
+
+
+@pytest.mark.parametrize('submitted', [None, {}, {'TRITON_ENABLE_ASAN': '1', 'CUSTOM_ENV': 'caller'}])
+def test_auto_hook_freezes_the_same_environment_for_selection_and_f1(boundary, submitted):
+    b = boundary
+    opts = {'block_batching_factor': 1, 'block_batching_axis': -1}
+    expected = dict(b.current if submitted is None else submitted)
+    standard = b.compile(b.src, options=opts, _env_vars=expected)
+
+    def select(src, options, compile_variant, *, env_vars):
+        b.current['COMPILER_ENV'] = 'changed after submission'
+        if submitted is not None:
+            submitted['CUSTOM_ENV'] = 'changed after submission'
+        assert env_vars == expected
+        return compile_variant(opts, src)
+
+    b.backend.compile_bundle = select
+    actual = b.compile(b.src, options={'block_batching_factor': 'auto'}, _env_vars=submitted)
+    assert actual.hash == standard.hash and actual.metadata == standard.metadata
 
 
 def test_unprovable_environment_falls_back_without_compiling_candidate(boundary):

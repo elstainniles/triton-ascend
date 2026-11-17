@@ -245,6 +245,20 @@ def test_compile_only_block_batching_requires_explicit_target_without_runtime_qu
         assert backend.parse_options(simt).hash() != backend.parse_options(changed).hash()
 
 
+def test_a3_auto_compile_only_uses_declared_core_counts(monkeypatch):
+    from triton import knobs
+    arch = 'Ascend910_9391'
+    backend = compiler.AscendBackend(GPUTarget('npu', arch, 32))
+    monkeypatch.setattr(compiler, 'NPUUtils', lambda: pytest.fail('queried a device for an explicit target'))
+    with knobs.ascend.scope():
+        knobs.ascend.compile_only = True
+        values = dict(block_batching_factor='auto', enable_graph_optimize=False)
+        with pytest.raises(ValueError, match='AIC/AIV'):
+            backend.prepare_block_compile_options(dict(values, block_compile_context=(arch, None, None, None)))
+        v = dict(values, block_compile_context=(arch, None, (False, 24, 48), None))
+        assert backend.prepare_block_compile_options(v) == v
+
+
 def test_empty_options_expose_all_legacy_names(backend):
     options = backend.parse_options({})
 
