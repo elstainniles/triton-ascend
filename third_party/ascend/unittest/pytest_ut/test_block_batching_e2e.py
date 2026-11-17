@@ -403,6 +403,35 @@ class TestCV:
     def batching_target(self, monkeypatch):
         require_batching_target(monkeypatch)
 
+    def test_auto_batch_handle_keeps_capture_and_alias_fallbacks(self):
+        cpu_a = torch.arange(4 * 32 * 32).reshape(4, 32, 32).remainder(7).float()
+        cpu_b = cpu_a.flip([2]).contiguous()
+        expected = cpu_a @ cpu_b
+        a, b = cpu_a.npu(), cpu_b.npu()
+        out = torch.empty_like(a)
+        constants = (32, 32, 32, 2, False, False, 32)
+        bundle = grouped_dot[(4, )](a, b, out, *constants, enable_hivm_batch_matmul=True)
+        torch.npu.synchronize()
+        assert bundle.block_auto_selection['selected_factor'] == 2
+        assert_applied(bundle, 2)
+        torch.testing.assert_close(out.cpu(), expected, rtol=0, atol=0)
+
+        # Reuse the same warmed handle: capture cannot compile or load F1.
+        launch = bundle[(4, 1, 1)]
+        out.zero_()
+        graph = torch.npu.NPUGraph()
+        with torch.npu.graph(graph):
+            launch(a, b, out, *constants)
+        assert bundle.last_launch['reason'] == 'CAPTURE_BASELINE'
+        graph.replay()
+        torch.npu.synchronize()
+        torch.testing.assert_close(out.cpu(), expected, rtol=0, atol=0)
+
+        launch(a, b, a, *constants)
+        torch.npu.synchronize()
+        assert bundle.last_launch['reason'] == 'WRITE_ALIAS'
+        torch.testing.assert_close(a.cpu(), expected, rtol=0, atol=0)
+
     @pytest.mark.parametrize('mode,loop,integer,k', [(0, False, False, 32), (1, False, False, 32),
                                                      (2, False, False, 32), (0, True, False, 63), (1, True, False, 63),
                                                      (2, True, False, 64), (2, True, False, 63), (2, False, False, 31),
