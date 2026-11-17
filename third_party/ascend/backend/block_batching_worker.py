@@ -16,7 +16,7 @@ import tempfile
 import time
 from uuid import uuid4
 
-_PROTOCOL = 1
+_PROTOCOL = 2
 _TIMEOUT = 600
 _TERMINATION_GRACE = 0.5
 _MAX_REPLY = 32 * 1024 * 1024
@@ -364,8 +364,9 @@ _active_attempt = ContextVar('ascend_batch_compiler_attempt', default=None)
 class _CandidateStages:
     """Child-only cache and stage binding for a single call to Triton's compiler."""
 
-    def __init__(self, source, directory, writer):
+    def __init__(self, source, directory, writer, prepared=None):
         self.source, self.directory, self.writer = source, directory, writer
+        self.prepared = prepared
         self.index_root = directory / 'core-cache'
         self.decline = None
         self.stop = Exception('candidate stage declined')
@@ -384,7 +385,10 @@ class _CandidateStages:
 
         def run(module, metadata):
             (self.directory / 'stage').write_text(ext)
-            result = stage(module, metadata)
+            if ext == 'ttir' and self.prepared is not None:
+                result = _restore_ttir(self.prepared, metadata, module.context, self.directory)
+            else:
+                result = stage(module, metadata)
             if isinstance(result, BatchDecline):
                 if result.stage != ext:
                     raise BatchCompileError('decline does not match the running stage', stage=ext)
@@ -435,28 +439,15 @@ def _worker_input(body, directory):
     return source, backend, options, normalized
 
 
-def _probe_selection(body, directory):
-    from triton._C.libtriton import ir
-    from .compiler import make_ttir
-    source, backend, _, normalized = _worker_input(body, directory)
-    context = ir.context()
-    ir.load_dialects(context)
-    backend.load_dialects(context)
-    module = source.make_ir(backend.target, normalized, backend.get_codegen_implementation(normalized),
-                            backend.get_module_map(), context)
-    metadata = dict(vars(normalized), hash=body['variant'])
-    result = make_ttir(module, metadata, normalized)
-    if isinstance(result, BatchDecline):
-        return 'NotApplicable', result.payload()
-    return 'Success', dict(report=metadata['block_batching'])
-
-
 def _compile(body, directory):
     from dataclasses import asdict
     from triton import knobs
     from triton.compiler.compiler import _compile as compile_single
     from triton.runtime.cache import FileCacheManager
-    source, backend, options, _ = _worker_input(body, directory)
+    source, backend, options, normalized = _worker_input(body, directory)
+    prepared = body.get('prepared')
+    if prepared is not None:
+        _check_ttir(prepared, body['variant'], normalized)
     target = backend.target
     cache = FileCacheManager(body['stage_key'])
     stage_dir = Path(cache.cache_dir).resolve()
@@ -467,7 +458,8 @@ def _compile(body, directory):
             timings.update(asdict(kwargs['times']))
 
         knobs.compilation.listener = collect
-    candidate = _CandidateStages(source, directory, cache).compile(compile_single, target, options, body['env_vars'])
+    candidate = _CandidateStages(source, directory, cache, prepared).compile(compile_single, target, options,
+                                                                             body['env_vars'])
     if isinstance(candidate, BatchDecline):
         return 'NotApplicable', candidate.payload()
     if candidate.hash != body['variant']:
@@ -487,13 +479,14 @@ def _worker():
             raise ValueError('invalid request identity')
         if operation == 'compile':
             status, payload = _compile(body, directory)
-        elif operation == 'selection_probe':
-            status, payload = _probe_selection(body, directory)
         elif operation in ('analyze', 'probe'):
             status, payload = _native_report(operation, body, directory)
         elif operation == 'select':
-            from .block_auto import _native
-            status, payload = 'Success', dict(report=_native('rank', body['contract'], candidates=body['candidates']))
+            from .block_auto import _select_ttir
+            source, backend, options, _ = _worker_input(body, directory)
+            report = _select_ttir(backend, source, options, body['env_vars'], body['contract'],
+                                  body['scalar_arguments'], Path(body['output']))
+            status, payload = 'Success', dict(report=report)
         else:
             raise ValueError('unknown worker operation')
     except Exception as error:
@@ -539,29 +532,56 @@ def _worker_request(backend, source, options, env_vars, variant):
                 autotuning_knobs=_knob_overrides(knobs.autotuning), propagate_env=knobs.propagate_env)
 
 
-def selection_probe(backend, frozen, options, env_vars):
-    """Run the selector's normal TTIR preparation and proof in an isolated interpreter."""
-    normalized = backend.parse_options(dict(options))
-    variant = _variant_key(frozen, backend, normalized, env_vars)
-    outcome = _attempt('selection_probe', _worker_request(backend, frozen, options, env_vars, variant))
-    if outcome.status == 'NotApplicable':
-        if outcome.payload.get('stage') != 'ttir':
-            raise BatchCompileError('invalid selector probe refusal stage', kind='ProtocolError')
-        return BatchDecline(**outcome.payload)
-    report = outcome.payload['report']
-    axis = report.get('selected_axis')
-    if (report.get('compile_status') != 'REWRITTEN' or report.get('owner') != 'block_batching'
-            or report.get('plan_id') != variant or report.get('candidate_factor') != normalized.block_batching_factor
-            or type(axis) is not int or axis not in (0, 1, 2)
-            or normalized.block_batching_axis >= 0 and axis != normalized.block_batching_axis):
-        raise BatchCompileError('invalid selector probe identity', kind='ProtocolError')
-    return report
-
-
 def _cacheable_decline(payload):
     return (isinstance(payload, dict) and payload.keys() <= {'reason', 'stage', 'analysis'}
             and payload.get('stage') == 'ttir' and payload.get('reason') in _CACHEABLE_DECLINES
             and ('analysis' not in payload or isinstance(payload['analysis'], dict)))
+
+
+def _candidate_cache(variant):
+    from triton.runtime.cache import get_cache_manager
+    return get_cache_manager(_digest(['batch_artifacts', _PROTOCOL, variant]))
+
+
+def _remember_decline(cache, variant, payload):
+    if _cacheable_decline(payload):
+        cache.put(json.dumps(dict(version=_PROTOCOL, variant=variant, decline=payload, digest=_digest(payload))),
+                  _DECLINE, binary=False)
+
+
+def _pack_ttir(module, metadata, output):
+    from triton._C.libtriton import ascend
+    data = ascend.serialize_block_input(module)
+    with output.open('xb') as stream:
+        stream.write(data)
+    return dict(variant=metadata['hash'], digest=hashlib.sha256(data).hexdigest(), report=metadata['block_batching'])
+
+
+def _check_ttir(prepared, variant, options):
+    """Bind the selected frontend to exactly the candidate being compiled."""
+    report = prepared['report']
+    if (prepared.keys() != {'variant', 'digest', 'path', 'report'} or prepared['variant'] != variant
+            or report.get('plan_id') != variant or report.get('compile_status') != 'REWRITTEN'
+            or report.get('owner') != 'block_batching'
+            or report.get('candidate_factor') != options.block_batching_factor
+            or report.get('requested_axis') != options.block_batching_axis
+            or report.get('selected_axis') not in (0, 1, 2)):
+        raise BatchCompileError('selected TTIR identity differs', kind='InvalidArtifact', stage='ttir')
+
+
+def _restore_ttir(prepared, metadata, context, directory):
+    from triton._C.libtriton import ir
+    if metadata['hash'] != prepared['variant']:
+        raise BatchCompileError('prepared TTIR cache identity differs', kind='InvalidArtifact', stage='ttir')
+    path = directory / 'selected.ttir'
+    data = Path(prepared['path']).read_bytes()
+    if hashlib.sha256(data).hexdigest() != prepared['digest']:
+        raise BatchCompileError('selected TTIR bytes changed', kind='InvalidArtifact', stage='ttir')
+    path.write_bytes(data)
+    module = ir.parse_mlir_module(str(path), context)
+    module.context = context
+    metadata['block_batching'] = prepared['report']
+    return module
 
 
 def _cached_decline(cache, variant):
@@ -581,21 +601,23 @@ def _cached_decline(cache, variant):
 class CandidateCompiler:
     """Own one bundle request and at most one resource-directed retry."""
 
-    def __init__(self, backend, source, env_vars):
+    def __init__(self, backend, source, env_vars, *, prepared=None):
         self.backend, self.source, self.env_vars = backend, source, dict(env_vars)
+        self.prepared = prepared
 
     def _variant(self, options, pending):
         from triton import knobs
         from triton.compiler.compiler import CompileTimer
-        from triton.runtime.cache import get_cache_manager
 
         listener = knobs.compilation.listener
         timer = CompileTimer() if listener else None
         normalized = self.backend.parse_options(dict(options))
         variant = _variant_key(self.source, self.backend, normalized, self.env_vars)
+        if self.prepared is not None:
+            _check_ttir(self.prepared, variant, normalized)
         # Old groups were published by _compile before contract binding. A distinct
         # index lets us ignore them without invalidating the independent F1 entry.
-        cache = get_cache_manager(_digest(['batch_artifacts', _PROTOCOL, variant]))
+        cache = _candidate_cache(variant)
         attempts = Path(cache.cache_dir).resolve() / 'attempts'
         name = self.source.name[:150]
         if Path(name).name != name or not name:
@@ -619,6 +641,8 @@ class CandidateCompiler:
                 return refusal, None
         generation = uuid4().hex
         body = _worker_request(self.backend, self.source, options, self.env_vars, variant)
+        if self.prepared is not None:
+            body['prepared'] = self.prepared
         body.update(stage_key=f'{cache.key}/attempts/{generation}', timing=bool(listener))
         stage_dir = attempts / generation
         stage_dir.mkdir(parents=True, exist_ok=False)
@@ -634,10 +658,7 @@ class CandidateCompiler:
             if refusal['reason'] in _RESOURCE_REASONS and (refusal.get('stage') != 'npubin'
                                                            or not isinstance(refusal.get('diagnostic'), str)):
                 raise BatchCompileError('invalid resource refusal evidence', kind='ProtocolError')
-            if _cacheable_decline(refusal):
-                cache.put(
-                    json.dumps(dict(version=_PROTOCOL, variant=variant, decline=refusal, digest=_digest(refusal))),
-                    _DECLINE, binary=False)
+            _remember_decline(cache, variant, refusal)
             return refusal, None
         manifest = outcome.payload['manifest']
         group = _checked_group(manifest, attempts / generation, variant, name)
@@ -647,11 +668,11 @@ class CandidateCompiler:
             raise BatchCompileError('invalid compilation timing record', kind='ProtocolError') from error
         return None, (cache, dict(generation=generation, manifest=manifest), group, variant, timings)
 
-    def compile(self, baseline, options, request, positions):
+    def compile(self, baseline, options, request, positions, *, allow_layout_retry=True):
         with ExitStack() as pending:
-            return self._compile_and_bind(baseline, options, request, positions, pending)
+            return self._compile_and_bind(baseline, options, request, positions, pending, allow_layout_retry)
 
-    def _compile_and_bind(self, baseline, options, request, positions, pending):
+    def _compile_and_bind(self, baseline, options, request, positions, pending, allow_layout_retry=True):
         from triton import knobs
         from triton.compiler.compiler import CompiledKernel, _notify_compilation_listener
         from .block_batching import BatchKernel, IMPLEMENTATION_VERSION
@@ -659,9 +680,9 @@ class CandidateCompiler:
         options = dict(options)
         decline, compiled = self._variant(options, pending)
         retry = None
-        if (decline and decline['reason'] == 'LAYOUT_TARGET_RESOURCE_REJECTED' and decline.get('stage') == 'npubin'
-                and decline.get('factor') == request.factor and decline.get('axis') == request.axis
-                and options.get('block_batching_layout', 'auto') == 'auto'):
+        if (allow_layout_retry and decline and decline['reason'] == 'LAYOUT_TARGET_RESOURCE_REJECTED'
+                and decline.get('stage') == 'npubin' and decline.get('factor') == request.factor
+                and decline.get('axis') == request.axis and options.get('block_batching_layout', 'auto') == 'auto'):
             retry = {key: decline[key] for key in ('reason', 'stage', 'diagnostic')}
             pending.close()
             decline, compiled = self._variant(dict(options, block_batching_layout='semantic_only'), pending)

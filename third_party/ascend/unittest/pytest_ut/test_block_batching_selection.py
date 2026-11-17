@@ -1,24 +1,336 @@
 # Copyright (c) Huawei Technologies Co., Ltd. 2026. All rights reserved.
-"""Automatic-selection orchestration, cache identity and JIT policy; CPU-only."""
+"""TTIR scoring, isolated selection and bounded backend compilation; CPU-only."""
+from block_batching_test_utils import assign_npu  # noqa: F401 - CPU-only fixture
 import importlib
-import subprocess
+import json
 import sys
+from pathlib import Path
 import tempfile
 import unittest
-import json
-import pytest
-from pathlib import Path
-from types import ModuleType, SimpleNamespace
-from unittest.mock import patch, Mock
-from block_batching_test_utils import assign_npu  # noqa: F401 - pytest fixtures
+from contextlib import ExitStack
+from types import SimpleNamespace, ModuleType
+from unittest.mock import Mock, patch
 
-pytestmark = pytest.mark.backend('native')
+from triton._C.libtriton import ascend, ir
+from triton.backends.ascend import block_batching as batching
+from triton.backends.ascend.compiler import AscendBackend
+from triton.backends.compiler import GPUTarget
 
-# Model bridge and cache
+
+class TestTtirAnalysis(unittest.TestCase):
+
+    def score(self, text, scalar_arguments=None, **options):
+        context = ir.context()
+        ir.load_dialects(context)
+        AscendBackend(GPUTarget("npu", "Ascend950", 32)).load_dialects(context)
+        with tempfile.TemporaryDirectory() as directory:
+            source = Path(directory) / "kernel.mlir"
+            source.write_text(text)
+            module = ir.parse_mlir_module(str(source), context)
+        request = dict(contract=dict(grid=[256, 1, 1]), factor=1, axis=-1, cv=False, arch="Ascend950", cores=56)
+        request.update(options)
+        if scalar_arguments is not None:
+            request["scalar_arguments"] = scalar_arguments
+        original = str(module)
+        result = json.loads(ascend.score_block_ttir(module, json.dumps(request)))
+        self.assertEqual(str(module), original)
+        return result
+
+    def test_dynamic_loop_declines_instead_of_assuming_one_iteration(self):
+        result = self.score('''module {
+          tt.func public @kernel(%n: index, %out: !tt.ptr<i32>) {
+            %zero = arith.constant 0 : index
+            %one = arith.constant 1 : index
+            scf.for %i = %zero to %n step %one {
+              %value = arith.addi %i, %one : index
+              %stored = arith.index_cast %value : index to i32
+              tt.store %out, %stored : !tt.ptr<i32>
+              scf.yield
+            }
+            tt.return
+          }
+        }''')
+        self.assertEqual(result["status"], "TTIR_MODEL_UNSUPPORTED")
+        self.assertIn("dynamic loop", result["error"])
+
+    def test_launch_scalar_specializes_loop_without_changing_executable_ir(self):
+        text = '''module {
+          tt.func public @kernel(%n: index, %out: !tt.ptr<i32>) {
+            %zero = arith.constant 0 : index
+            %one = arith.constant 1 : index
+            scf.for %i = %zero to %n step %one {
+              %stored = arith.index_cast %i : index to i32
+              tt.store %out, %stored : !tt.ptr<i32>
+            }
+            tt.return
+          }
+        }'''
+        result = self.score(text, [7, None])
+        self.assertEqual(result["status"], "TTIR_COST_ESTIMATED")
+        self.assertEqual(result["memory_requests"], 7)
+        self.assertFalse(result["loop_trip_upper_bound"])
+
+    def test_persistent_loop_uses_grid_range_for_worst_core(self):
+        result = self.score('''module {
+          tt.func public @kernel(%out: !tt.ptr<i32>) {
+            %pid = tt.get_program_id x : i32
+            %grid = tt.get_num_programs x : i32
+            %upper = arith.constant 1000 : i32
+            scf.for %i = %pid to %upper step %grid : i32 {
+              tt.store %out, %i : !tt.ptr<i32>
+            }
+            tt.return
+          }
+        }''')
+        self.assertEqual(result["status"], "TTIR_COST_ESTIMATED")
+        self.assertEqual(result["memory_requests"], 4)
+        self.assertTrue(result["loop_trip_upper_bound"])
+
+    def test_frontend_liveness_never_claims_final_ub_validation(self):
+        result = self.score('''module {
+          tt.func public @kernel(%x: tensor<128xf32>) {
+            %v = arith.mulf %x, %x : tensor<128xf32>
+            tt.return
+          }
+        }''')
+        self.assertEqual(result["status"], "TTIR_COST_ESTIMATED")
+        self.assertFalse(result["resource_checked"])
+
+    def test_equivalent_duplicate_expressions_have_the_same_cost(self):
+        template = '''module {
+          tt.func public @kernel(%x: tensor<128xf32>, %out: tensor<128x!tt.ptr<f32>>) {
+            %a = arith.mulf %x, %x : tensor<128xf32>
+            DUPLICATE
+            %sum = arith.addf %a, RHS : tensor<128xf32>
+            tt.store %out, %sum : tensor<128x!tt.ptr<f32>>
+            tt.return
+          }
+        }'''
+        shared = self.score(template.replace("DUPLICATE", "").replace("RHS", "%a"))
+        duplicate = self.score(
+            template.replace("DUPLICATE", "%b = arith.mulf %x, %x : tensor<128xf32>").replace("RHS", "%b"))
+        self.assertEqual(shared["status"], "TTIR_COST_ESTIMATED")
+        self.assertEqual(shared["score"], duplicate["score"])
+        self.assertEqual(shared["estimated_live_bytes"], duplicate["estimated_live_bytes"])
+
+    def test_scan_cost_accounts_for_retaining_all_prefix_values(self):
+        reduction = '''module {
+          tt.func public @kernel(%x: tensor<512xf32>, %out: !tt.ptr<f32>) {
+            %v = "tt.reduce"(%x) ({
+            ^bb0(%a: f32, %b: f32):
+              %c = arith.addf %a, %b : f32
+              tt.reduce.return %c : f32
+            }) {axis = 0 : i32} : (tensor<512xf32>) -> f32
+            tt.store %out, %v : !tt.ptr<f32>
+            tt.return
+          }
+        }'''
+        scan = '''module {
+          tt.func public @kernel(%x: tensor<512xf32>, %out: tensor<512x!tt.ptr<f32>>) {
+            %v = "tt.scan"(%x) ({
+            ^bb0(%a: f32, %b: f32):
+              %c = arith.addf %a, %b : f32
+              tt.scan.return %c : f32
+            }) {axis = 0 : i32, reverse = false} : (tensor<512xf32>) -> tensor<512xf32>
+            tt.store %out, %v : tensor<512x!tt.ptr<f32>>
+            tt.return
+          }
+        }'''
+        self.assertGreater(self.score(scan)["vector_work"], self.score(reduction)["vector_work"])
+
+    def test_small_dma_batches_do_not_charge_bytes_for_idle_tail_cores(self):
+
+        def candidate(factor):
+            size = 512 * factor
+            text = '''module {
+              tt.func public @kernel(%ptr: !tt.ptr<f32>) {
+                %r = tt.make_range {start = 0 : i32, end = SIZE : i32} : tensor<SIZExi32>
+                %p = tt.splat %ptr : !tt.ptr<f32> -> tensor<SIZEx!tt.ptr<f32>>
+                %q = tt.addptr %p, %r : tensor<SIZEx!tt.ptr<f32>>, tensor<SIZExi32>
+                %x = tt.load %q : tensor<SIZEx!tt.ptr<f32>>
+                %y = arith.mulf %x, %x : tensor<SIZExf32>
+                tt.store %q, %y : tensor<SIZEx!tt.ptr<f32>>
+                tt.return
+              }
+            }'''.replace("SIZE", str(size))
+            return self.score(text, factor=factor, axis=0)
+
+        original, merged = candidate(1), candidate(4)
+        self.assertEqual(original["status"], "TTIR_COST_ESTIMATED")
+        self.assertEqual(merged["status"], "TTIR_COST_ESTIMATED")
+        self.assertEqual(original["blocks"] * original["bytes_per_program"],
+                         merged["blocks"] * merged["bytes_per_program"])
+        self.assertLess(merged["score"], original["score"])
+
+    def test_batched_scans_retain_serial_helper_cost_per_row(self):
+
+        def candidate(factor):
+            shape = "512" if factor == 1 else f"{factor}x512"
+            axis = 0 if factor == 1 else 1
+            text = '''module {
+              tt.func public @kernel(%p: tensor<SHAPEx!tt.ptr<f32>>) {
+                %x = tt.load %p : tensor<SHAPEx!tt.ptr<f32>>
+                %y = "tt.scan"(%x) ({
+                ^bb0(%a: f32, %b: f32):
+                  %c = arith.addf %a, %b : f32
+                  tt.scan.return %c : f32
+                }) {axis = AXIS : i32, reverse = false} :
+                    (tensor<SHAPExf32>) -> tensor<SHAPExf32>
+                tt.store %p, %y : tensor<SHAPEx!tt.ptr<f32>>
+                tt.return
+              }
+            }'''.replace("SHAPE", shape).replace("AXIS", str(axis))
+            return self.score(text, factor=factor, axis=0)
+
+        original = candidate(1)
+        self.assertEqual(original["status"], "TTIR_COST_ESTIMATED")
+        for factor in (2, 4):
+            merged = candidate(factor)
+            self.assertEqual(merged["status"], "TTIR_COST_ESTIMATED")
+            self.assertGreater(merged["score"], original["score"])
+
+    def test_small_predicted_gain_remains_eligible(self):
+        request = dict(
+            action="rank_ttir", contract=dict(grid=[256, 1, 1]), candidates=[
+                dict(factor=1, axis=-1, status="TTIR_COST_ESTIMATED", score=100, cores=56, blocks=256),
+                dict(factor=4, axis=0, status="TTIR_COST_ESTIMATED", score=99.5, cores=56, blocks=64)
+            ])
+        result = json.loads(ascend.select_block_candidates(json.dumps(request)))
+        self.assertEqual(result["factor"], 4)
+
+    def test_missing_baseline_cost_forces_f1(self):
+        request = dict(
+            action="rank_ttir", contract=dict(grid=[256, 1, 1]), candidates=[
+                dict(factor=1, axis=-1, status="TTIR_MODEL_UNSUPPORTED"),
+                dict(factor=2, axis=0, status="TTIR_COST_ESTIMATED", score=1, cores=56, blocks=128)
+            ])
+        result = json.loads(ascend.select_block_candidates(json.dumps(request)))
+        self.assertEqual(result["factor"], 1)
+        self.assertFalse(result["model_complete"])
+
+    def test_a3_selects_a_proven_group_with_target_core_count(self):
+        text = """module { tt.func public @kernel(%out: !tt.ptr<i32>) {
+          %zero = arith.constant 0 : i32
+          tt.store %out, %zero : !tt.ptr<i32>
+          tt.return
+        }}"""
+        rows = []
+        for factor in (1, 2, 4):
+            row = self.score(text, arch="Ascend910_9391", cores=20, factor=factor, axis=-1 if factor == 1 else 0,
+                             cv=False, merge_kind="vv")
+            self.assertEqual(row["model"], "ttir-a3-grouping-v1")
+            rows.append(row)
+        result = json.loads(
+            ascend.select_block_candidates(
+                json.dumps(dict(action="rank_ttir", contract=dict(grid=[256, 1, 1]), candidates=rows))))
+        self.assertEqual(result["factor"], 2)
+        self.assertEqual(result["candidates"]["a0_f2"]["cores"], 20)
+
+    def test_missing_target_resources_cannot_use_a5_defaults(self):
+        result = self.score("module { tt.func public @kernel() { tt.return } }", cores=0)
+        self.assertEqual(result["status"], "TTIR_MODEL_UNSUPPORTED")
+
+
+class TestRankedRecovery(unittest.TestCase):
+
+    def run_selection(self, *, selected=4, decline=False, failure=None, arch="Ascend950"):
+        from triton.backends.ascend import block_auto as dispatch, block_batching_worker as worker
+        backend = Mock(target=GPUTarget("npu", arch, 32))
+        backend.parse_options.side_effect = lambda options: SimpleNamespace(block_batching_backend_revision="test", **
+                                                                            options)
+        source = SimpleNamespace(fn=SimpleNamespace(arg_names=["X"]))
+        baseline = SimpleNamespace(hash="f1")
+        events = []
+        env = {"TRITON_ENABLE_SANITIZER": "1", "NPU_DEVICE_LIMIT": "12,24"}
+
+        def compile_f1(*args):
+            events.append("f1")
+            return baseline
+
+        plan = dict(candidates=[dict(axis=0, factor=2), dict(axis=0, factor=4)])
+        key = "unmerged" if selected == 1 else f"a0_f{selected}"
+        selection = dict(factor=selected, selected_axis=-1 if selected == 1 else 0, selected_key=key,
+                         candidates={key: dict(factor=selected, axis=0, requested_axis=0)}, reason="TTIR_SELECTED")
+        prepared = None if selected == 1 else dict(report=dict(selected_axis=0))
+
+        def attempt(operation, body, *, timeout):
+            self.assertGreater(timeout, 0)
+            self.assertEqual(operation, "select")
+            self.assertEqual(body["env_vars"], env)
+            events.append("ttir")
+            if failure:
+                raise worker.BatchCompileError("worker failed", kind=failure, stage="select")
+            return SimpleNamespace(payload=dict(report=dict(selection=selection, plan=plan, prepared=prepared)))
+
+        def compile_candidate(baseline, options, request, positions, *, allow_layout_retry=True):
+            self.assertFalse(allow_layout_retry)
+            self.assertIn(request.factor, (2, 4))
+            events.append(request.factor)
+            return SimpleNamespace(candidate=None if decline else object(),
+                                   block_batching=dict(reason="VV_TARGET_RESOURCE_REJECTED"))
+
+        contract = dict(grid=[256, 1, 1], arguments=dict(X=dict(kind="tensor")))
+        options = dict(block_auto_contract=json.dumps(contract), block_batching_factor="auto")
+        with ExitStack() as stack:
+            for name, value in [("_freeze_refusal", None), ("_candidate_refusal", None), ("_runtime_positions", [0]),
+                                ("_freeze_source", Mock())]:
+                stack.enter_context(patch.object(worker, name, return_value=value))
+            stack.enter_context(patch.object(worker, "_variant_key", return_value="f1"))
+            stack.enter_context(
+                patch.object(worker, "_worker_request", side_effect=lambda b, s, o, e, v: dict(env_vars=e)))
+            stack.enter_context(patch.object(worker, "_attempt", side_effect=attempt))
+            stack.enter_context(patch.object(worker.CandidateCompiler, "compile", side_effect=compile_candidate))
+            stack.enter_context(patch.object(batching, "BatchKernel", return_value=SimpleNamespace()))
+            result = dispatch.compile_auto_bundle(backend, source, options, compile_f1, env_vars=env)
+        return result.block_auto_selection, events
+
+    def test_only_winner_and_f1_enter_backend(self):
+        result, events = self.run_selection()
+        self.assertEqual(events, ["ttir", "f1", 4])
+        self.assertEqual(result["selected_factor"], 4)
+
+    def test_baseline_winner_only_compiles_f1(self):
+        result, events = self.run_selection(selected=1)
+        self.assertEqual(events, ["ttir", "f1"])
+        self.assertEqual(result["selected_factor"], 1)
+
+    def test_rejected_winner_keeps_f1_without_compiling_runner_up(self):
+        result, events = self.run_selection(decline=True)
+        self.assertEqual(events, ["ttir", "f1", 4])
+        self.assertEqual(result["selected_factor"], 1)
+        self.assertEqual(result["reason"], "BASELINE_AFTER_CANDIDATE_REJECTION")
+
+    def test_a3_uses_the_selection_worker(self):
+        result, events = self.run_selection(arch="Ascend910_9391", selected=2)
+        self.assertEqual(events, ["ttir", "f1", 2])
+        self.assertEqual(result["selected_factor"], 2)
+
+    def test_abnormal_worker_exits_do_not_masquerade_as_declines(self):
+        from triton.backends.ascend.block_batching_worker import BatchCompileError
+        for kind in ("Signal", "InternalError"):
+            with self.subTest(kind=kind), self.assertRaises(BatchCompileError) as caught:
+                self.run_selection(failure=kind)
+            self.assertEqual(caught.exception.kind, kind)
+
+    def test_selection_timeout_keeps_retryable_f1(self):
+        result, events = self.run_selection(failure="Timeout")
+        self.assertEqual(events, ["ttir", "f1"])
+        self.assertEqual(result["failure_kind"], "Timeout")
+
+    def test_auto_does_not_retry_a_rejected_layout(self):
+        from triton.backends.ascend import block_batching_worker as worker
+        compiler = worker.CandidateCompiler(Mock(), Mock(), {})
+        decline = dict(reason="LAYOUT_TARGET_RESOURCE_REJECTED", stage="npubin", diagnostic="UB capacity exceeded",
+                       factor=4, axis=0)
+        with patch.object(compiler, "_variant", return_value=(decline, None)) as attempt, \
+             patch.object(worker, "rejected_bundle", return_value="fallback"):
+            result = compiler.compile(Mock(), dict(block_batching_layout="auto"), batching.BatchRequest(4, 0), [],
+                                      allow_layout_retry=False)
+        self.assertEqual(result, "fallback")
+        attempt.assert_called_once()
+
 
 BACKEND = Path(__file__).resolve().parents[2] / "backend"
-
-ENTRY_PACKAGE = "_block_auto_entry_test"
 
 
 def module(name, **values):
@@ -26,221 +338,6 @@ def module(name, **values):
     result.__dict__.update(values)
     return result
 
-
-class TestModelBridge(unittest.TestCase):
-
-    def setUp(self):
-        patcher = patch.dict(sys.modules, {ENTRY_PACKAGE: module(ENTRY_PACKAGE, __path__=[str(BACKEND)])})
-        patcher.start()
-        self.addCleanup(patcher.stop)
-        self.bridge = importlib.import_module(ENTRY_PACKAGE + ".block_auto")
-
-    def test_probe_failure_reaches_native_planner_without_inventing_a_candidate(self):
-        requested = [dict(axis=0, factor=2), dict(axis=1, factor=4)]
-        reports = []
-
-        def probe(axis, factor):
-            reports.append((axis, factor))
-            if axis == 1:
-                raise ValueError("unsupported rewrite")
-            return dict(selected_axis=axis, requested_factor=factor)
-
-        result = dict(candidates=[requested[0]], reason="native decision")
-        with patch.object(self.bridge, "_native", side_effect=[dict(probes=requested), result]) as native:
-            self.assertEqual(self.bridge.candidate_plan(dict(grid=[8, 8, 1]), probe=probe), result)
-        self.assertEqual(reports, [(0, 2), (1, 4)])
-        self.assertEqual(len(native.call_args.kwargs["reports"]), 1)
-
-    def test_native_json_keeps_argument_order(self):
-        import json
-        binding = SimpleNamespace(select_block_candidates=lambda request: request)
-        with patch.dict(sys.modules, {"triton._C.libtriton": module("libtriton", ascend=binding)}):
-            result = self.bridge._native("prepare", dict(arguments={"z": {}, "a": {}}), candidates=[])
-        self.assertEqual(result["contract"]["argument_order"], ["z", "a"])
-        self.assertEqual(json.dumps(result["candidates"]), "[]")
-
-    def test_selection_deadline_falls_back_but_protocol_errors_propagate(self):
-        worker = importlib.import_module(ENTRY_PACKAGE + ".block_batching_worker")
-        artifacts = importlib.import_module(ENTRY_PACKAGE + ".block_auto_artifacts")
-        for kind in ("Timeout", "ProtocolError"):
-            with patch.object(artifacts, "load_resources", return_value={}), \
-                 patch.object(self.bridge, "_native", return_value=dict(candidates=[dict(needs_llvm=False)])), \
-                 patch.object(worker, "_attempt", side_effect=worker.BatchCompileError("test", kind=kind)) as attempt:
-                candidates = [dict(factor=1, axis=-1, kernel=object())]
-                if kind == "Timeout":
-                    factor, report = self.bridge.select_candidates(candidates, {})
-                    self.assertEqual(factor, 1)
-                    self.assertIn("budget", report["error"])
-                else:
-                    with self.assertRaises(worker.BatchCompileError):
-                        self.bridge.select_candidates(candidates, {})
-                self.assertEqual(attempt.call_args.kwargs["timeout"], 30)
-
-    def test_incomplete_resource_response_cannot_drop_a_candidate(self):
-        artifacts = importlib.import_module(ENTRY_PACKAGE + ".block_auto_artifacts")
-        with patch.object(artifacts, "load_resources", return_value={}), \
-             patch.object(self.bridge, "_native", return_value=dict(candidates=[])), \
-             patch.object(artifacts, "load_analysis") as analysis:
-            factor, report = self.bridge.select_candidates([dict(factor=1, axis=-1)], {})
-        self.assertEqual(factor, 1)
-        self.assertFalse(report["model_complete"])
-        self.assertIn("one state per candidate", report["error"])
-        analysis.assert_not_called()
-
-
-class LocalCache:
-
-    def __init__(self, directory):
-        self.cache_dir = str(directory)
-        directory.mkdir(parents=True, exist_ok=True)
-
-    def put(self, data, name, binary=False):
-        path = Path(self.cache_dir) / name
-        path.write_bytes(data if isinstance(data, bytes) else data.encode())
-        return str(path)
-
-    def get_file(self, name):
-        path = Path(self.cache_dir) / name
-        return str(path) if path.is_file() else None
-
-
-class TestModelCache(unittest.TestCase):
-
-    def setUp(self):
-        temporary = tempfile.TemporaryDirectory()
-        self.addCleanup(temporary.cleanup)
-        self.root = Path(temporary.name)
-        self.compiler = self.root / "bisheng"
-        self.compiler.touch()
-        self.compiler.with_name("llvm-link").touch()
-        self.keys = []
-        self.cache_module = module("cache", get_cache_manager=self.cache)
-        modules = {
-            ENTRY_PACKAGE: module(ENTRY_PACKAGE, __path__=[str(BACKEND)]), ENTRY_PACKAGE + ".utils":
-            module("utils", _get_bisheng_path=lambda: str(self.compiler)), "triton.runtime.cache": self.cache_module
-        }
-        patcher = patch.dict(sys.modules, modules)
-        patcher.start()
-        self.addCleanup(patcher.stop)
-        self.artifacts = importlib.import_module(ENTRY_PACKAGE + ".block_auto_artifacts")
-
-    def cache(self, key):
-        self.keys.append(key)
-        return LocalCache(self.root / "cache" / key)
-
-    def collect(self, key, text):
-        source = self.root / "temps"
-        source.mkdir(exist_ok=True)
-        (source / "module.hivm.opt.mlir").write_text("module {}")
-        (source / "kernel.ll").write_text(text)
-        metadata = {"hash": key}
-        evidence = self.artifacts.collect(source, self.compiler, metadata, cache_factory=self.cache)
-        self.assertEqual(evidence["status"], "COLLECTED")
-        metadata["block_auto_evidence"] = evidence
-        return SimpleNamespace(metadata=SimpleNamespace(_asdict=lambda: metadata),
-                               asm=dict(ttir="ttir", ttadapter="ir"))
-
-    def test_artifacts_use_candidate_cache_and_need_no_file_records(self):
-        first = self.collect("first", "first module")
-        second = self.collect("second", "second module")
-        self.compiler.write_text("new compiler installation")
-        for kernel, expected in ((first, "first module"), (second, "second module")):
-            resources = self.artifacts.load_resources(dict(factor=2, axis=0, kernel=kernel))
-            self.assertNotIn("llvm", resources)
-            self.assertEqual(resources["files"]["compiler"], dict(path=str(self.compiler)))
-            result = self.artifacts.load_analysis(resources, dict(vv=False, needs_llvm=False))
-            self.assertEqual(result["llvm"], expected)
-            self.assertFalse({"metadata", "files", "final_ir", "meta_library"}.intersection(result))
-            self.assertNotIn("llvm", resources)
-        self.assertEqual(self.keys, ["first", "second", "first", "second"])
-
-    def test_missing_cached_input_remains_unavailable(self):
-        kernel = self.collect("missing", "module")
-        (self.root / "cache/missing/block_auto_llvm.ll").unlink()
-        result = self.artifacts.load_resources(dict(factor=4, axis=1, kernel=kernel))
-        self.assertEqual(result["status"], "RESOURCE_UNCONFIRMED")
-        self.assertIn("cached model input unavailable", result["error"])
-        self.assertNotIn("metadata", result)
-
-    def test_optimizer_publishes_once_under_the_normal_candidate_key(self):
-        item = dict(metadata={"hash": "candidate"},
-                    files={"compiler": {"path": str(self.compiler)}, "llvm": {"path":
-                                                                              "candidate.ll"}}, meta_library='meta.bc')
-
-        def compile_cpu(command, **kwargs):
-            output = Path(command[command.index("-o") + 1])
-            output.write_text("optimized module")
-            self.assertEqual(kwargs["env"]["ASCEND_RT_VISIBLE_DEVICES"], "")
-
-        state = dict(vv=True, needs_llvm=True)
-        with patch.object(self.artifacts.subprocess, "run", side_effect=compile_cpu) as run:
-            for _ in range(2):
-                result = self.artifacts.load_analysis(item, state)
-                self.assertEqual(result["optimized_llvm"], "optimized module")
-                self.assertNotIn("llvm", result)
-        self.assertEqual(run.call_count, 2)
-        self.assertIn("-emit-llvm", run.call_args_list[0].args[0])
-        self.assertEqual(self.keys, ["candidate", "candidate"])
-
-    def test_optimizer_failure_does_not_publish_a_cache_entry(self):
-        item = dict(metadata={"hash": "failed"},
-                    files={"compiler": {"path": str(self.compiler)}, "llvm": {"path":
-                                                                              "candidate.ll"}}, meta_library='meta.bc')
-        for error in (OSError("optimizer failed"), subprocess.TimeoutExpired("bisheng", 30)):
-            with self.subTest(error=type(error).__name__), \
-                 patch.object(self.artifacts.subprocess, "run", side_effect=error):
-                result = self.artifacts.load_analysis(item, dict(vv=True, needs_llvm=True))
-            self.assertEqual(result["status"], "STATIC_ANALYSIS_UNSUPPORTED")
-            self.assertNotIn("optimized_llvm", result)
-            self.assertFalse((self.root / "cache/failed/block_auto_optimized.ll").exists())
-
-    def test_cv_and_a3_inputs_do_not_invoke_the_vv_optimizer(self):
-        files = {}
-        for role in ("llvm_aic", "llvm_aiv"):
-            path = self.root / (role + ".ll")
-            path.write_text(role + " body")
-            files[role] = dict(path=str(path))
-        with patch.object(self.artifacts.subprocess, "run") as run:
-            cv = self.artifacts.load_analysis(dict(files=files), dict(vv=False, needs_llvm=False))
-            a3 = self.artifacts.load_analysis(dict(files={}), dict(vv=True, needs_llvm=False, resource_policy=True))
-            rejected = dict(factor=4, axis=1, status="COMPILE_REJECTED", error="unsupported rewrite")
-            resources = self.artifacts.load_resources(rejected)
-            failed = self.artifacts.load_analysis(resources, dict(needs_llvm=False))
-        run.assert_not_called()
-        self.assertEqual((cv["llvm_aic"], cv["llvm_aiv"]), ("llvm_aic body", "llvm_aiv body"))
-        self.assertEqual(a3, dict(vv=True, needs_llvm=False, resource_policy=True))
-        self.assertEqual(failed, dict(rejected, needs_llvm=False))
-
-    def test_resource_loading_does_not_read_llvm_and_late_loss_rejects_analysis(self):
-        kernel = self.collect("late-loss", "module")
-        read_text = Path.read_text
-        reads = []
-
-        def read(path, *args, **kwargs):
-            reads.append(path.suffix)
-            return read_text(path, *args, **kwargs)
-
-        with patch.object(Path, "read_text", read):
-            resources = self.artifacts.load_resources(dict(factor=1, axis=-1, kernel=kernel))
-        self.assertEqual(reads, [".mlir"])
-        (self.root / "cache/late-loss/block_auto_llvm.ll").unlink()
-        result = self.artifacts.load_analysis(resources, dict(vv=False, needs_llvm=False))
-        self.assertEqual(result["status"], "STATIC_ANALYSIS_UNSUPPORTED")
-        self.assertNotIn("llvm", result)
-
-    def test_a3_requires_final_ir_but_not_unavailable_llvm(self):
-        source = self.root / "a3-temps"
-        source.mkdir()
-        metadata = dict(hash="a3", target=dict(arch="Ascend910_9391"))
-        collect = lambda: self.artifacts.collect(source, self.compiler, metadata, cache_factory=self.cache)
-        self.assertEqual(collect()["status"], "UNAVAILABLE")
-        (source / "module.hivm.opt.mlir").write_text("module {}")
-        evidence = collect()
-        self.assertEqual(evidence["status"], "COLLECTED")
-        self.assertEqual(set(evidence["files"]), {"final_ir"})
-
-
-# JIT and bundle integration
 
 PACKAGE = "_block_auto_private_test"
 
@@ -468,169 +565,3 @@ class TestHostIntegration(unittest.TestCase):
         with self.assertRaisesRegex(RuntimeError, "launch error"):
             self.run_handler()
         self.assertEqual(self.calls.count("launch"), 1)
-
-
-class TestCompileIntegration(unittest.TestCase):
-
-    def setUp(self):
-        self.events = []
-        self.baseline = SimpleNamespace(metadata=SimpleNamespace(mix_mode="aiv"))
-        self.frozen = object()
-        self.backend = SimpleNamespace(parse_options=lambda _: SimpleNamespace(block_batching_backend_revision="r"))
-        self.options = dict(block_batching_factor="auto", block_auto_contract=json.dumps(dict(grid=[256, 1, 1])))
-        self.bundle = SimpleNamespace(candidate=object(), block_batching=dict(selected_axis=0))
-        self.batching = module("batching", _core_floor=lambda: 0, BatchRequest=lambda: "F1",
-                               BatchKernel=lambda *args: SimpleNamespace(baseline=args[0], candidate=None))
-        self.patcher = patch.dict(sys.modules, {
-            PACKAGE: module(PACKAGE, __path__=[str(BACKEND)]),
-            PACKAGE + ".block_batching": self.batching,
-        })
-        self.patcher.start()
-        self.addCleanup(self.patcher.stop)
-        self.dispatch = self.model = importlib.import_module(PACKAGE + ".block_auto")
-        self.worker = importlib.import_module(PACKAGE + ".block_batching_worker")
-        self.manual = self.worker
-        compile_patch = patch.multiple(self.worker, _freeze_source=lambda *args: self.frozen,
-                                       _freeze_refusal=lambda normalized: None, _candidate_refusal=lambda *args: None,
-                                       _runtime_positions=lambda src: [], compile_bundle=self.manual_compile)
-        model_patch = patch.multiple(
-            self.model, select_candidates=self.select,
-            candidate_plan=lambda *args, **kw: dict(candidates=[dict(axis=1, factor=4),
-                                                                dict(axis=2, factor=4)]))
-        for patcher in (compile_patch, model_patch):
-            patcher.start()
-            self.addCleanup(patcher.stop)
-        environment = patch.object(self.worker, "_baseline_environment", return_value={})
-        self.environment = environment.start()
-        self.addCleanup(environment.stop)
-
-    def compile(self, options, frozen=None):
-        self.events.append((options, frozen))
-        self.assertEqual(options["block_batching_factor"], 1)
-        self.assertNotIn("block_auto_contract", options)
-        return self.baseline
-
-    def manual_compile(self, backend, frozen, options, compile_variant):
-        self.assertIs(frozen, self.frozen)
-        self.assertIs(compile_variant(dict(options, block_batching_factor=1), frozen), self.baseline)
-        self.events.append((options["block_batching_axis"], options["block_batching_factor"]))
-        if options["block_batching_factor"] == 2:
-            return SimpleNamespace(candidate=None, block_batching=dict(reason="RESOURCE_LIMIT"))
-        return self.bundle
-
-    def select(self, candidates, contract):
-        self.assertEqual(len(candidates), 3)
-        self.assertEqual(candidates[1]["status"], "COMPILE_REJECTED")
-        self.assertIs(candidates[2]["kernel"], self.bundle.candidate)
-        return 4, dict(selected_key="a0_f4", selected_axis=0, reason="LOWER_ESTIMATED_LATENCY")
-
-    def test_selection_returns_existing_manual_bundle_and_compiles_baseline_once(self):
-        result = self.dispatch.compile_auto_bundle(self.backend, object(), self.options, self.compile)
-        self.assertIs(result, self.bundle)
-        self.assertEqual(result.block_auto_selection["selected_factor"], 4)
-        self.assertEqual(self.events[1:], [(-1, 2), (-1, 4)])
-
-    def test_without_launch_contract_only_baseline_is_compiled(self):
-        self.assertIs(
-            self.dispatch.compile_auto_bundle(self.backend, object(), dict(block_batching_factor="auto"), self.compile),
-            self.baseline)
-        self.assertEqual(len(self.events), 1)
-
-    def test_vv_below_core_floor_skips_candidates_and_model(self):
-        self.batching._core_floor = lambda: 512
-        self.model.select_candidates = Mock(side_effect=AssertionError("no candidate to score"))
-        result = self.dispatch.compile_auto_bundle(self.backend, object(), self.options, self.compile)
-        self.assertEqual(len(self.events), 1)
-        self.assertEqual(result.block_auto_selection["reason"], "GRID_BELOW_CORE_FLOOR")
-
-    def test_all_candidates_declined_does_not_score_the_baseline(self):
-        self.manual.compile_bundle = lambda *args: SimpleNamespace(candidate=None, block_batching=
-                                                                   {"reason": "NO_PROGRAM_AXIS"})
-        self.model.select_candidates = Mock(side_effect=AssertionError("no candidate to score"))
-        result = self.dispatch.compile_auto_bundle(self.backend, object(), self.options, self.compile)
-        self.assertEqual(result.block_auto_selection["reason"], "NO_COMPILED_CANDIDATE")
-
-    def test_cv_uses_native_shortlist_and_preserves_selected_axis(self):
-        self.baseline.metadata.mix_mode = "mix"
-        bundle1 = SimpleNamespace(candidate=object(), block_batching=dict(selected_axis=1))
-        bundle2 = SimpleNamespace(candidate=object(), block_batching=dict(selected_axis=2))
-        self.manual.compile_bundle = lambda backend, frozen, options, compile: bundle1 if options["block_batching_axis"
-                                                                                                  ] == 1 else bundle2
-        self.model.select_candidates = lambda candidates, contract: (4, dict(selected_key="a2_f4", selected_axis=2))
-        result = self.dispatch.compile_auto_bundle(self.backend, object(), self.options, self.compile)
-        self.assertIs(result, bundle2)
-        self.assertEqual(len(result.block_auto_selection["candidate_plan"]["candidates"]), 2)
-
-    def test_modeled_freeze_decline_compiles_f1_from_original_source(self):
-        src = object()
-        self.manual._freeze_source = lambda *args: self.worker.BatchDecline("CUSTOM_CACHE_NOT_SUPPORTED", "freeze")
-        self.model.select_candidates = lambda candidates, contract: (1, dict(reason="BASELINE_ONLY"))
-        result = self.dispatch.compile_auto_bundle(self.backend, src, self.options, self.compile)
-        self.assertEqual(result.block_auto_selection["candidate_plan"],
-                         dict(candidates=[], reason="CUSTOM_CACHE_NOT_SUPPORTED"))
-        self.assertEqual(len(self.events), 1)
-        self.assertIs(self.events[0][1], src)
-
-    def test_cv_with_unproven_baseline_environment_does_not_probe(self):
-        self.baseline.metadata.mix_mode = "aic"
-        self.environment.return_value = None
-        self.model.candidate_plan = Mock(side_effect=AssertionError("unproven environment cannot probe"))
-        self.model.select_candidates = lambda candidates, contract: (1, dict(reason="BASELINE_ONLY"))
-        result = self.dispatch.compile_auto_bundle(self.backend, object(), self.options, self.compile)
-        self.assertEqual(result.block_auto_selection["candidate_plan"],
-                         dict(candidates=[], reason="BASELINE_ENVIRONMENT_NOT_PROVEN"))
-        self.model.candidate_plan.assert_not_called()
-        self.assertIs(result.baseline, self.baseline)
-
-    def test_cv_probe_passes_the_verified_snapshot_and_overrides_only_probe_options(self):
-        self.baseline.metadata.mix_mode = "mix"
-        env = {"SAVED_FLAG": "submitted"}
-        self.environment.return_value = env
-        probe = Mock(return_value={"selected_axis": 1, "requested_factor": 2})
-
-        def planner(contract, axis, probe):
-            self.assertEqual(probe(1, 2), {"selected_axis": 1, "requested_factor": 2})
-            return dict(candidates=[], reason="NO_CANDIDATES")
-
-        self.model.candidate_plan = planner
-        self.model.select_candidates = lambda candidates, contract: (1, dict(reason="BASELINE_ONLY"))
-        with patch.object(self.worker, "selection_probe", probe):
-            self.dispatch.compile_auto_bundle(self.backend, object(), dict(self.options, num_stages=3), self.compile)
-        probe.assert_called_once_with(
-            self.backend, self.frozen,
-            dict(num_stages=3, block_batching_factor=2, block_batching_axis=1, block_auto_collect=False,
-                 enable_graph_optimize=False, debug=False), env)
-        self.assertEqual(len(self.events), 1)
-
-    def test_cv_probe_distinguishes_worker_refusal_from_internal_errors(self):
-        args = (self.backend, self.frozen, {}, {}, 0, 2)
-        with patch.object(self.worker, "selection_probe",
-                          return_value=self.worker.BatchDecline("UNUSED_BATCH_AXIS", "ttir")):
-            with self.assertRaisesRegex(ValueError, "UNUSED_BATCH_AXIS"):
-                self.dispatch._probe(*args)
-        failure = self.worker.BatchCompileError("native failure", kind="CompilerCrash", stage="ttir")
-        with patch.object(self.worker, "selection_probe", side_effect=failure):
-            with self.assertRaises(self.worker.BatchCompileError) as raised:
-                self.dispatch._probe(*args)
-            self.assertIs(raised.exception, failure)
-        with patch.object(self.worker, "selection_probe", side_effect=ValueError("invalid serialized input")):
-            with self.assertRaisesRegex(self.worker.BatchCompileError, "invalid serialized input"):
-                self.dispatch._probe(*args)
-
-    def test_model_fallback_cannot_launch_a_rejected_merge(self):
-        self.model.select_candidates = lambda candidates, contract: (
-            1, dict(selected_key="unmerged", reason="MODEL_INCOMPLETE"))
-        result = self.dispatch.compile_auto_bundle(self.backend, object(), self.options, self.compile)
-        self.assertIs(result.baseline, self.baseline)
-        self.assertIsNone(result.candidate)
-
-    def test_candidate_internal_failure_is_not_silently_downgraded(self):
-        worker = importlib.import_module(PACKAGE + ".block_batching_worker")
-
-        def fail(*args):
-            raise worker.BatchCompileError("broken protocol", kind="ProtocolError")
-
-        self.manual.compile_bundle = fail
-        with self.assertRaises(worker.BatchCompileError):
-            self.dispatch.compile_auto_bundle(self.backend, object(), self.options, self.compile)
-        self.assertEqual(len(self.events), 1)

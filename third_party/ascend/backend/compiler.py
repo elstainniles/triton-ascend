@@ -902,9 +902,6 @@ def _finish_batch_compilation(metadata, opt, npu_compiler_path, bin_path, save_t
             return decline
         metadata["block_batching_binary_sha256"] = hashlib.sha256(Path(bin_path).read_bytes()).hexdigest()
         metadata["block_batching_plan_sha256"] = metadata["block_batching"]["guard"]["plan_fingerprint"]
-    if opt.block_auto_collect:
-        from .block_auto_artifacts import collect
-        metadata["block_auto_evidence"] = collect(save_temps, npu_compiler_path, metadata)
     return Path(bin_path).read_bytes()
 
 
@@ -1143,7 +1140,7 @@ def linalg_to_bin_enable_npu_compile_910_95(linalg: str, metadata, opt):
         if plan_memory_strategy is not None:
             _compile_option_list += [f"--plan-memory-strategy={plan_memory_strategy}"]
 
-        if opt.debug or opt.block_auto_collect:
+        if opt.debug:
             save_temps = _get_save_temps_dir(metadata["hash"]) if opt.debug else tmpdir
             _compile_option_list += [f"--save-temps={save_temps}"]
 
@@ -1180,8 +1177,7 @@ def linalg_to_bin_enable_npu_compile_910_95(linalg: str, metadata, opt):
         if Path(callback_path).is_file():
             __load_metadata_by_callback(callback_path, metadata)
 
-        return _finish_batch_compilation(metadata, opt, npu_compiler_path, bin_path,
-                                         save_temps if opt.debug or opt.block_auto_collect else None)
+        return _finish_batch_compilation(metadata, opt, npu_compiler_path, bin_path, save_temps if opt.debug else None)
 
 
 def linalg_to_bin_enable_npu_compile_A2_A3(linalg: str, metadata, opt):
@@ -1350,7 +1346,7 @@ def linalg_to_bin_enable_npu_compile_A2_A3(linalg: str, metadata, opt):
             _compile_option_list += ["--mlir-print-stacktrace-on-diagnostic"]
 
         save_temps = _get_save_temps_dir(metadata["hash"]) if opt.debug else tmpdir
-        if opt.debug or opt.block_auto_collect:
+        if opt.debug:
             _compile_option_list += [f"--save-temps={save_temps}"]
 
         masked_options = _masked_batch_compile_options(metadata, npu_compiler_path)
@@ -1487,7 +1483,6 @@ class NPUOptions:
     instrumentation_mode: str = ""
     enable_graph_optimize: bool = True
     block_auto_contract: Optional[str] = None
-    block_auto_collect: bool = False
     # Parent-resolved (architecture, graph core count, effective core limit,
     # SIMT stack bytes). Included in the normal option hash and worker request.
     block_compile_context: Optional[Tuple] = None
@@ -1976,12 +1971,12 @@ class AscendBackend(BaseBackend):
         import uuid
         return FileCacheManager(cache.key + "/attempts/" + uuid.uuid4().hex)
 
-    def compile_bundle(self, src, options, compile_variant):
+    def compile_bundle(self, src, options, compile_variant, *, env_vars=None):
         if options.get("block_batching_factor", 1) != 1:
             options = self.prepare_block_compile_options(options)
         if options.get("block_batching_factor") == "auto":
             from .block_auto import compile_auto_bundle
-            return compile_auto_bundle(self, src, options, compile_variant)
+            return compile_auto_bundle(self, src, options, compile_variant, env_vars=env_vars)
         from .block_batching_worker import compile_bundle
         return compile_bundle(self, src, options, compile_variant)
 
@@ -1989,11 +1984,14 @@ class AscendBackend(BaseBackend):
         """Resolve hardware inputs in the caller, before any candidate/cache lookup."""
         options = self.parse_options(dict(values))
         if options.block_compile_context is not None:
+            if values.get("block_batching_factor") == "auto" and options.block_compile_context[2] is None:
+                raise ValueError("automatic TTIR selection requires explicit AIC/AIV core counts")
             return dict(values, block_compile_context=options.block_compile_context)
         if knobs.ascend.compile_only:
             raise ValueError("compile-only block batching requires explicit block_compile_context")
         context = (self.target.arch, _graph_optimize_core_num(options) if options.enable_graph_optimize else None,
-                   _compile_device_limit(options) if options.compile_on_910_95 else None,
+                   _compile_device_limit(options)
+                   if options.compile_on_910_95 or values.get("block_batching_factor") == "auto" else None,
                    get_simt_stack_limit() if options.is_pure_simt else None)
         return dict(values, block_compile_context=context)
 
