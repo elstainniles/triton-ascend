@@ -230,9 +230,9 @@ class TestVV:
         torch.npu.synchronize()
         torch.testing.assert_close(out, x * 2 + 1, rtol=0, atol=0)
         if str(kernel.metadata.target.arch).startswith('Ascend910_93'):
-            assert kernel.block_auto_selection['model'] == 'jit-a3-resource-v1'
+            assert kernel.block_auto_selection['model'] == 'ttir-a3-grouping-v1'
             assert_applied(kernel, 2)
-            assert kernel.block_auto_selection['reason'] == 'A3_RESOURCE_SAFE_GROUPING'
+            assert kernel.block_auto_selection['reason'] == 'A3_TTIR_GROUPING'
 
     @pytest.mark.parametrize('explicit', [None, 'auto', 2])
     def test_autotune_batching_default_and_override(self, explicit):

@@ -5,9 +5,14 @@
 #include "llvm/ADT/StringRef.h"
 #include <string>
 
+namespace mlir {
+class ModuleOp;
+}
+
 namespace mlir::triton::ascend {
 // Host-only analysis: no kernel launch, tensor access or measured-time input.
 std::string selectBlockCandidates(llvm::StringRef request);
+std::string scoreBlockTtir(ModuleOp module, llvm::StringRef request);
 } // namespace mlir::triton::ascend
 
 #endif

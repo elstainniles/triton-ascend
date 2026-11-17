@@ -519,3 +519,54 @@ class TestSelectedDispatch(unittest.TestCase):
         self.assertEqual(self.dispatch(grid=3)['reason'], 'CV_GRID_NOT_DIVISIBLE')
         self.assertEqual(self.dispatch(capture=True)['reason'], 'CAPTURE_BASELINE')
         self.assertEqual(self.events, ['baseline', 'baseline'])
+
+
+class TestPreparedFallback(unittest.TestCase):
+
+    def setUp(self):
+        self.events = []
+
+        def kernel(role):
+            return SimpleNamespace(hash=role, metadata=SimpleNamespace(_asdict=lambda: {}), function=role,
+                                   packed_metadata=role, launch_metadata=lambda *args: None, _init_handles=Mock(),
+                                   _run=True, run=lambda *args: self.events.append((args[4], args[5])))
+
+        self.original = kernel("f1")
+        self.candidate = kernel("f2")
+        self.guard = Mock(return_value=(True, "PROVEN_AT_RUNTIME"))
+        with patch.object(guard_module, "RuntimeGuard", return_value=self.guard):
+            self.bundle = batching.BatchKernel(
+                self.original, self.candidate, batching.BatchRequest(2, 0),
+                dict(cv_mode="independent_batch_v1", selected_axis=0, lane_width=2, guard={}, owner="block_batching"),
+                [0], publish_manifest=False)
+        self.bundle.block_auto_selection = dict(selected_factor=2)
+
+    def dispatch(self, *, capture=False):
+        with patch.object(batching, "_capture_state", return_value=capture), \
+             patch.object(batching, "_core_floor", return_value=56):
+            self.bundle._dispatch(4, 1, 1, 0, None, None, None, None, None, 1234)
+
+    def test_eager_initialization_keeps_capture_fallback_ready(self):
+        with patch.object(batching, "_capture_state", return_value=False):
+            self.bundle._init_handles()
+        self.original._init_handles.assert_called_once()
+        self.candidate._init_handles.assert_called_once()
+        self.dispatch()
+        self.dispatch(capture=True)
+        self.assertEqual(self.events, [("f2", "f2"), ("f1", "f1")])
+
+    def test_alias_fallback_uses_the_complete_prepared_baseline(self):
+        self.guard.return_value = False, "WRITE_ALIAS"
+        self.dispatch()
+        self.dispatch()
+        self.assertEqual(self.events, [("f1", "f1"), ("f1", "f1")])
+        self.assertEqual(self.bundle.last_launch["applied_factor"], 1)
+
+    def test_candidate_load_resource_failure_uses_complete_f1(self):
+        from triton.runtime.errors import OutOfResources
+        self.candidate._init_handles.side_effect = OutOfResources(4096, 1024, "shared memory")
+        with patch.object(batching, "_capture_state", return_value=False):
+            self.bundle._init_handles()
+        self.dispatch()
+        self.assertIsNone(self.bundle.candidate)
+        self.assertEqual(self.events, [("f1", "f1")])
