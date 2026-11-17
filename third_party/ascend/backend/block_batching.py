@@ -182,7 +182,7 @@ class _BatchLaunchHandler:
         bind = None if warmup else lambda: fn.device_caches[device][4](*args, **kwargs)[0]
         grid = _annotate_launch_grid(kwargs, grid, bind=bind)
         if "block_batching_factor" not in fn.arg_names and kwargs.get("block_batching_factor", 1) != 1:
-            kwargs = backend.prepare_block_compile_options(kwargs)
+            kwargs = backend.prepare_block_compile_options(kwargs, cache=fn.device_caches[device][0])
         from .reuse.config import enabled
 
         if enabled():

@@ -1980,19 +1980,48 @@ class AscendBackend(BaseBackend):
         from .block_batching_worker import compile_bundle
         return compile_bundle(self, src, options, compile_variant)
 
-    def prepare_block_compile_options(self, values):
+    def prepare_block_compile_options(self, values, *, cache=None):
         """Resolve hardware inputs in the caller, before any candidate/cache lookup."""
+        key = None
+        if cache is not None and not knobs.compilation.always_compile:
+            # Only memoize target preparation, never the launch contract or its
+            # guards. The owning JIT cache scopes this state to a device and
+            # clears it with the executable handles. Full toolchain identity is
+            # still checked on compilation and persistent artifact lookup.
+            inputs = {k: v for k, v in values.items()
+                      if k in NPUOptions.__dataclass_fields__ and k not in
+                      ("block_auto_contract", "block_batching_grid")}
+            from .reuse.snapshot import encode, SourceNotSerializable
+            try:
+                token = json.dumps(encode(inputs), separators=(",", ":"))
+            except SourceNotSerializable:
+                pass  # Preserve the ordinary option validation for exotic inputs.
+            else:
+                key = ("block_compile_context", os.getpid(), str(self.target), token,
+                       knobs.ascend.compile_only, knobs.ascend.npu_compiler_path, knobs.cache.dir,
+                       os.getenv("NPU_DEVICE_LIMIT"), os.getenv("ASCEND_HOME_PATH"))
+                contexts = cache.get("block_compile_contexts", {})
+                if key in contexts:
+                    return dict(values, block_compile_context=contexts[key])
         options = self.parse_options(dict(values))
         if options.block_compile_context is not None:
             if values.get("block_batching_factor") == "auto" and options.block_compile_context[2] is None:
                 raise ValueError("automatic TTIR selection requires explicit AIC/AIV core counts")
-            return dict(values, block_compile_context=options.block_compile_context)
-        if knobs.ascend.compile_only:
-            raise ValueError("compile-only block batching requires explicit block_compile_context")
-        context = (self.target.arch, _graph_optimize_core_num(options) if options.enable_graph_optimize else None,
-                   _compile_device_limit(options)
-                   if options.compile_on_910_95 or values.get("block_batching_factor") == "auto" else None,
-                   get_simt_stack_limit() if options.is_pure_simt else None)
+            context = options.block_compile_context
+        else:
+            if knobs.ascend.compile_only:
+                raise ValueError("compile-only block batching requires explicit block_compile_context")
+            context = (self.target.arch, _graph_optimize_core_num(options) if options.enable_graph_optimize else None,
+                       _compile_device_limit(options)
+                       if options.compile_on_910_95 or values.get("block_batching_factor") == "auto" else None,
+                       get_simt_stack_limit() if options.is_pure_simt else None)
+        # A failed device query remains retryable. Pure-SIMT reads a mutable
+        # runtime configuration file, so it retains the existing refresh path.
+        if key is not None and not options.is_pure_simt and context[1] != 0:
+            contexts = cache.setdefault("block_compile_contexts", {})
+            if len(contexts) >= 16:
+                contexts.clear()
+            contexts[key] = context
         return dict(values, block_compile_context=context)
 
     def add_stages(self, stages, options, language):

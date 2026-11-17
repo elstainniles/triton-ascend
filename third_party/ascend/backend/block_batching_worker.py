@@ -605,7 +605,7 @@ class CandidateCompiler:
         self.backend, self.source, self.env_vars = backend, source, dict(env_vars)
         self.prepared = prepared
 
-    def _variant(self, options, pending):
+    def _variant(self, options, pending, *, cached_only=False):
         from triton import knobs
         from triton.compiler.compiler import CompileTimer
 
@@ -635,6 +635,8 @@ class CandidateCompiler:
                 raise BatchCompileError(f'invalid published index: {error}', kind='InvalidArtifact',
                                         stage='cache') from error
             return None, (cache, None, group, variant, timer.end() if timer else None)
+        if cached_only:
+            return None, None
         if not knobs.compilation.always_compile:
             refusal = _cached_decline(cache, variant)
             if refusal is not None:
@@ -668,17 +670,22 @@ class CandidateCompiler:
             raise BatchCompileError('invalid compilation timing record', kind='ProtocolError') from error
         return None, (cache, dict(generation=generation, manifest=manifest), group, variant, timings)
 
-    def compile(self, baseline, options, request, positions, *, allow_layout_retry=True):
+    def compile(self, baseline, options, request, positions, *, allow_layout_retry=True, cached_only=False):
         with ExitStack() as pending:
-            return self._compile_and_bind(baseline, options, request, positions, pending, allow_layout_retry)
+            return self._compile_and_bind(baseline, options, request, positions, pending, allow_layout_retry, cached_only)
 
-    def _compile_and_bind(self, baseline, options, request, positions, pending, allow_layout_retry=True):
+    def _compile_and_bind(self, baseline, options, request, positions, pending, allow_layout_retry=True, cached_only=False):
         from triton import knobs
         from triton.compiler.compiler import CompiledKernel, _notify_compilation_listener
         from .block_batching import BatchKernel, IMPLEMENTATION_VERSION
         from .block_batching_report import validated_candidate_report
         options = dict(options)
-        decline, compiled = self._variant(options, pending)
+        if cached_only:
+            decline, compiled = self._variant(options, pending, cached_only=True)
+            if compiled is None:
+                return None
+        else:
+            decline, compiled = self._variant(options, pending)
         retry = None
         if (allow_layout_retry and decline and decline['reason'] == 'LAYOUT_TARGET_RESOURCE_REJECTED'
                 and decline.get('stage') == 'npubin' and decline.get('factor') == request.factor

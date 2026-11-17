@@ -3,6 +3,7 @@
 from block_batching_test_utils import assign_npu  # noqa: F401 - CPU-only fixture
 import importlib
 import json
+import hashlib
 import sys
 from pathlib import Path
 import tempfile
@@ -231,9 +232,172 @@ class TestTtirAnalysis(unittest.TestCase):
         self.assertEqual(result["status"], "TTIR_MODEL_UNSUPPORTED")
 
 
+def selection_report(factor=2):
+    key = "unmerged" if factor == 1 else f"a0_f{factor}"
+    return dict(selection=dict(factor=factor, selected_axis=-1 if factor == 1 else 0, selected_key=key,
+                               model_complete=True, reason="LOWEST_TTIR_SCORE",
+                               candidates={key: dict(factor=factor, axis=0, requested_axis=0,
+                                                     status="TTIR_COST_ESTIMATED")}),
+                plan=dict(candidates=[dict(axis=0, factor=factor)]),
+                prepared=None if factor == 1 else dict(variant="candidate", digest=hashlib.sha256(b"ttir").hexdigest(),
+                                                      report=dict(selected_axis=0)))
+
+
+class TestSelectionCache(unittest.TestCase):
+
+    def setUp(self):
+        from triton import knobs
+        from triton.backends.ascend import block_auto
+        self.auto = block_auto
+        directory = tempfile.TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        self.root = Path(directory.name)
+        scope = knobs.cache.scope()
+        scope.__enter__()
+        self.addCleanup(scope.__exit__, None, None, None)
+        knobs.cache.dir = str(self.root / "cache")
+        self.body = dict(variant="source-target-options-env", contract=dict(grid=[256, 1, 1]),
+                         scalar_arguments=[123], target=dict(arch="Ascend950"), knobs={})
+        self.cache = block_auto._SelectionCache(self.body)
+        self.output = self.root / "selected.ttir"
+        self.output.write_bytes(b"ttir")
+
+    def test_decision_survives_new_cache_object_and_binds_full_request(self):
+        report = selection_report()
+        self.cache.store(report, self.output)
+        self.assertEqual(self.auto._SelectionCache(self.body).load(), report)
+        for field, value in (("variant", "changed"), ("contract", dict(grid=[128, 1, 1])),
+                             ("scalar_arguments", [124]), ("target", dict(arch="Ascend910_9391")),
+                             ("knobs", dict(debug=True))):
+            with self.subTest(field=field):
+                changed = self.auto._SelectionCache(dict(self.body, **{field: value}))
+                self.assertIsNone(changed.load())
+
+    def test_normal_f1_needs_no_snapshot(self):
+        report = selection_report(1)
+        self.cache.store(report, self.root / "absent")
+        self.assertEqual(self.cache.load(), report)
+
+    def test_corrupt_record_is_a_miss(self):
+        self.cache.store(selection_report(), self.output)
+        record = Path(self.cache.cache.get_file("block_auto.selection"))
+        for data in ("{", json.dumps(dict(version=99)),
+                     record.read_text().replace("LOWEST_TTIR_SCORE", "changed")):
+            record.write_text(data)
+            self.assertIsNone(self.cache.load())
+
+    def test_snapshot_is_checked_only_when_requested(self):
+        report = selection_report()
+        self.cache.store(report, self.output)
+        prepared = report["prepared"]
+        path = Path(self.cache.cache.get_file(f"selected-{prepared['digest']}.ttir"))
+        restored = self.root / "restored"
+        self.cache.restore_ttir(prepared, restored)
+        self.assertEqual(restored.read_bytes(), b"ttir")
+        path.write_bytes(b"corrupt")
+        self.assertEqual(self.cache.load(), report)
+        with self.assertRaises(self.auto._SelectionMiss):
+            self.cache.restore_ttir(prepared, restored)
+        path.unlink()
+        with self.assertRaises(self.auto._SelectionMiss):
+            self.cache.restore_ttir(prepared, restored)
+
+    def test_incomplete_models_and_unaudited_refusals_are_not_cached(self):
+        for change in ("model", "failure", "candidate", "decline"):
+            report = selection_report(1)
+            if change == "model":
+                report["selection"]["model_complete"] = False
+            elif change == "failure":
+                report["selection"]["failure_kind"] = "Timeout"
+            elif change == "candidate":
+                report["selection"]["candidates"]["unmerged"]["status"] = "TTIR_MODEL_UNSUPPORTED"
+            else:
+                report["plan"]["declines"] = [dict(axis=0, factor=2, stage="ttir", reason="UNSUPPORTED_BATCH_OP")]
+            self.assertFalse(self.auto._cacheable_selection(report))
+
+
+class TestCompileContextCache(unittest.TestCase):
+
+    def setUp(self):
+        from triton import knobs
+        from triton.backends.ascend import compiler
+        self.compiler, self.knobs = compiler, knobs
+        self.backend = compiler.AscendBackend(GPUTarget("npu", "Ascend950", 32))
+        self.cache = {}
+        self.options = dict(block_batching_factor="auto")
+        stack = ExitStack()
+        self.addCleanup(stack.close)
+        for group in (knobs.compilation, knobs.ascend, knobs.cache):
+            stack.enter_context(group.scope())
+        knobs.compilation.always_compile = False
+        knobs.ascend.compile_only = False
+        stack.enter_context(patch.dict("os.environ", NPU_DEVICE_LIMIT="28,56"))
+        self.cores = stack.enter_context(patch.object(compiler, "_graph_optimize_core_num", return_value=28))
+        self.limit = stack.enter_context(patch.object(compiler, "_compile_device_limit", return_value=(False, 28, 56)))
+        self.parse = stack.enter_context(patch.object(self.backend, "parse_options", wraps=self.backend.parse_options))
+
+    def prepare(self, options=None, cache=None):
+        return self.backend.prepare_block_compile_options(self.options if options is None else options,
+                                                          cache=self.cache if cache is None else cache)
+
+    def test_shapes_and_runtime_arguments_do_not_repeat_target_preparation(self):
+        first = self.prepare()
+        second = self.prepare(dict(self.options, size=512, block_auto_contract="new", block_batching_grid=(32, 1, 1)))
+        self.assertEqual(first["block_compile_context"], second["block_compile_context"])
+        self.assertEqual(second["size"], 512)
+        self.parse.assert_called_once()
+        self.limit.assert_called_once()
+
+    def test_device_cache_clear_and_configuration_changes_refresh(self):
+        self.prepare()
+        self.prepare(cache={})
+        self.cache.clear()
+        self.prepare()
+        with patch.dict("os.environ", NPU_DEVICE_LIMIT="14,28"):
+            self.prepare()
+        self.knobs.cache.dir += "-other"
+        self.prepare()
+        self.knobs.ascend.npu_compiler_path = "/other/compiler"
+        # The real option parser validates this executable; substitute only
+        # that parser while checking that the preparation cache misses.
+        parsed = self.parse.return_value = SimpleNamespace(block_compile_context=None, enable_graph_optimize=True,
+                                                          compile_on_910_95=True, is_pure_simt=False)
+        self.parse.side_effect = lambda _: parsed
+        self.prepare()
+        self.prepare(dict(self.options, enable_graph_optimize=False))
+        self.assertEqual(self.parse.call_count, 7)
+
+    def test_explicit_context_and_compile_only_retain_validation(self):
+        self.prepare()
+        self.knobs.ascend.compile_only = True
+        with self.assertRaisesRegex(ValueError, "explicit block_compile_context"):
+            self.prepare()
+        context = ("Ascend950", 14, (True, 14, 28), None)
+        self.assertEqual(self.prepare(dict(self.options, block_compile_context=context))["block_compile_context"], context)
+        with self.assertRaises(ValueError):
+            self.prepare(dict(self.options, block_compile_context=("Ascend950", 14, None, None)))
+
+    def test_failures_and_forced_compilation_remain_retryable(self):
+        self.limit.side_effect = ValueError("bad limit")
+        with self.assertRaisesRegex(ValueError, "bad limit"):
+            self.prepare()
+        self.assertEqual(self.cache, {})
+        self.limit.side_effect = None
+        self.cores.return_value = 0
+        self.prepare()
+        self.prepare()
+        self.assertEqual(self.cache, {})
+        self.cores.return_value = 28
+        self.prepare()
+        self.knobs.compilation.always_compile = True
+        self.prepare()
+        self.prepare()
+        self.assertEqual(self.parse.call_count, 6)
+
+
 class TestRankedRecovery(unittest.TestCase):
 
-    def run_selection(self, *, selected=4, decline=False, failure=None, arch="Ascend950"):
+    def run_selection(self, *, selected=4, decline=False, failure=None, arch="Ascend950", saved=None, binary_hit=True):
         from triton.backends.ascend import block_auto as dispatch, block_batching_worker as worker
         backend = Mock(target=GPUTarget("npu", arch, 32))
         backend.parse_options.side_effect = lambda options: SimpleNamespace(block_batching_backend_revision="test", **
@@ -250,7 +414,8 @@ class TestRankedRecovery(unittest.TestCase):
         plan = dict(candidates=[dict(axis=0, factor=2), dict(axis=0, factor=4)])
         key = "unmerged" if selected == 1 else f"a0_f{selected}"
         selection = dict(factor=selected, selected_axis=-1 if selected == 1 else 0, selected_key=key,
-                         candidates={key: dict(factor=selected, axis=0, requested_axis=0)}, reason="TTIR_SELECTED")
+                         candidates={key: dict(factor=selected, axis=0, requested_axis=0, status="TTIR_COST_ESTIMATED")},
+                         model_complete=True, reason="TTIR_SELECTED")
         prepared = None if selected == 1 else dict(report=dict(selected_axis=0))
 
         def attempt(operation, body, *, timeout):
@@ -262,16 +427,20 @@ class TestRankedRecovery(unittest.TestCase):
                 raise worker.BatchCompileError("worker failed", kind=failure, stage="select")
             return SimpleNamespace(payload=dict(report=dict(selection=selection, plan=plan, prepared=prepared)))
 
-        def compile_candidate(baseline, options, request, positions, *, allow_layout_retry=True):
+        def compile_candidate(baseline, options, request, positions, *, allow_layout_retry=True, cached_only=False):
             self.assertFalse(allow_layout_retry)
             self.assertIn(request.factor, (2, 4))
-            events.append(request.factor)
+            events.append("binary-hit" if cached_only else request.factor)
+            if cached_only and not binary_hit:
+                return None
             return SimpleNamespace(candidate=None if decline else object(),
                                    block_batching=dict(reason="VV_TARGET_RESOURCE_REJECTED"))
 
         contract = dict(grid=[256, 1, 1], arguments=dict(X=dict(kind="tensor")))
         options = dict(block_auto_contract=json.dumps(contract), block_batching_factor="auto")
         with ExitStack() as stack:
+            store = saved if saved is not None else Mock(load=lambda: None)
+            stack.enter_context(patch.object(dispatch, "_SelectionCache", return_value=store))
             for name, value in [("_freeze_refusal", None), ("_candidate_refusal", None), ("_runtime_positions", [0]),
                                 ("_freeze_source", Mock())]:
                 stack.enter_context(patch.object(worker, name, return_value=value))
@@ -288,6 +457,44 @@ class TestRankedRecovery(unittest.TestCase):
         result, events = self.run_selection()
         self.assertEqual(events, ["ttir", "f1", 4])
         self.assertEqual(result["selected_factor"], 4)
+
+    def test_cached_binary_does_not_start_worker_or_read_ttir(self):
+        saved = Mock()
+        saved.load.return_value = selection_report()
+        saved.restore_ttir.side_effect = AssertionError("binary hit must not read TTIR")
+        result, events = self.run_selection(selected=2, saved=saved)
+        self.assertEqual(events, ["f1", "binary-hit"])
+        self.assertEqual(result["selected_factor"], 2)
+        saved.store.assert_not_called()
+
+    def test_evicted_binary_uses_saved_ttir_without_reselection(self):
+        saved = Mock(load=lambda: selection_report())
+        result, events = self.run_selection(selected=2, saved=saved, binary_hit=False)
+        self.assertEqual(events, ["f1", "binary-hit", 2])
+        saved.restore_ttir.assert_called_once()
+
+    def test_evicted_binary_and_ttir_reselect(self):
+        from triton.backends.ascend import block_auto
+        saved = Mock(load=lambda: selection_report(), restore_ttir=Mock(side_effect=block_auto._SelectionMiss))
+        result, events = self.run_selection(selected=2, saved=saved, binary_hit=False)
+        self.assertEqual(events, ["f1", "binary-hit", "ttir", "f1", 2])
+        saved.store.assert_called_once()
+
+    def test_complete_f1_decision_is_cached_but_failures_are_not(self):
+        for options, stored in ((dict(selected=1), True), (dict(decline=True), False),
+                                (dict(failure="Timeout"), False)):
+            saved = Mock(load=lambda: None)
+            self.run_selection(saved=saved, **options)
+            self.assertEqual(saved.store.called, stored)
+
+    def test_forced_compile_ignores_decision_cache(self):
+        from triton import knobs
+        saved = Mock(load=Mock(side_effect=AssertionError("forced compile read selection cache")))
+        with knobs.compilation.scope():
+            knobs.compilation.always_compile = True
+            _, events = self.run_selection(saved=saved)
+        self.assertEqual(events, ["ttir", "f1", 4])
+        saved.store.assert_not_called()
 
     def test_baseline_winner_only_compiles_f1(self):
         result, events = self.run_selection(selected=1)
@@ -371,8 +578,9 @@ class TestHostIntegration(unittest.TestCase):
         capture = patch.object(self.batching, "_capture_state", return_value=False)
         self.capture = capture.start()
         self.addCleanup(capture.stop)
-        self.backend = SimpleNamespace(target=SimpleNamespace(arch="Ascend950"), prepare_block_compile_options=dict)
-        self.fn = SimpleNamespace(arg_names=["x", "size", "BLOCK"], device_caches={0: [None] * 4 + [self.bind]})
+        self.backend = SimpleNamespace(target=SimpleNamespace(arch="Ascend950"),
+                                       prepare_block_compile_options=lambda values, **_: dict(values))
+        self.fn = SimpleNamespace(arg_names=["x", "size", "BLOCK"], device_caches={0: [{}, None, None, None, self.bind]})
         self.kwargs = dict(block_batching_factor="auto", BLOCK=512)
         self.result = object()
 
@@ -435,7 +643,7 @@ class TestHostIntegration(unittest.TestCase):
         for factor in (1, 2, 4):
             context = ("Ascend950", 24 // factor, (True, 24 // factor, 48 // factor), None)
             self.backend.prepare_block_compile_options = Mock(
-                side_effect=lambda values: dict(values, block_compile_context=context))
+                side_effect=lambda values, **_: dict(values, block_compile_context=context))
             self.kwargs = dict(BLOCK=512, block_batching_axis=0)
             self.kwargs["block_batching_factor"] = factor
             self.calls.clear()
@@ -446,7 +654,8 @@ class TestHostIntegration(unittest.TestCase):
                 self.backend.prepare_block_compile_options.assert_not_called()
             else:
                 self.assertEqual(self.calls[0][0][1], dict(self.kwargs, block_compile_context=context))
-                self.backend.prepare_block_compile_options.assert_called_once_with(self.kwargs)
+                self.backend.prepare_block_compile_options.assert_called_once_with(self.kwargs,
+                                                                                   cache=self.fn.device_caches[0][0])
 
     def test_warmup_uses_the_same_contract_as_launch(self):
         self.kwargs.pop("block_batching_factor")

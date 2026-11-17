@@ -1,12 +1,82 @@
 # Copyright (c) Huawei Technologies Co., Ltd. 2026. All rights reserved.
 """TTIR selection in a CPU worker; only F1 and the winner reach the backend."""
 import json
+import hashlib
 from pathlib import Path
 import tempfile
 
 
 class _NotApplicable(ValueError):
     """A modeled compiler decline, not an unexpected frontend error."""
+
+
+class _SelectionMiss(Exception):
+    """A cached decision has neither a binary nor a usable TTIR snapshot."""
+
+
+def _cacheable_selection(report):
+    from .block_batching_worker import _cacheable_decline
+    selection = report["selection"]
+    # model_complete only guarantees a baseline score. Do not turn unmodeled
+    # candidates or unaudited refusals into a persistent F1 decision.
+    return (selection.get("model_complete") is True and not selection.get("failure_kind")
+            and all(row.get("status") == "TTIR_COST_ESTIMATED"
+                    for row in selection["candidates"].values())
+            and all(_cacheable_decline({k: v for k, v in decline.items() if k not in ("factor", "axis")})
+                    for decline in report["plan"].get("declines", ())))
+
+
+class _SelectionCache:
+    """Persist decisions separately from executable generations, using their full request identity."""
+
+    def __init__(self, body):
+        from triton.runtime.cache import get_cache_manager
+        from .block_batching_worker import _digest, _PROTOCOL
+        self.identity = _digest(["ttir_selection", 1, _PROTOCOL, body])
+        self.cache = get_cache_manager(self.identity)
+
+    def load(self):
+        from .block_batching_worker import _digest
+        path = self.cache.get_file("block_auto.selection")
+        if path is None:
+            return None
+        try:
+            record = json.loads(Path(path).read_bytes())
+            report = record["report"]
+            if (record == dict(version=1, identity=self.identity, report=report, digest=_digest(report))
+                    and _cacheable_selection(report)):
+                return report
+        except (OSError, ValueError, TypeError, KeyError, AttributeError):
+            pass  # Missing or stale decision metadata requires fresh selection.
+        return None
+
+    def restore_ttir(self, prepared, output):
+        # Called only after the executable cache misses. Content-addressed files
+        # remain valid when another process atomically publishes a newer index.
+        digest = prepared["digest"]
+        if (not isinstance(digest, str) or len(digest) != 64
+                or any(c not in "0123456789abcdef" for c in digest)):
+            raise _SelectionMiss()
+        path = self.cache.get_file(f"selected-{digest}.ttir")
+        try:
+            data = Path(path).read_bytes() if path is not None else None
+        except OSError:
+            data = None
+        if data is None or hashlib.sha256(data).hexdigest() != digest:
+            raise _SelectionMiss()
+        output.write_bytes(data)
+
+    def store(self, report, output):
+        from .block_batching_worker import _digest, BatchCompileError
+        prepared = report["prepared"]
+        if prepared is not None:
+            data = output.read_bytes()
+            if hashlib.sha256(data).hexdigest() != prepared["digest"]:
+                raise BatchCompileError("selected TTIR bytes changed", kind="InvalidArtifact", stage="select")
+            self.cache.put(data, f"selected-{prepared['digest']}.ttir", binary=True)
+        # FileCacheManager.put publishes atomically; the index is always last.
+        self.cache.put(json.dumps(dict(version=1, identity=self.identity, report=report, digest=_digest(report))),
+                       "block_auto.selection", binary=False)
 
 
 def _native(action, contract, **inputs):
@@ -116,6 +186,7 @@ def compile_auto_bundle(backend, src, options, compile_variant, *, env_vars):
     """Score all variants at TTIR; keep a complete, capture-ready F1 fallback."""
     from . import block_batching_worker as compilation
     from .block_batching_worker import BatchDecline, _variant_key
+    from triton import knobs
 
     common = {k: v for k, v in options.items() if k not in ("block_auto_contract", "block_batching_grid")}
     baseline_options = dict(common, block_batching_factor=1, block_batching_axis=-1)
@@ -139,8 +210,16 @@ def compile_auto_bundle(backend, src, options, compile_variant, *, env_vars):
     variant = _variant_key(frozen, backend, backend.parse_options(selection_options), env_vars)
     body = compilation._worker_request(backend, frozen, selection_options, env_vars, variant)
     body.update(contract=contract, scalar_arguments=scalar_arguments)
+    saved = None if knobs.compilation.always_compile else _SelectionCache(body)
     with tempfile.TemporaryDirectory(prefix="triton-selected-ttir-") as directory:
         output = Path(directory) / "selected.ttir"
+        report = saved.load() if saved is not None else None
+        if report is not None:
+            try:
+                return _compile_selected(backend, frozen, common, baseline_options, compile_variant, env_vars, positions,
+                                         contract, report, output, saved=saved)
+            except _SelectionMiss:
+                pass  # An evicted snapshot must not prevent normal compilation.
         body["output"] = str(output)
         try:
             report = compilation._attempt("select", body, timeout=30).payload["report"]
@@ -151,12 +230,17 @@ def compile_auto_bundle(backend, src, options, compile_variant, *, env_vars):
                 selection=dict(factor=1, selected_axis=-1, selected_key="unmerged", reason="TTIR_SELECTION_TIMEOUT",
                                failure_kind=error.kind, candidates={}, model_complete=False, device_timing_used=False),
                 plan=dict(candidates=[]), prepared=None)
-        return _compile_selected(backend, frozen, common, baseline_options, compile_variant, env_vars, positions,
-                                 contract, report, output)
+        # _compile_selected annotates the report when a candidate is rejected.
+        record = json.loads(json.dumps(report)) if saved is not None and _cacheable_selection(report) else None
+        result = _compile_selected(backend, frozen, common, baseline_options, compile_variant, env_vars, positions,
+                                   contract, report, output)
+        if record is not None and not result.block_auto_selection["compile_rejections"]:
+            saved.store(record, output)
+        return result
 
 
 def _compile_selected(backend, frozen, common, baseline_options, compile_variant, env_vars, positions, contract, report,
-                      output):
+                      output, *, saved=None):
     from . import block_batching as batching
     from .block_batching_worker import (BatchCompileError, CandidateCompiler, _variant_key, _candidate_cache,
                                         _remember_decline)
@@ -187,10 +271,14 @@ def _compile_selected(backend, frozen, common, baseline_options, compile_variant
         values = dict(common, block_batching_factor=factor, block_batching_axis=requested_axis,
                       block_batching_grid=tuple(contract["grid"]))
         request = batching.BatchRequest(factor, requested_axis)
-        candidate = CandidateCompiler(backend, frozen, env_vars,
-                                      prepared=dict(prepared,
-                                                    path=str(output))).compile(baseline, values, request, positions,
-                                                                               allow_layout_retry=False)
+        compiler = CandidateCompiler(backend, frozen, env_vars, prepared=dict(prepared, path=str(output)))
+        candidate = None
+        if saved is not None:
+            candidate = compiler.compile(baseline, values, request, positions, allow_layout_retry=False, cached_only=True)
+            if candidate is None:
+                saved.restore_ttir(prepared, output)
+        if candidate is None:
+            candidate = compiler.compile(baseline, values, request, positions, allow_layout_retry=False)
         if candidate.candidate is None:
             declines.append(dict(key=key, reason=candidate.block_batching["reason"]))
             selection["reason"] = "BASELINE_AFTER_CANDIDATE_REJECTION"
