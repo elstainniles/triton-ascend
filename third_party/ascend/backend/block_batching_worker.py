@@ -672,9 +672,11 @@ class CandidateCompiler:
 
     def compile(self, baseline, options, request, positions, *, allow_layout_retry=True, cached_only=False):
         with ExitStack() as pending:
-            return self._compile_and_bind(baseline, options, request, positions, pending, allow_layout_retry, cached_only)
+            return self._compile_and_bind(baseline, options, request, positions, pending, allow_layout_retry,
+                                          cached_only)
 
-    def _compile_and_bind(self, baseline, options, request, positions, pending, allow_layout_retry=True, cached_only=False):
+    def _compile_and_bind(self, baseline, options, request, positions, pending, allow_layout_retry=True,
+                          cached_only=False):
         from triton import knobs
         from triton.compiler.compiler import CompiledKernel, _notify_compilation_listener
         from .block_batching import BatchKernel, IMPLEMENTATION_VERSION

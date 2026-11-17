@@ -1988,18 +1988,20 @@ class AscendBackend(BaseBackend):
             # guards. The owning JIT cache scopes this state to a device and
             # clears it with the executable handles. Full toolchain identity is
             # still checked on compilation and persistent artifact lookup.
-            inputs = {k: v for k, v in values.items()
-                      if k in NPUOptions.__dataclass_fields__ and k not in
-                      ("block_auto_contract", "block_batching_grid")}
+            inputs = {
+                k: v
+                for k, v in values.items()
+                if k in NPUOptions.__dataclass_fields__ and k not in ("block_auto_contract", "block_batching_grid")
+            }
             from .reuse.snapshot import encode, SourceNotSerializable
             try:
                 token = json.dumps(encode(inputs), separators=(",", ":"))
             except SourceNotSerializable:
                 pass  # Preserve the ordinary option validation for exotic inputs.
             else:
-                key = ("block_compile_context", os.getpid(), str(self.target), token,
-                       knobs.ascend.compile_only, knobs.ascend.npu_compiler_path, knobs.cache.dir,
-                       os.getenv("NPU_DEVICE_LIMIT"), os.getenv("ASCEND_HOME_PATH"))
+                key = ("block_compile_context", os.getpid(), str(self.target), token, knobs.ascend.compile_only,
+                       knobs.ascend.npu_compiler_path, knobs.cache.dir, os.getenv("NPU_DEVICE_LIMIT"),
+                       os.getenv("ASCEND_HOME_PATH"))
                 contexts = cache.get("block_compile_contexts", {})
                 if key in contexts:
                     return dict(values, block_compile_context=contexts[key])

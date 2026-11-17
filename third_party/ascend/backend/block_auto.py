@@ -20,10 +20,11 @@ def _cacheable_selection(report):
     # model_complete only guarantees a baseline score. Do not turn unmodeled
     # candidates or unaudited refusals into a persistent F1 decision.
     return (selection.get("model_complete") is True and not selection.get("failure_kind")
-            and all(row.get("status") == "TTIR_COST_ESTIMATED"
-                    for row in selection["candidates"].values())
-            and all(_cacheable_decline({k: v for k, v in decline.items() if k not in ("factor", "axis")})
-                    for decline in report["plan"].get("declines", ())))
+            and all(row.get("status") == "TTIR_COST_ESTIMATED" for row in selection["candidates"].values()) and all(
+                _cacheable_decline({k: v
+                                    for k, v in decline.items()
+                                    if k not in ("factor", "axis")})
+                for decline in report["plan"].get("declines", ())))
 
 
 class _SelectionCache:
@@ -43,7 +44,8 @@ class _SelectionCache:
         try:
             record = json.loads(Path(path).read_bytes())
             report = record["report"]
-            if (record == dict(version=1, identity=self.identity, report=report, digest=_digest(report))
+            if (type(record.get("version")) is int
+                    and record == dict(version=1, identity=self.identity, report=report, digest=_digest(report))
                     and _cacheable_selection(report)):
                 return report
         except (OSError, ValueError, TypeError, KeyError, AttributeError):
@@ -54,8 +56,7 @@ class _SelectionCache:
         # Called only after the executable cache misses. Content-addressed files
         # remain valid when another process atomically publishes a newer index.
         digest = prepared["digest"]
-        if (not isinstance(digest, str) or len(digest) != 64
-                or any(c not in "0123456789abcdef" for c in digest)):
+        if (not isinstance(digest, str) or len(digest) != 64 or any(c not in "0123456789abcdef" for c in digest)):
             raise _SelectionMiss()
         path = self.cache.get_file(f"selected-{digest}.ttir")
         try:
@@ -216,8 +217,8 @@ def compile_auto_bundle(backend, src, options, compile_variant, *, env_vars):
         report = saved.load() if saved is not None else None
         if report is not None:
             try:
-                return _compile_selected(backend, frozen, common, baseline_options, compile_variant, env_vars, positions,
-                                         contract, report, output, saved=saved)
+                return _compile_selected(backend, frozen, common, baseline_options, compile_variant, env_vars,
+                                         positions, contract, report, output, saved=saved)
             except _SelectionMiss:
                 pass  # An evicted snapshot must not prevent normal compilation.
         body["output"] = str(output)
@@ -274,7 +275,8 @@ def _compile_selected(backend, frozen, common, baseline_options, compile_variant
         compiler = CandidateCompiler(backend, frozen, env_vars, prepared=dict(prepared, path=str(output)))
         candidate = None
         if saved is not None:
-            candidate = compiler.compile(baseline, values, request, positions, allow_layout_retry=False, cached_only=True)
+            candidate = compiler.compile(baseline, values, request, positions, allow_layout_retry=False,
+                                         cached_only=True)
             if candidate is None:
                 saved.restore_ttir(prepared, output)
         if candidate is None:

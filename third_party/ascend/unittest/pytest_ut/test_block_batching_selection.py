@@ -234,13 +234,12 @@ class TestTtirAnalysis(unittest.TestCase):
 
 def selection_report(factor=2):
     key = "unmerged" if factor == 1 else f"a0_f{factor}"
-    return dict(selection=dict(factor=factor, selected_axis=-1 if factor == 1 else 0, selected_key=key,
-                               model_complete=True, reason="LOWEST_TTIR_SCORE",
-                               candidates={key: dict(factor=factor, axis=0, requested_axis=0,
-                                                     status="TTIR_COST_ESTIMATED")}),
-                plan=dict(candidates=[dict(axis=0, factor=factor)]),
-                prepared=None if factor == 1 else dict(variant="candidate", digest=hashlib.sha256(b"ttir").hexdigest(),
-                                                      report=dict(selected_axis=0)))
+    return dict(
+        selection=dict(factor=factor, selected_axis=-1 if factor == 1 else 0, selected_key=key, model_complete=True,
+                       reason="LOWEST_TTIR_SCORE",
+                       candidates={key: dict(factor=factor, axis=0, requested_axis=0, status="TTIR_COST_ESTIMATED")}),
+        plan=dict(candidates=[dict(axis=0, factor=factor)]), prepared=None if factor == 1 else dict(
+            variant="candidate", digest=hashlib.sha256(b"ttir").hexdigest(), report=dict(selected_axis=0)))
 
 
 class TestSelectionCache(unittest.TestCase):
@@ -256,8 +255,8 @@ class TestSelectionCache(unittest.TestCase):
         scope.__enter__()
         self.addCleanup(scope.__exit__, None, None, None)
         knobs.cache.dir = str(self.root / "cache")
-        self.body = dict(variant="source-target-options-env", contract=dict(grid=[256, 1, 1]),
-                         scalar_arguments=[123], target=dict(arch="Ascend950"), knobs={})
+        self.body = dict(variant="source-target-options-env", contract=dict(grid=[256, 1, 1]), scalar_arguments=[123],
+                         target=dict(arch="Ascend950"), knobs={})
         self.cache = block_auto._SelectionCache(self.body)
         self.output = self.root / "selected.ttir"
         self.output.write_bytes(b"ttir")
@@ -266,9 +265,8 @@ class TestSelectionCache(unittest.TestCase):
         report = selection_report()
         self.cache.store(report, self.output)
         self.assertEqual(self.auto._SelectionCache(self.body).load(), report)
-        for field, value in (("variant", "changed"), ("contract", dict(grid=[128, 1, 1])),
-                             ("scalar_arguments", [124]), ("target", dict(arch="Ascend910_9391")),
-                             ("knobs", dict(debug=True))):
+        for field, value in (("variant", "changed"), ("contract", dict(grid=[128, 1, 1])), ("scalar_arguments", [124]),
+                             ("target", dict(arch="Ascend910_9391")), ("knobs", dict(debug=True))):
             with self.subTest(field=field):
                 changed = self.auto._SelectionCache(dict(self.body, **{field: value}))
                 self.assertIsNone(changed.load())
@@ -281,8 +279,7 @@ class TestSelectionCache(unittest.TestCase):
     def test_corrupt_record_is_a_miss(self):
         self.cache.store(selection_report(), self.output)
         record = Path(self.cache.cache.get_file("block_auto.selection"))
-        for data in ("{", json.dumps(dict(version=99)),
-                     record.read_text().replace("LOWEST_TTIR_SCORE", "changed")):
+        for data in ("{", json.dumps(dict(version=99)), record.read_text().replace("LOWEST_TTIR_SCORE", "changed")):
             record.write_text(data)
             self.assertIsNone(self.cache.load())
 
@@ -361,7 +358,7 @@ class TestCompileContextCache(unittest.TestCase):
         # The real option parser validates this executable; substitute only
         # that parser while checking that the preparation cache misses.
         parsed = self.parse.return_value = SimpleNamespace(block_compile_context=None, enable_graph_optimize=True,
-                                                          compile_on_910_95=True, is_pure_simt=False)
+                                                           compile_on_910_95=True, is_pure_simt=False)
         self.parse.side_effect = lambda _: parsed
         self.prepare()
         self.prepare(dict(self.options, enable_graph_optimize=False))
@@ -373,7 +370,8 @@ class TestCompileContextCache(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "explicit block_compile_context"):
             self.prepare()
         context = ("Ascend950", 14, (True, 14, 28), None)
-        self.assertEqual(self.prepare(dict(self.options, block_compile_context=context))["block_compile_context"], context)
+        self.assertEqual(
+            self.prepare(dict(self.options, block_compile_context=context))["block_compile_context"], context)
         with self.assertRaises(ValueError):
             self.prepare(dict(self.options, block_compile_context=("Ascend950", 14, None, None)))
 
@@ -394,6 +392,14 @@ class TestCompileContextCache(unittest.TestCase):
         self.prepare()
         self.assertEqual(self.parse.call_count, 6)
 
+    def test_simt_keeps_refreshing_its_runtime_configuration(self):
+        self.parse.side_effect = lambda _: SimpleNamespace(block_compile_context=None, enable_graph_optimize=True,
+                                                           compile_on_910_95=True, is_pure_simt=True)
+        with patch.object(self.compiler, "get_simt_stack_limit", side_effect=[1152, 2048]):
+            self.assertEqual(self.prepare()["block_compile_context"][3], 1152)
+            self.assertEqual(self.prepare()["block_compile_context"][3], 2048)
+        self.assertEqual(self.cache, {})
+
 
 class TestRankedRecovery(unittest.TestCase):
 
@@ -413,9 +419,10 @@ class TestRankedRecovery(unittest.TestCase):
 
         plan = dict(candidates=[dict(axis=0, factor=2), dict(axis=0, factor=4)])
         key = "unmerged" if selected == 1 else f"a0_f{selected}"
-        selection = dict(factor=selected, selected_axis=-1 if selected == 1 else 0, selected_key=key,
-                         candidates={key: dict(factor=selected, axis=0, requested_axis=0, status="TTIR_COST_ESTIMATED")},
-                         model_complete=True, reason="TTIR_SELECTED")
+        selection = dict(
+            factor=selected, selected_axis=-1 if selected == 1 else 0, selected_key=key,
+            candidates={key: dict(factor=selected, axis=0, requested_axis=0,
+                                  status="TTIR_COST_ESTIMATED")}, model_complete=True, reason="TTIR_SELECTED")
         prepared = None if selected == 1 else dict(report=dict(selected_axis=0))
 
         def attempt(operation, body, *, timeout):
@@ -481,11 +488,18 @@ class TestRankedRecovery(unittest.TestCase):
         saved.store.assert_called_once()
 
     def test_complete_f1_decision_is_cached_but_failures_are_not(self):
-        for options, stored in ((dict(selected=1), True), (dict(decline=True), False),
-                                (dict(failure="Timeout"), False)):
+        for options, stored in ((dict(selected=1), True), (dict(decline=True), False), (dict(failure="Timeout"),
+                                                                                        False)):
             saved = Mock(load=lambda: None)
             self.run_selection(saved=saved, **options)
             self.assertEqual(saved.store.called, stored)
+
+    def test_cached_f1_does_not_start_a_worker(self):
+        saved = Mock(load=lambda: selection_report(1))
+        result, events = self.run_selection(saved=saved)
+        self.assertEqual(events, ["f1"])
+        self.assertEqual(result["selected_factor"], 1)
+        saved.restore_ttir.assert_not_called()
 
     def test_forced_compile_ignores_decision_cache(self):
         from triton import knobs
@@ -580,7 +594,8 @@ class TestHostIntegration(unittest.TestCase):
         self.addCleanup(capture.stop)
         self.backend = SimpleNamespace(target=SimpleNamespace(arch="Ascend950"),
                                        prepare_block_compile_options=lambda values, **_: dict(values))
-        self.fn = SimpleNamespace(arg_names=["x", "size", "BLOCK"], device_caches={0: [{}, None, None, None, self.bind]})
+        self.fn = SimpleNamespace(arg_names=["x", "size", "BLOCK"],
+                                  device_caches={0: [{}, None, None, None, self.bind]})
         self.kwargs = dict(block_batching_factor="auto", BLOCK=512)
         self.result = object()
 
