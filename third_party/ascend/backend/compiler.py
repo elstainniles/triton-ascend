@@ -314,13 +314,12 @@ def _with_debug_line(npubin_stage, options):
 def _graph_optimize_core_num(opt):
     if getattr(opt, "block_compile_context", None) is not None:
         return opt.block_compile_context[1]
-    if knobs.ascend.compile_only:
-        raise ValueError("compile-only graph optimization requires explicit block_compile_context")
     # Physical AI-core blocks the launcher will schedule, so the row-count policy
     # can keep at least one full wave after R-way coalescing.  The launcher picks
     # AIV for pure-SIMT kernels (final mix_mode "aiv") and AIC otherwise, so the
-    # compile-time proxy is opt.is_pure_simt. Preserve the online query-failure
-    # policy (0 disables the occupancy check); offline callers supply a context.
+    # compile-time proxy is opt.is_pure_simt. Legacy callers retain the query-
+    # failure policy (0 disables the occupancy check). Candidate workers require
+    # an explicit context at their entry point and return above without querying.
     try:
         npu_utils = NPUUtils()
         if getattr(opt, "is_pure_simt", False):
@@ -333,8 +332,6 @@ def _graph_optimize_core_num(opt):
 def _compile_device_limit(opt):
     if getattr(opt, "block_compile_context", None) is not None:
         return opt.block_compile_context[2]
-    if knobs.ascend.compile_only:
-        raise ValueError("compile-only binary generation requires explicit block_compile_context")
     # This branch retains the legacy limit policy: invalid A5 limits raise,
     # while targets without an active limit leave the vendor defaults intact.
     npu_utils = NPUUtils()

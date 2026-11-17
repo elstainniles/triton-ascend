@@ -168,8 +168,8 @@ def test_get_simt_stack_limit_config_overrides_default(monkeypatch, tmp_path):
 
 def test_block_compile_context_preserves_hardware_inputs_and_identity(monkeypatch):
     backend = compiler.AscendBackend(GPUTarget('npu', 'Ascend950PR_9579', 32))
-    hardware = SimpleNamespace(get_aicore_num=lambda: 12, get_aivector_core_num=lambda: 24, get_device_limit=lambda:
-                               (True, 12, 24))
+    hardware = SimpleNamespace(get_aicore_num=lambda: 12, get_aivector_core_num=lambda: 24,
+                               has_device_limit=lambda: True)
     monkeypatch.setattr(compiler, 'NPUUtils', lambda: hardware)
     values = backend.prepare_block_compile_options(dict(block_batching_factor=2))
     assert values['block_compile_context'] == (backend.target.arch, 12, (True, 12, 24), None)
@@ -191,21 +191,51 @@ def test_block_compile_context_preserves_hardware_inputs_and_identity(monkeypatc
         backend.parse_options(dict(values, block_compile_context=('Ascend910_9391', 12, (True, 12, 24), None)))
 
 
-def test_compile_only_requires_explicit_target_without_runtime_queries(monkeypatch):
+@pytest.mark.parametrize("compile_only", [False, True])
+@pytest.mark.parametrize("simt", [False, True])
+def test_direct_compilation_preserves_device_queries(monkeypatch, compile_only, simt):
+    from triton import knobs
+    backend = compiler.AscendBackend(GPUTarget('npu', 'Ascend950PR_9579', 32))
+    hardware = SimpleNamespace(get_aicore_num=lambda: 12, get_aivector_core_num=lambda: 24,
+                               has_device_limit=lambda: True)
+    monkeypatch.setattr(compiler, 'NPUUtils', lambda: hardware)
+    with knobs.ascend.scope():
+        knobs.ascend.compile_only = compile_only
+        options = backend.parse_options(dict(compile_mode='simt_only') if simt else {})
+        assert compiler._graph_optimize_core_num(options) == (24 if simt else 12)
+        assert compiler._compile_device_limit(options) == (True, 12, 24)
+
+
+@pytest.mark.parametrize("compile_only", [False, True])
+def test_direct_compilation_preserves_device_query_failures(monkeypatch, compile_only):
+    from triton import knobs
+    backend = compiler.AscendBackend(GPUTarget('npu', 'Ascend950PR_9579', 32))
+
+    def unavailable():
+        raise RuntimeError('device unavailable')
+
+    monkeypatch.setattr(compiler, 'NPUUtils', unavailable)
+    with knobs.ascend.scope():
+        knobs.ascend.compile_only = compile_only
+        options = backend.parse_options({})
+        assert compiler._graph_optimize_core_num(options) == 0
+        with pytest.raises(RuntimeError, match='device unavailable'):
+            compiler._compile_device_limit(options)
+
+
+def test_compile_only_block_batching_requires_explicit_target_without_runtime_queries(monkeypatch):
     from triton import knobs
     backend = compiler.AscendBackend(GPUTarget('npu', 'Ascend950PR_9579', 32))
     monkeypatch.setattr(compiler, 'NPUUtils', lambda: pytest.fail('offline compilation queried the NPU'))
     with knobs.ascend.scope():
         knobs.ascend.compile_only = True
-        # Direct F1 compilation bypasses the bundle hook but must not query a
-        # default device either. Check both stages before entering their tools.
-        for resolve in (compiler._graph_optimize_core_num, compiler._compile_device_limit):
-            with pytest.raises(ValueError, match='explicit block_compile_context'):
-                resolve(backend.parse_options({}))
         with pytest.raises(ValueError, match='explicit block_compile_context'):
             backend.prepare_block_compile_options(dict(block_batching_factor=2))
         values = dict(block_batching_factor=2, block_compile_context=(backend.target.arch, 24, (False, 24, 48), None))
         assert backend.prepare_block_compile_options(values) == values
+        options = backend.parse_options(values)
+        assert compiler._graph_optimize_core_num(options) == 24
+        assert compiler._compile_device_limit(options) == (False, 24, 48)
         with pytest.raises(ValueError, match='SIMT stack'):
             backend.parse_options(dict(values, compile_mode='simt_only'))
         simt = dict(values, compile_mode='simt_only',
