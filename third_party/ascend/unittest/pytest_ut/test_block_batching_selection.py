@@ -394,7 +394,7 @@ class TestCompileContextCache(unittest.TestCase):
         with self.assertRaises(ValueError):
             self.prepare(dict(self.options, block_compile_context=("Ascend950", 14, None, None)))
 
-    def test_failures_and_forced_compilation_remain_retryable(self):
+    def test_failed_target_queries_remain_retryable(self):
         self.limit.side_effect = ValueError("bad limit")
         with self.assertRaisesRegex(ValueError, "bad limit"):
             self.prepare()
@@ -406,10 +406,24 @@ class TestCompileContextCache(unittest.TestCase):
         self.assertEqual(self.cache, {})
         self.cores.return_value = 28
         self.prepare()
+        self.prepare()
+        self.assertEqual(self.parse.call_count, 4)
+
+    def test_forced_compilation_reuses_only_launch_target_preparation(self):
         self.knobs.compilation.always_compile = True
+        first = self.prepare()
+        self.assertEqual(self.prepare(), first)
+        self.parse.assert_called_once()
+        with patch.dict("os.environ", NPU_DEVICE_LIMIT="14,28"):
+            self.prepare()
+        self.assertEqual(self.parse.call_count, 2)
+        # Actual compilation does not supply the per-device launch cache.
+        self.backend.prepare_block_compile_options(self.options)
+        self.backend.prepare_block_compile_options(self.options)
+        self.assertEqual(self.parse.call_count, 4)
+        self.cache.clear()
         self.prepare()
-        self.prepare()
-        self.assertEqual(self.parse.call_count, 6)
+        self.assertEqual(self.parse.call_count, 5)
 
     def test_simt_keeps_refreshing_its_runtime_configuration(self):
         self.parse.side_effect = lambda _: SimpleNamespace(block_compile_context=None, enable_graph_optimize=True,
@@ -857,10 +871,18 @@ class TestHostIntegration(unittest.TestCase):
     def test_equivalent_auto_decisions_share_device_handle_and_identity(self):
         cache = {}
 
+        class Report(dict):
+
+            def __repr__(self):
+                representations.append(self)
+                return super().__repr__()
+
+        representations = []
+
         class Kernel:
             hash = "same-artifact"
-            block_batching = {"reason": "DISABLED"}
-            block_auto_selection = {"selected_factor": 1, "reason": "GRID_BELOW_CORE_FLOOR"}
+            block_batching = Report(reason="DISABLED")
+            block_auto_selection = Report(selected_factor=1, reason="GRID_BELOW_CORE_FLOOR")
 
             def __init__(self):
                 self._init_handles = Mock()
@@ -868,7 +890,13 @@ class TestHostIntegration(unittest.TestCase):
         first, second = Kernel(), Kernel()
         with patch.object(self.batching, "BatchKernel", Kernel):
             self.assertIs(self.dispatch.initialize_auto_kernel(cache, first), first)
+            self.assertIs(self.dispatch.initialize_auto_kernel(cache, first), first)
+            first._init_handles.assert_called_once()
+            self.assertEqual(len(representations), 2)
             self.assertIs(self.dispatch.initialize_auto_kernel(cache, second), first)
+            self.assertIs(self.dispatch.initialize_auto_kernel(cache, second), first)
+            self.assertEqual(len(representations), 4)
+            self.assertEqual(first._init_handles.call_count, 2)
             second._init_handles.assert_not_called()
             # A different device/native cache cannot reuse the previous handle.
             self.assertIs(self.dispatch.initialize_auto_kernel({}, second), second)
@@ -877,6 +905,23 @@ class TestHostIntegration(unittest.TestCase):
             self.assertIs(self.dispatch.initialize_auto_kernel(cache, changed), changed)
             cache.clear()
             self.assertIs(self.dispatch.initialize_auto_kernel(cache, second), second)
+
+    def test_failed_auto_initialization_is_retried(self):
+
+        class Kernel:
+            hash = "artifact"
+            block_batching = {"reason": "DISABLED"}
+            block_auto_selection = {"selected_factor": 1}
+
+        kernel = Kernel()
+        kernel._init_handles = Mock(side_effect=[RuntimeError("load failed"), None])
+        cache = {}
+        with patch.object(self.batching, "BatchKernel", Kernel):
+            with self.assertRaisesRegex(RuntimeError, "load failed"):
+                self.dispatch.initialize_auto_kernel(cache, kernel)
+            self.assertIs(self.dispatch.initialize_auto_kernel(cache, kernel), kernel)
+            self.assertIs(self.dispatch.initialize_auto_kernel(cache, kernel), kernel)
+        self.assertEqual(kernel._init_handles.call_count, 2)
 
     def test_launch_exception_is_not_replayed(self):
 

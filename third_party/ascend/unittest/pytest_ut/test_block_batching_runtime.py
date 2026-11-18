@@ -585,8 +585,12 @@ class TestPreparedFallback(unittest.TestCase):
     def test_candidate_load_resource_failure_uses_complete_f1(self):
         from triton.runtime.errors import OutOfResources
         self.candidate._init_handles.side_effect = OutOfResources(4096, 1024, "shared memory")
+        cache = {}
         with patch.object(batching, "_capture_state", return_value=False):
-            self.bundle._init_handles()
+            self.assertIs(batching.initialize_auto_kernel(cache, self.bundle), self.bundle)
+            self.assertIs(batching.initialize_auto_kernel(cache, self.bundle), self.bundle)
+        self.candidate._init_handles.assert_called_once()
+        self.original._init_handles.assert_called_once()
         self.dispatch()
         self.assertIsNone(self.bundle.candidate)
         self.assertEqual(self.events, [("f1", "f1")])

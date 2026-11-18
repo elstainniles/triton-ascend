@@ -216,9 +216,18 @@ def initialize_auto_kernel(cache, kernel):
     clears this identity; no process-global device handles are retained.
     """
     if isinstance(kernel, BatchKernel) and hasattr(kernel, "block_auto_selection"):
+        initialized_key = ("block_auto_initialized", kernel)
+        initialized = cache.get(initialized_key)
+        if initialized is not None:
+            return initialized
         key = ("block_auto_kernel", kernel.hash, repr(kernel.block_batching), repr(kernel.block_auto_selection))
         kernel = cache.setdefault(key, kernel)
-    kernel._init_handles()
+        kernel._init_handles()
+        # Initialization may fail or replace a candidate with its baseline.
+        # Remember the resolved object only after initialization succeeds.
+        cache[initialized_key] = kernel
+    else:
+        kernel._init_handles()
     return kernel
 
 

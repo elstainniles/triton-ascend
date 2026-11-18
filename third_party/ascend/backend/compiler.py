@@ -1983,11 +1983,12 @@ class AscendBackend(BaseBackend):
     def prepare_block_compile_options(self, values, *, cache=None):
         """Resolve hardware inputs in the caller, before any candidate/cache lookup."""
         key = None
-        if cache is not None and not knobs.compilation.always_compile:
+        if cache is not None:
             # Only memoize target preparation, never the launch contract or its
             # guards. The owning JIT cache scopes this state to a device and
             # clears it with the executable handles. Full toolchain identity is
-            # still checked on compilation and persistent artifact lookup.
+            # still checked on compilation and persistent artifact lookup,
+            # including forced compilation. It need not repeat on a JIT hit.
             inputs = {
                 k: v
                 for k, v in values.items()
