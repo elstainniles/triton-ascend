@@ -105,6 +105,10 @@ def prepare_launch(fn, args, kwargs, grid, warmup, device, backend):
         result.pop("block_auto_contract", None)
         return result, grid
 
+    from triton.runtime.autotuner import _autotuning_kernel
+    if "block_batching_factor" not in kwargs and _autotuning_kernel.get() is fn.fn:
+        return baseline()
+
     # Dynamic reuse owns constexpr/tile adaptation and must receive the original
     # callable grid. A concrete auto contract would split its variant families.
     if (reuse_enabled() or getattr(getattr(fn, "ASTSource", None), "frontend_kind", "triton") != "triton"

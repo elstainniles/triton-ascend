@@ -764,8 +764,8 @@ std::string scoreBlockTtir(ModuleOp module, llvm::StringRef request) {
                      {"live_bytes_known", live.known},
                      {"estimated_live_bytes", int64_t(live.peakLiveBytes)}});
   } catch (const std::exception &error) {
-    update(output,
-           O{{"status", "TTIR_MODEL_UNSUPPORTED"}, {"error", error.what()}});
+    update(output, O{{"status", "TTIR_MODEL_UNSUPPORTED"},
+                     {"error", std::string(error.what())}});
   }
   std::string result;
   llvm::raw_string_ostream stream(result);

@@ -1174,21 +1174,35 @@ index b1dd327bb..c49330d40 100644
  
  @core._tensor_member_fn
 diff --git a/python/triton/runtime/autotuner.py b/python/triton/runtime/autotuner.py
-index 0c4d71049..42f463f55 100644
+index 0c4d71049..f3e55b366 100644
 --- a/python/triton/runtime/autotuner.py
 +++ b/python/triton/runtime/autotuner.py
-@@ -5,6 +5,7 @@ import time
+@@ -5,6 +5,8 @@ import time
  import inspect
  import hashlib
  import json
-+from contextlib import nullcontext
++from contextlib import contextmanager, nullcontext
++from contextvars import ContextVar
  from functools import cached_property
  from typing import Dict, Tuple, List, Optional
  
-@@ -16,6 +17,15 @@ from .cache import get_cache_manager, triton_key
+@@ -16,6 +18,28 @@ from .cache import get_cache_manager, triton_key
  from triton._C.libtriton import get_cache_invalidating_env_vars
  
  
++_autotuning_kernel = ContextVar("triton_autotuning_kernel", default=None)
++
++
++@contextmanager
++def _autotune_scope(kernel):
++    # Scope the default policy to this kernel without changing explicit options.
++    token = _autotuning_kernel.set(kernel)
++    try:
++        yield
++    finally:
++        _autotuning_kernel.reset(token)
++
++
 +def _exact_request_scope():
 +    from ..compiler import make_backend
 +    from .driver import driver
@@ -1201,7 +1215,7 @@ index 0c4d71049..42f463f55 100644
  class Autotuner(KernelInterface):
  
      def __init__(self, fn, arg_names, configs, key, reset_to_zero, restore_value, pre_hook=None, post_hook=None,
-@@ -126,7 +136,7 @@ class Autotuner(KernelInterface):
+@@ -126,7 +150,7 @@ class Autotuner(KernelInterface):
          return self._do_bench
  
      def _bench(self, *args, config, **meta):
@@ -1210,7 +1224,7 @@ index 0c4d71049..42f463f55 100644
  
          verbose = knobs.autotuning.print
          if verbose:
-@@ -147,10 +157,11 @@ class Autotuner(KernelInterface):
+@@ -147,10 +171,11 @@ class Autotuner(KernelInterface):
                  config.pre_hook(full_nargs)
              self.pre_hook(full_nargs)
              try:
@@ -1218,7 +1232,7 @@ index 0c4d71049..42f463f55 100644
 -                    *args,
 -                    **current,
 -                )
-+                with _exact_request_scope():
++                with _autotune_scope(self.base_fn), _exact_request_scope():
 +                    self.fn.run(
 +                        *args,
 +                        **current,
@@ -1226,7 +1240,7 @@ index 0c4d71049..42f463f55 100644
              except Exception as e:
                  try:
                      self.post_hook(full_nargs, exception=e)
-@@ -162,7 +173,7 @@ class Autotuner(KernelInterface):
+@@ -162,7 +187,7 @@ class Autotuner(KernelInterface):
  
          try:
              return self.do_bench(kernel_call, quantiles=(0.5, 0.2, 0.8))
@@ -1235,7 +1249,24 @@ index 0c4d71049..42f463f55 100644
              if verbose:
                  print(f"Autotuning failed with {e}")
              return [float("inf"), float("inf"), float("inf")]
-@@ -288,11 +299,12 @@ class Autotuner(KernelInterface):
+@@ -249,10 +274,11 @@ class Autotuner(KernelInterface):
+         if config.pre_hook is not None:
+             full_nargs = {**self.nargs, **kwargs, **config.all_kwargs()}
+             config.pre_hook(full_nargs)
+-        ret = self.fn.run(
+-            *args,
+-            **kwargs,
+-            **config.all_kwargs(),
+-        )
++        with _autotune_scope(self.base_fn):
++            ret = self.fn.run(
++                *args,
++                **kwargs,
++                **config.all_kwargs(),
++            )
+         self.nargs = None
+         return ret
+@@ -288,11 +314,12 @@ class Autotuner(KernelInterface):
          self.nargs = dict(zip(self.arg_names, args))
          ret = []
          for autotune_config in self.prune_configs(kwargs):
@@ -1244,7 +1275,7 @@ index 0c4d71049..42f463f55 100644
 -                **kwargs,
 -                **autotune_config.all_kwargs(),
 -            ))
-+            with _exact_request_scope():
++            with _autotune_scope(self.base_fn), _exact_request_scope():
 +                ret.append(self.fn.warmup(
 +                    *args,
 +                    **kwargs,

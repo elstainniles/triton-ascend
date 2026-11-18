@@ -4,6 +4,8 @@ from block_batching_test_utils import assign_npu  # noqa: F401 - CPU-only fixtur
 import importlib
 import json
 import hashlib
+import os
+import subprocess
 import sys
 from pathlib import Path
 import tempfile
@@ -53,6 +55,23 @@ class TestTtirAnalysis(unittest.TestCase):
         }''')
         self.assertEqual(result["status"], "TTIR_MODEL_UNSUPPORTED")
         self.assertIn("dynamic loop", result["error"])
+
+    def test_rejection_message_survives_exception_destruction(self):
+        # Disable glibc's tcache so freed exception storage is overwritten.
+        script = '''
+import runpy, sys
+from pathlib import Path
+sys.path.insert(0, str(Path(sys.argv[1]).resolve().parent))
+tests = runpy.run_path(sys.argv[1])
+case = tests['TestTtirAnalysis']()
+for _ in range(20):
+    case.test_dynamic_loop_declines_instead_of_assuming_one_iteration()
+    case.test_missing_target_resources_cannot_use_a5_defaults()
+'''
+        env = dict(os.environ, GLIBC_TUNABLES="glibc.malloc.tcache_count=0", MALLOC_PERTURB_="165")
+        result = subprocess.run([sys.executable, "-c", script, __file__], env=env, capture_output=True, text=True,
+                                timeout=60)
+        self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
 
     def test_launch_scalar_specializes_loop_without_changing_executable_ir(self):
         text = '''module {
@@ -594,7 +613,7 @@ class TestHostIntegration(unittest.TestCase):
         self.addCleanup(capture.stop)
         self.backend = SimpleNamespace(target=SimpleNamespace(arch="Ascend950"),
                                        prepare_block_compile_options=lambda values, **_: dict(values))
-        self.fn = SimpleNamespace(arg_names=["x", "size", "BLOCK"],
+        self.fn = SimpleNamespace(fn=lambda: None, arg_names=["x", "size", "BLOCK"],
                                   device_caches={0: [{}, None, None, None, self.bind]})
         self.kwargs = dict(block_batching_factor="auto", BLOCK=512)
         self.result = object()
@@ -640,6 +659,86 @@ class TestHostIntegration(unittest.TestCase):
         self.assertEqual(list(prepared), list(explicit))
         self.assertEqual(prepared["block_batching_factor"], "auto")
         self.assertNotIn("block_batching_factor", self.kwargs)
+
+    def test_generic_autotune_default_and_explicit_options(self):
+        from contextlib import nullcontext
+        from triton.runtime import autotuner
+
+        def launch(*args, grid, **options):
+            prepared, _ = self.dispatch.prepare_launch(self.fn, args, options, grid, False, 0, self.backend)
+            seen.append(prepared["block_batching_factor"])
+            return prepared
+
+        def bench(fn, quantiles):
+            fn()
+            return 1.0
+
+        def hook(*args, **kwargs):
+            self.assertIsNone(autotuner._autotuning_kernel.get())
+
+        self.fn.run = self.fn.warmup = launch
+        for source, factor in (("default", None), ("call", "auto"), ("config", "auto"), ("call", 2), ("config", 2),
+                               ("call", 4), ("config", 4)):
+            with self.subTest(source=source, factor=factor):
+                seen = []
+                self.calls.clear()
+                self.capture.reset_mock()
+                option = {} if factor is None else dict(block_batching_factor=factor)
+                configs = [
+                    autotuner.Config(dict(BLOCK=b, **(option if source == "config" else {})), pre_hook=hook)
+                    for b in (256, 512)
+                ]
+                tuned = autotuner.Autotuner(self.fn, self.fn.arg_names, configs, ["size"], None, None, pre_hook=hook,
+                                            post_hook=hook, do_bench=bench)
+                options = dict(grid=(256, ), **(option if source == "call" else {}))
+                with patch.object(autotuner, "_exact_request_scope", nullcontext):
+                    tuned.warmup(Tensor(), 131072, **options)
+                    tuned.run(Tensor(), 131072, **options)
+                    tuned.run(Tensor(), 131072, **options)  # Cached best configuration.
+                self.assertEqual(seen, [1 if factor is None else factor] * 6)
+                if factor is None:
+                    self.assertEqual(self.calls, [])
+                    self.capture.assert_not_called()
+                self.assertIsNone(autotuner._autotuning_kernel.get())
+                direct = launch(Tensor(), 131072, grid=(256, ), BLOCK=512)
+                self.assertEqual(direct["block_batching_factor"], "auto")
+
+    def test_generic_autotune_scope_resets_on_failure(self):
+        from contextlib import nullcontext
+        from triton.runtime import autotuner
+
+        def fail(*args, **kwargs):
+            self.assertIs(autotuner._autotuning_kernel.get(), self.fn.fn)
+            raise RuntimeError("kernel failed")
+
+        self.fn.run = self.fn.warmup = fail
+        config = autotuner.Config(dict(BLOCK=512))
+        tuned = autotuner.Autotuner(self.fn, self.fn.arg_names, [config], [], None, None, do_bench=lambda fn, **_: fn())
+        tuned.nargs = {}
+        with patch.object(autotuner, "_exact_request_scope", nullcontext):
+            for invoke in (lambda: tuned._bench(config=config), tuned.run, tuned.warmup):
+                with self.assertRaisesRegex(RuntimeError, "kernel failed"):
+                    invoke()
+                self.assertIsNone(autotuner._autotuning_kernel.get())
+
+    def test_generic_autotune_scope_is_kernel_and_thread_local(self):
+        from concurrent.futures import ThreadPoolExecutor
+        from triton.runtime import autotuner
+
+        self.kwargs.pop("block_batching_factor")
+        other = lambda: None
+        with ThreadPoolExecutor(max_workers=1) as pool, autotuner._autotune_scope(self.fn.fn):
+            self.assertIsNone(pool.submit(autotuner._autotuning_kernel.get).result())
+            with autotuner._autotune_scope(other):
+                self.run_handler()
+                self.assertEqual(self.calls[-1][0][1]["block_batching_factor"], "auto")
+            self.assertIs(autotuner._autotuning_kernel.get(), self.fn.fn)
+            self.run_handler()
+            self.assertEqual(self.calls[-1][0][1]["block_batching_factor"], 1)
+            self.fn.arg_names.append("block_batching_factor")
+            options, _ = self.dispatch.prepare_launch(self.fn, (), self.kwargs, (256, ), True, 0, self.backend)
+            self.assertIs(options, self.kwargs)  # A kernel argument is not a compiler option.
+        self.assertIsNone(autotuner._autotuning_kernel.get())
 
     def test_incomplete_tensor_metadata_does_not_break_default_launch(self):
         wrapper = SimpleNamespace(dtype="fp32", shape=(256, 512), stride=lambda: (512, 1))

@@ -235,7 +235,10 @@ class TestVV:
             assert kernel.block_auto_selection['reason'] == 'A3_TTIR_GROUPING'
 
     @pytest.mark.parametrize('explicit', [None, 'auto', 2])
-    def test_autotune_batching_default_and_override(self, explicit):
+    @pytest.mark.parametrize('generic', [False, True])
+    def test_autotune_batching_default_and_override(self, explicit, generic):
+        from triton.runtime.autotuner import autotune as generic_autotune
+
         seen = []
 
         def bench(fn, quantiles):
@@ -243,8 +246,9 @@ class TestVV:
             return 1.0  # Functional test; no device performance assertion.
 
         config_options = dict(block_batching_factor=2) if explicit == 2 else {}
-        tuned = triton.autotune(configs=[triton.Config(dict(B=b, **config_options)) for b in (256, 512)], key=['N'],
-                                do_bench=bench)(pointwise)
+        decorate = generic_autotune if generic else triton.autotune
+        tuned = decorate(configs=[triton.Config(dict(B=b, **config_options)) for b in (256, 512)], key=['N'],
+                         do_bench=bench)(pointwise)
         x = torch.arange(131072, device='npu', dtype=torch.float32)
         out = torch.full_like(x, -123.)
         options = dict(block_batching_factor='auto') if explicit == 'auto' else {}
