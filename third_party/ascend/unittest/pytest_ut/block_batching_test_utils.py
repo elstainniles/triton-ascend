@@ -445,10 +445,12 @@ def tiled_scan_ir():
 # Device admission
 
 
-def require_batching_target(monkeypatch, *, include_a3=False):
+def require_batching_target(monkeypatch, *, include_legacy=False):
     import triton
     arch = triton.runtime.driver.active.get_current_target().arch
-    targets = ('Ascend950', 'Ascend910_95', 'Ascend910_93') if include_a3 else ('Ascend950', 'Ascend910_95')
+    targets = ('Ascend950', 'Ascend910_95')
+    if include_legacy:
+        targets += ('Ascend910_93', 'Ascend910B')
     if not arch.startswith(targets):
         pytest.skip('This test requires ' + '/'.join(targets))
     # These are correctness tests, independent of the occupancy heuristic.

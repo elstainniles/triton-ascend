@@ -275,23 +275,26 @@ for _ in range(20):
         self.assertEqual(result["factor"], 1)
         self.assertFalse(result["model_complete"])
 
-    def test_a3_selects_a_proven_group_with_target_core_count(self):
+    def test_legacy_targets_select_a_proven_group_with_target_core_count(self):
         text = """module { tt.func public @kernel(%out: !tt.ptr<i32>) {
           %zero = arith.constant 0 : i32
           tt.store %out, %zero : !tt.ptr<i32>
           tt.return
         }}"""
-        rows = []
-        for factor in (1, 2, 4):
-            row = self.score(text, arch="Ascend910_9391", cores=20, factor=factor, axis=-1 if factor == 1 else 0,
-                             cv=False, merge_kind="vv")
-            self.assertEqual(row["model"], "ttir-a3-grouping-v1")
-            rows.append(row)
-        result = json.loads(
-            ascend.select_block_candidates(
-                json.dumps(dict(action="rank_ttir", contract=dict(grid=[256, 1, 1]), candidates=rows))))
-        self.assertEqual(result["factor"], 2)
-        self.assertEqual(result["candidates"]["a0_f2"]["cores"], 20)
+        # The A5 cost model does not transfer, so every SOC of the earlier
+        # generation scores on legality and occupancy instead.
+        for arch in ("Ascend910_9391", "Ascend910B1", "Ascend910B2", "Ascend910B3", "Ascend910B4"):
+            rows = []
+            for factor in (1, 2, 4):
+                row = self.score(text, arch=arch, cores=20, factor=factor, axis=-1 if factor == 1 else 0, cv=False,
+                                 merge_kind="vv")
+                self.assertEqual(row["model"], "ttir-legacy-grouping-v1", arch)
+                rows.append(row)
+            result = json.loads(
+                ascend.select_block_candidates(
+                    json.dumps(dict(action="rank_ttir", contract=dict(grid=[256, 1, 1]), candidates=rows))))
+            self.assertEqual(result["factor"], 2, arch)
+            self.assertEqual(result["candidates"]["a0_f2"]["cores"], 20, arch)
 
     def test_missing_target_resources_cannot_use_a5_defaults(self):
         result = self.score("module { tt.func public @kernel() { tt.return } }", cores=0)
@@ -601,10 +604,12 @@ class TestRankedRecovery(unittest.TestCase):
         self.assertEqual(result["selected_factor"], 1)
         self.assertEqual(result["reason"], "BASELINE_AFTER_CANDIDATE_REJECTION")
 
-    def test_a3_uses_the_selection_worker(self):
-        result, events = self.run_selection(arch="Ascend910_9391", selected=2)
-        self.assertEqual(events, ["ttir", "f1", 2])
-        self.assertEqual(result["selected_factor"], 2)
+    def test_legacy_targets_use_the_selection_worker(self):
+        for arch in ("Ascend910_9391", "Ascend910B1", "Ascend910B4"):
+            with self.subTest(arch=arch):
+                result, events = self.run_selection(arch=arch, selected=2)
+                self.assertEqual(events, ["ttir", "f1", 2])
+                self.assertEqual(result["selected_factor"], 2)
 
     def test_abnormal_worker_exits_do_not_masquerade_as_declines(self):
         from triton.backends.ascend.block_batching_worker import BatchCompileError
@@ -899,18 +904,22 @@ class TestHostIntegration(unittest.TestCase):
 
     def test_non_a5_and_invalid_grid_keep_baseline(self):
         self.kwargs.pop("block_batching_factor")
-        for target, grid in (("Ascend910B", (256, )), ("Ascend950", (0, ))):
+        for target, grid in (("Ascend310B4", (256, )), ("Ascend950", (0, ))):
             self.backend.target.arch = target
             self.calls.clear()
             self.run_handler(grid)
             self.assertNotIn("block_batching_factor", self.calls[-1][0][1])
 
-    def test_a3_enters_auto_without_a5_empirical_override(self):
-        self.backend.target.arch = "Ascend910_9391"
-        self.run_handler()
-        options = self.calls[-1][0][1]
-        self.assertEqual(options["block_batching_factor"], "auto")
-        self.assertFalse(json.loads(options["block_auto_contract"])["cv_empirical_short_batch"])
+    def test_legacy_targets_enter_auto_without_a5_empirical_override(self):
+        # A5 calibrated the short-batch heuristic; the earlier generation
+        # admits the same automatic launches but scores them without it.
+        for target in ("Ascend910_9391", "Ascend910B1", "Ascend910B2", "Ascend910B3", "Ascend910B4"):
+            self.backend.target.arch = target
+            self.calls.clear()
+            self.run_handler()
+            options = self.calls[-1][0][1]
+            self.assertEqual(options["block_batching_factor"], "auto", target)
+            self.assertFalse(json.loads(options["block_auto_contract"])["cv_empirical_short_batch"], target)
 
     def test_single_program_keeps_normal_cache_without_contract(self):
         for grid, axis in (((1, ), -1), ((1, 1, 1), -1), ((8, 1), 1)):

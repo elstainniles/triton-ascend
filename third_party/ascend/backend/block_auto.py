@@ -143,9 +143,10 @@ def _select_ttir(backend, frozen, options, env_vars, contract, scalar_arguments,
     arch, _, limit, _ = backend.parse_options(options).block_compile_context
     if limit is None:
         raise ValueError("automatic TTIR selection requires explicit AIC/AIV core counts")
-    a3 = arch.startswith("Ascend910_93")
-    contract = dict(contract, a3_resource_policy=a3)
-    if a3:
+    from .block_batching import uses_grouping_policy
+    legacy = uses_grouping_policy(arch)
+    contract = dict(contract, legacy_resource_policy=legacy)
+    if legacy:
         contract['cv_empirical_short_batch'] = False
     axis = options.get("block_batching_axis", -1)
     if cv:
@@ -174,9 +175,9 @@ def _select_ttir(backend, frozen, options, env_vars, contract, scalar_arguments,
         rows.append(row)
         prepared["unmerged" if factor == 1 else f"a{selected_axis}_f{factor}"] = module, metadata
     selection = _native("rank_ttir", contract, candidates=rows)
-    if a3:
-        selection.update(model="ttir-a3-grouping-v1",
-                         reason="A3_TTIR_GROUPING" if selection['factor'] > 1 else "A3_KEEP_BASELINE")
+    if legacy:
+        selection.update(model="ttir-legacy-grouping-v1",
+                         reason="LEGACY_TTIR_GROUPING" if selection['factor'] > 1 else "LEGACY_KEEP_BASELINE")
     chosen = selection["selected_key"]
     snapshot = _pack_ttir(*prepared[chosen], output) if chosen != "unmerged" else None
     plan["declines"] = [dict(axis=a, factor=f, **decline) for (a, f), decline in declines.items()]

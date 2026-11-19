@@ -78,6 +78,10 @@ inline void update(O &o, O values) {
   for (auto &v : values)
     o[v.first] = std::move(v.second);
 }
+// Keep this list in step with uses_grouping_policy in block_batching.py.
+inline bool usesGroupingPolicy(StringRef arch) {
+  return arch.starts_with("Ascend910_93") || arch.starts_with("Ascend910B");
+}
 inline int64_t product(const A &values) {
   int64_t n = 1;
   for (const V &v : values) {
@@ -227,9 +231,9 @@ O planCV(const O &request) {
           slot = &o;
       }
     }
-  if (flag(sub(request, "contract"), "a3_resource_policy")) {
+  if (flag(sub(request, "contract"), "legacy_resource_policy")) {
     auto reason = spatial.empty() ? "CV_NO_ADMITTED_SPATIAL_MERGE"
-                                  : "A3_CV_SPATIAL_CANDIDATES";
+                                  : "LEGACY_CV_SPATIAL_CANDIDATES";
     return result(reason, std::move(spatial));
   }
   if (m && n)
@@ -743,9 +747,11 @@ std::string scoreBlockTtir(ModuleOp module, llvm::StringRef request) {
     }
     int64_t blocks = product(grid);
     StringRef arch = input.getString("arch").value_or("");
-    if (arch.starts_with("Ascend910_93")) {
-      // A3 uses TTIR legality and occupancy, not A5 instruction costs. Final
-      // allocation and launcher validation still run on the selected binary.
+    if (usesGroupingPolicy(arch)) {
+      // The earlier generation uses TTIR legality and occupancy, not the A5
+      // instruction costs priced below against an A5 register file and
+      // unified buffer. Final allocation and launcher validation still run
+      // on the selected binary.
       bool allowed =
           factor == 1 ||
           (!preserve && axis >= 0 && axis < 3 && (factor == 2 || factor == 4) &&
@@ -755,7 +761,7 @@ std::string scoreBlockTtir(ModuleOp module, llvm::StringRef request) {
             str(input, "merge_kind") == "N"));
       update(output, O{{"status", allowed ? "TTIR_COST_ESTIMATED"
                                           : "TTIR_MODEL_UNSUPPORTED"},
-                       {"model", "ttir-a3-grouping-v1"},
+                       {"model", "ttir-legacy-grouping-v1"},
                        {"score", factor == 1 ? 5 : factor},
                        {"blocks", blocks},
                        {"cores", cores}});

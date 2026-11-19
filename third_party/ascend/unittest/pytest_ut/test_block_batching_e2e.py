@@ -8,6 +8,7 @@ import triton.language as tl
 import torch_npu
 
 from block_batching_test_utils import assert_applied, require_batching_target
+from triton.backends.ascend.block_batching import uses_grouping_policy
 
 
 @triton.jit
@@ -172,7 +173,7 @@ class TestVV:
 
     @pytest.fixture(autouse=True)
     def batching_target(self, monkeypatch):
-        require_batching_target(monkeypatch, include_a3=True)
+        require_batching_target(monkeypatch, include_legacy=True)
 
     @pytest.mark.parametrize('factor', [1, 3])
     def test_factor_tail_and_default(self, factor):
@@ -229,10 +230,10 @@ class TestVV:
         assert kernel is warmed
         torch.npu.synchronize()
         torch.testing.assert_close(out, x * 2 + 1, rtol=0, atol=0)
-        if str(kernel.metadata.target.arch).startswith('Ascend910_93'):
-            assert kernel.block_auto_selection['model'] == 'ttir-a3-grouping-v1'
+        if uses_grouping_policy(str(kernel.metadata.target.arch)):
+            assert kernel.block_auto_selection['model'] == 'ttir-legacy-grouping-v1'
             assert_applied(kernel, 2)
-            assert kernel.block_auto_selection['reason'] == 'A3_TTIR_GROUPING'
+            assert kernel.block_auto_selection['reason'] == 'LEGACY_TTIR_GROUPING'
 
     @pytest.mark.parametrize('explicit', [None, 'auto', 2])
     @pytest.mark.parametrize('generic', [False, True])
