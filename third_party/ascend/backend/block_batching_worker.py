@@ -49,11 +49,11 @@ def _digest(value):
 
 
 def _file_digest(path):
-    h = hashlib.sha256()
+    digest = hashlib.sha256()
     with path.open('rb') as stream:
         for chunk in iter(lambda: stream.read(1024 * 1024), b''):
-            h.update(chunk)
-    return h.hexdigest()
+            digest.update(chunk)
+    return digest.hexdigest()
 
 
 def _stage(directory):
