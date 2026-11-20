@@ -7,10 +7,13 @@
 #include "mlir/Dialect/SCF/IR/SCF.h"
 #include "mlir/IR/BuiltinOps.h"
 #include "mlir/IR/Matchers.h"
+#include "mlir/IR/TypeUtilities.h"
+#include "mlir/Interfaces/SideEffectInterfaces.h"
 #include "mlir/Pass/PassManager.h"
 #include "mlir/Transforms/Passes.h"
 #include "triton/Analysis/AxisInfo.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
+#include "llvm/ADT/DenseSet.h"
 #include "llvm/ADT/SmallVector.h"
 #include "llvm/ADT/StringSwitch.h"
 #include "llvm/Support/JSON.h"
@@ -74,6 +77,10 @@ inline bool flag(const O &o, StringRef key) {
 inline void update(O &o, O values) {
   for (auto &v : values)
     o[v.first] = std::move(v.second);
+}
+// Keep this list in step with uses_grouping_policy in block_batching.py.
+inline bool usesGroupingPolicy(StringRef arch) {
+  return arch.starts_with("Ascend910_93") || arch.starts_with("Ascend910B");
 }
 inline int64_t product(const A &values) {
   int64_t n = 1;
@@ -224,9 +231,9 @@ O planCV(const O &request) {
           slot = &o;
       }
     }
-  if (flag(sub(request, "contract"), "a3_resource_policy")) {
+  if (flag(sub(request, "contract"), "legacy_resource_policy")) {
     auto reason = spatial.empty() ? "CV_NO_ADMITTED_SPATIAL_MERGE"
-                                  : "A3_CV_SPATIAL_CANDIDATES";
+                                  : "LEGACY_CV_SPATIAL_CANDIDATES";
     return result(reason, std::move(spatial));
   }
   if (m && n)
@@ -668,6 +675,54 @@ static TtirWork ttirWork(ModuleOp module, const Profile &profile,
 } // namespace mlir::triton::ascend::blockauto
 
 namespace mlir::triton::ascend {
+std::vector<unsigned> blockDataOnlyArguments(ModuleOp module, unsigned arity) {
+  if (!llvm::hasSingleElement(*module.getBody()))
+    return {};
+  auto fn = dyn_cast<triton::FuncOp>(&module.getBody()->front());
+  if (!fn || !fn.isPublic() || fn.getNumArguments() != arity ||
+      !llvm::hasSingleElement(fn.getBody()))
+    return {};
+
+  // Follow every use, including both roles if a value is stored under itself
+  // as the mask. An unrecognized consumer keeps the scalar exact.
+  llvm::DenseSet<Operation *> dataConsumers;
+  auto onlyDataUses = [&](Value value) {
+    return llvm::all_of(value.getUses(), [&](OpOperand &use) {
+      Operation *owner = use.getOwner();
+      if (!dataConsumers.contains(owner))
+        return false;
+      auto store = dyn_cast<triton::StoreOp>(owner);
+      return !store || &use == &store.getValueMutable();
+    });
+  };
+  bool outputTail = true;
+  for (Operation &op : llvm::reverse(fn.getBody().front())) {
+    if (auto store = dyn_cast<triton::StoreOp>(op)) {
+      if (outputTail && getElementTypeOrSelf(store.getValue()).isIntOrFloat())
+        dataConsumers.insert(&op);
+      continue;
+    }
+    if (isa<triton::ReturnOp>(op))
+      continue;
+    // A later read may observe the stored value through an alias.
+    if (op.getNumRegions() || !isMemoryEffectFree(&op))
+      outputTail = false;
+    if (isa<triton::SplatOp, triton::BitcastOp, arith::BitcastOp,
+            arith::ExtSIOp, arith::ExtUIOp, arith::TruncIOp, arith::AddIOp,
+            arith::SubIOp, arith::MulIOp, arith::AndIOp, arith::OrIOp,
+            arith::XOrIOp, arith::ShLIOp, arith::ShRSIOp, arith::ShRUIOp,
+            arith::CmpIOp, arith::SelectOp>(op) &&
+        onlyDataUses(op.getResult(0)))
+      dataConsumers.insert(&op);
+  }
+
+  std::vector<unsigned> arguments;
+  for (BlockArgument arg : fn.getArguments())
+    if (isa<IntegerType>(arg.getType()) && onlyDataUses(arg))
+      arguments.push_back(arg.getArgNumber());
+  return arguments;
+}
+
 std::string scoreBlockTtir(ModuleOp module, llvm::StringRef request) {
   using namespace blockauto;
   auto parsed = json::parse(request);
@@ -692,9 +747,11 @@ std::string scoreBlockTtir(ModuleOp module, llvm::StringRef request) {
     }
     int64_t blocks = product(grid);
     StringRef arch = input.getString("arch").value_or("");
-    if (arch.starts_with("Ascend910_93")) {
-      // A3 uses TTIR legality and occupancy, not A5 instruction costs. Final
-      // allocation and launcher validation still run on the selected binary.
+    if (usesGroupingPolicy(arch)) {
+      // The earlier generation uses TTIR legality and occupancy, not the A5
+      // instruction costs priced below against an A5 register file and
+      // unified buffer. Final allocation and launcher validation still run
+      // on the selected binary.
       bool allowed =
           factor == 1 ||
           (!preserve && axis >= 0 && axis < 3 && (factor == 2 || factor == 4) &&
@@ -704,7 +761,7 @@ std::string scoreBlockTtir(ModuleOp module, llvm::StringRef request) {
             str(input, "merge_kind") == "N"));
       update(output, O{{"status", allowed ? "TTIR_COST_ESTIMATED"
                                           : "TTIR_MODEL_UNSUPPORTED"},
-                       {"model", "ttir-a3-grouping-v1"},
+                       {"model", "ttir-legacy-grouping-v1"},
                        {"score", factor == 1 ? 5 : factor},
                        {"blocks", blocks},
                        {"cores", cores}});

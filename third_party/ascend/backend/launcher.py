@@ -42,8 +42,8 @@ _LAUNCHER_CFLAGS = ("-O2", )
 # Keep these values in sync with launcher_abi.h. These are data tags, not C++
 # spellings: a signature is decoded once when a native plan is constructed.
 CONSTEXPR, POINTER, I8, I16, I32, I64, U8, U16, U32, U64, F32, F64, F16, BF16 = range(14)
-FFTS, PURE_SIMT, TASKQUEUE, AUTO_MAP, GRID_WARNING, COALESCE_CEIL, DYNAMIC_SHARED, DEVICE_PRINT, IAT, PTSM, DOT_ROW = (
-    1 << i for i in range(11))
+FFTS, PURE_SIMT, TASKQUEUE, AUTO_MAP, GRID_WARNING, COALESCE_CEIL, DYNAMIC_SHARED, DEVICE_PRINT, IAT, PTSM, DOT_ROW, IAT64 = (
+    1 << i for i in range(12))
 
 _KINDS = {
     "constexpr": CONSTEXPR,
@@ -102,6 +102,8 @@ class LaunchSpec:
     batch_axis: int = -1
     batch_factor: int = 1
 
+    profile_scratch_size: int = 0
+
     def as_dict(self):
         result = asdict(self)
         if not self.grid_contract_version:
@@ -157,6 +159,7 @@ def _program_grid_config(metadata):
     # requires the originalGridX/Y hidden arguments of dynamic mappings.
     modes = {
         ((1, 16, False, False), ): (IAT, 1, -1),
+        ((1, 64, False, False), ): (IAT | IAT64, 1, -1),
         ((1, 16, False, False), (0, 4, True, True)): (IAT | PTSM, 1, -1),
         ((0, 64, True, True), ): (PTSM, 1, -1),
         **{((0, factor, False, False), ): (DOT_ROW | COALESCE_CEIL, factor, 0)
@@ -209,6 +212,7 @@ def make_launch_spec(metadata, npu_utils):
     batch = normalize_program_grid_transforms(batch) if batch is not None else None
     batch = batch if batch and batch["version"] == 3 else None
     return LaunchSpec(
+        profile_scratch_size=int(getattr(metadata, "profile_scratch_size", 0) or 0),
         grid_contract_version=3 if batch else 0,
         batch_axis=batch["transforms"][0]["axis"] if batch else -1,
         batch_factor=batch["transforms"][0]["factor"] if batch else 1,
@@ -266,7 +270,7 @@ def make_tensordesc_arg(arg):
     return [arg.base, *arg.shape, *arg.strides, arg.padding == "nan", *arg.shape, *arg.strides]
 
 
-def wrap_handle_tensordesc(launcher, signature):
+def wrap_handle_tensordesc(launcher, signature, profile_scratch=False):
     signatures = tuple(signature.values())
     if not any(isinstance(sig, tuple) or sig.startswith("tensordesc") for sig in signatures):
         return launcher
@@ -281,10 +285,12 @@ def wrap_handle_tensordesc(launcher, signature):
         return [arg]
 
     def wrapped(*args):
-        if len(args) != 9 + len(signatures):
-            raise TypeError(f"launch expects {9 + len(signatures)} arguments, got {len(args)}")
-        flattened = [item for sig, value in zip(signatures, args[9:]) for item in expand(sig, value)]
-        return launcher(*args[:9], *flattened)
+        expected = 9 + len(signatures) + int(profile_scratch)
+        if len(args) != expected:
+            raise TypeError(f"launch expects {expected} arguments, got {len(args)}")
+        flattened = [item for sig, value in zip(signatures, args[9:9 + len(signatures)]) for item in expand(sig, value)]
+        scratch_args = args[-1:] if profile_scratch else ()
+        return launcher(*args[:9], *flattened, *scratch_args)
 
     return wrapped
 
@@ -360,6 +366,12 @@ def _load_runtime(path):
 
 
 def get_runtime(npu_utils_path, debug=False):
+    # The launcher bakes the helper's absolute path: a deleted or evicted
+    # artifact must be re-resolved (and rebuilt if needed) before the path is
+    # baked in.
+    if not os.path.exists(npu_utils_path):
+        from triton.backends.ascend.driver import NPUUtils
+        npu_utils_path = NPUUtils().get_so_path()
     print_identity = None
     if knobs.ascend.device_print:
         # CANN/loaded framework replacement requires a new process. Track the

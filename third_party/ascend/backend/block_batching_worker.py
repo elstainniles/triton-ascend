@@ -1,6 +1,6 @@
 # Copyright (c) Huawei Technologies Co., Ltd. 2026. All rights reserved.
 """Isolated compilation workers. The parent alone binds and publishes artifacts."""
-from contextlib import ExitStack
+from contextlib import ExitStack, contextmanager
 from contextvars import ContextVar
 from dataclasses import dataclass
 import hashlib
@@ -18,7 +18,7 @@ from uuid import uuid4
 
 I32_MAX = (1 << 31) - 1
 
-_PROTOCOL = 2
+_PROTOCOL = 3
 _TIMEOUT = 600
 _TERMINATION_GRACE = 0.5
 _MAX_REPLY = 32 * 1024 * 1024
@@ -27,7 +27,11 @@ _MANIFEST = 'block_batching.artifacts'
 _DECLINE = 'block_batching.decline'
 # Extend only for audited, deterministic TTIR failures. Resource limits,
 # analysis budgets and abnormal worker exits must remain retryable.
-_CACHEABLE_DECLINES = frozenset({'UNSUPPORTED_ADDRESS_EXPRESSION'})
+_CACHEABLE_DECLINES = frozenset({'UNSUPPORTED_ADDRESS_EXPRESSION', 'UNSUPPORTED_BYTE_OPERATION'})
+# Cost model limits reported by scoring itself. These are raised while reading
+# the TTIR, so the same module always reaches the same limit, and the request
+# identity carries the backend revision the model ships with.
+_DETERMINISTIC_MODEL_LIMITS = frozenset({'dynamic loop trip count in TTIR cost model'})
 _BOOTSTRAP = ('import resource; resource.setrlimit(resource.RLIMIT_CORE, (0, 0)); '
               'import site; site.main(); from triton.backends.ascend.block_batching_worker import _worker; _worker()')
 
@@ -498,29 +502,104 @@ def _worker():
     (directory / 'result').write_text(json.dumps(reply, allow_nan=False))
 
 
-def _publish_generation(cache, record, pending):
-    # Release rollback ownership before replacing the public index. A Python
-    # interruption immediately after rename must never remove a visible generation.
-    directory = Path(cache.cache_dir)
-    fd, name = tempfile.mkstemp(dir=directory)
-    path = Path(name)
-    try:
-        with os.fdopen(fd, 'w') as stream:
-            json.dump(record, stream)
-        # Retain a private rollback handle for a synchronous rename failure.
-        # When a signal interrupts the syscall its commit status is unknown:
-        # an unreachable private directory is safer than a dangling index.
-        rollback = pending.pop_all()
+def _remove_stage(directory):
+    if directory.exists():
+        shutil.rmtree(directory)
+
+
+@contextmanager
+def _cache_lock(directory):
+    """Serialize group reads and publication, never compilation, for one key."""
+    import fcntl
+    locks = directory.parent / '.block-locks'
+    locks.mkdir(parents=True, exist_ok=True)
+    previous = directory.parent / '.block-staging' / (directory.name + '.previous')
+    with (locks / directory.name).open('a') as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        # Recover a writer interrupted between the two directory renames.
+        if previous.exists():
+            if directory.exists() and any(directory.glob('__grp__*.json')):
+                _remove_stage(previous)
+            else:
+                if directory.exists():
+                    directory.rmdir()  # Only an empty cache-manager placeholder is removable.
+                previous.replace(directory)
+        yield previous
+
+
+@contextmanager
+def flat_cache(variant):
+    from triton import knobs
+    from triton.runtime.cache import FileCacheManager, get_cache_manager, _base32
+    directory = Path(knobs.cache.dir).resolve() / _base32(variant)
+    with _cache_lock(directory):
+        cache = get_cache_manager(variant)
+        if type(cache) is not FileCacheManager or Path(cache.cache_dir).resolve() != directory:
+            raise BatchCompileError('nonlocal block cache', kind='InvalidArtifact', stage='cache')
+        yield cache
+
+
+def _new_stage(cache):
+    from triton.runtime.cache import FileCacheManager
+    directory = Path(cache.cache_dir).resolve().parent / '.block-staging' / uuid4().hex
+    return FileCacheManager(str(directory))
+
+
+def _publish_artifacts(cache, stage, group, manifest=None):
+    """Move validated files into the ordinary key directory without copying bytes."""
+    from triton.runtime.cache import FileCacheManager
+    directory = Path(cache.cache_dir).resolve()
+    flat = {name: str(directory / name) for name in group}
+    metadata_name, = (name for name in group if name.endswith('.json'))
+    writer = FileCacheManager(str(stage))
+    writer.put_group(metadata_name, flat)
+    if manifest is not None:
+        writer.put(json.dumps(manifest), _MANIFEST, binary=False)
+    with _cache_lock(directory) as previous:
+        if directory.exists():
+            directory.replace(previous)
         try:
-            path.replace(directory / _MANIFEST)
-        except InterruptedError:
+            stage.replace(directory)
+        except BaseException:
+            # A signal can arrive after rename committed. Never remove the new
+            # visible group; a later reader can discard its previous backup.
+            if not directory.exists() and previous.exists():
+                previous.replace(directory)
             raise
-        except OSError:
-            rollback.close()
-            raise
-    except BaseException:
-        path.unlink(missing_ok=True)
-        raise
+        _remove_stage(previous)
+    return flat
+
+
+class _BaselineWriter:
+    """Stage F1 through the existing compiler and publish before its listener runs."""
+
+    def __init__(self, cache):
+        self.cache = cache
+        self.writer = _new_stage(cache)
+
+    def __getattr__(self, name):
+        return getattr(self.writer, name)
+
+    def commit(self, source, group, variant):
+        from triton.compiler.compiler import CompiledKernel
+        stage = Path(self.writer.cache_dir)
+        # Forced compilation can inherit old IR entries from get_group(). Only
+        # files produced in this attempt belong to the replacement directory.
+        group = {name: path for name, path in group.items() if Path(path).parent == stage}
+        result = CompiledKernel(source, group, variant)
+        if result.metadata.hash != variant:
+            raise BatchCompileError('baseline artifact identity mismatch', kind='InvalidArtifact', stage='cache')
+        result.metadata_group = _publish_artifacts(self.cache, stage, group)
+        return result
+
+
+@contextmanager
+def baseline_writer(cache):
+    writer = _BaselineWriter(cache)
+    try:
+        yield writer
+    finally:
+        _remove_stage(Path(writer.cache_dir))
 
 
 def _worker_request(backend, source, options, env_vars, variant):
@@ -617,40 +696,36 @@ class CandidateCompiler:
         variant = _variant_key(self.source, self.backend, normalized, self.env_vars)
         if self.prepared is not None:
             _check_ttir(self.prepared, variant, normalized)
-        # Old groups were published by _compile before contract binding. A distinct
-        # index lets us ignore them without invalidating the independent F1 entry.
-        cache = _candidate_cache(variant)
-        attempts = Path(cache.cache_dir).resolve() / 'attempts'
         name = self.source.name[:150]
         if Path(name).name != name or not name:
             raise BatchCompileError('invalid candidate artifact basename', kind='InvalidArtifact')
-        index = cache.get_file(_MANIFEST)
-        if index and not knobs.compilation.always_compile:
-            try:
-                stored = json.loads(Path(index).read_bytes())
-                generation = stored['generation']
-                if not isinstance(generation, str) or len(generation) != 32 or any(c not in '0123456789abcdef'
-                                                                                   for c in generation):
-                    raise ValueError('invalid cache generation')
-                group = _checked_group(stored['manifest'], attempts / generation, variant, name)
-            except (OSError, ValueError, TypeError, KeyError) as error:
-                raise BatchCompileError(f'invalid published index: {error}', kind='InvalidArtifact',
-                                        stage='cache') from error
-            return None, (cache, None, group, variant, timer.end() if timer else None)
+        with ExitStack() as reading:
+            cache = reading.enter_context(flat_cache(variant))
+            index = cache.get_file(_MANIFEST)
+            if index and not knobs.compilation.always_compile:
+                try:
+                    manifest = json.loads(Path(index).read_bytes())
+                    group = _checked_group(manifest, Path(cache.cache_dir).resolve(), variant, name)
+                except (OSError, ValueError, TypeError, KeyError) as error:
+                    raise BatchCompileError(f'invalid published index: {error}', kind='InvalidArtifact',
+                                            stage='cache') from error
+                # Keep the read lock until CompiledKernel has read the complete
+                # group and the parent has bound its execution contract.
+                pending.enter_context(reading.pop_all())
+                return None, (cache, None, group, variant, timer.end() if timer else None)
         if cached_only:
             return None, None
+        decline_cache = _candidate_cache(variant)
         if not knobs.compilation.always_compile:
-            refusal = _cached_decline(cache, variant)
+            refusal = _cached_decline(decline_cache, variant)
             if refusal is not None:
                 return refusal, None
-        generation = uuid4().hex
         body = _worker_request(self.backend, self.source, options, self.env_vars, variant)
         if self.prepared is not None:
             body['prepared'] = self.prepared
-        body.update(stage_key=f'{cache.key}/attempts/{generation}', timing=bool(listener))
-        stage_dir = attempts / generation
-        stage_dir.mkdir(parents=True, exist_ok=False)
-        pending.callback(shutil.rmtree, stage_dir)
+        stage_dir = Path(_new_stage(cache).cache_dir).resolve()
+        body.update(stage_key=str(stage_dir), timing=bool(listener))
+        pending.callback(_remove_stage, stage_dir)
         outcome = _attempt('compile', body)
         if outcome.status == 'NotApplicable':
             refusal = outcome.payload
@@ -662,15 +737,15 @@ class CandidateCompiler:
             if refusal['reason'] in _RESOURCE_REASONS and (refusal.get('stage') != 'npubin'
                                                            or not isinstance(refusal.get('diagnostic'), str)):
                 raise BatchCompileError('invalid resource refusal evidence', kind='ProtocolError')
-            _remember_decline(cache, variant, refusal)
+            _remember_decline(decline_cache, variant, refusal)
             return refusal, None
         manifest = outcome.payload['manifest']
-        group = _checked_group(manifest, attempts / generation, variant, name)
+        group = _checked_group(manifest, stage_dir, variant, name)
         try:
             timings = knobs.CompileTimes(**outcome.payload['timings']) if timer else None
         except (KeyError, TypeError) as error:
             raise BatchCompileError('invalid compilation timing record', kind='ProtocolError') from error
-        return None, (cache, dict(generation=generation, manifest=manifest), group, variant, timings)
+        return None, (cache, dict(stage=stage_dir, manifest=manifest), group, variant, timings)
 
     def compile(self, baseline, options, request, positions, *, allow_layout_retry=True, cached_only=False):
         with ExitStack() as pending:
@@ -716,7 +791,9 @@ class CandidateCompiler:
         except Exception as exc:
             raise BatchCompileError(str(exc), kind='InvalidArtifact', stage='bind') from exc
         if record is not None:
-            _publish_generation(cache, record, pending)
+            group = _publish_artifacts(cache, record['stage'], group, record['manifest'])
+            candidate.metadata_group = group
+        pending.close()
         bundle.publish_manifest()
         if knobs.compilation.listener:
             _notify_compilation_listener(knobs.compilation.listener, src=self.source,
@@ -780,7 +857,7 @@ def _runtime_positions(src):
     return result
 
 
-def _freeze_source(backend, src, baseline_options, backend_revision):
+def _freeze_source(backend, src, baseline_options, backend_revision, *, scalar_positions=()):
     """Generate frontend IR once, then parse the same immutable snapshot per variant."""
     import hashlib
     from triton._C.libtriton import ascend, ir
@@ -805,7 +882,12 @@ def _freeze_source(backend, src, baseline_options, backend_revision):
     path = cache.put(data, "block_batching.original.ttir", binary=True)
 
     from .block_batching_source import FrozenSource
-    return FrozenSource(src, path, fingerprint, hashlib.sha256(data).hexdigest())
+    frozen = FrozenSource(src, path, fingerprint, hashlib.sha256(data).hexdigest())
+    if scalar_positions:
+        frozen.block_auto_data_arguments = tuple(
+            src.fn.arg_names[scalar_positions[i]]
+            for i in ascend.block_data_only_arguments(module, len(scalar_positions)))
+    return frozen
 
 
 def rejected_bundle(baseline, request, decline, positions=(), retry=None):

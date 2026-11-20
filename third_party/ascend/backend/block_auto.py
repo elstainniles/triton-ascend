@@ -14,13 +14,32 @@ class _SelectionMiss(Exception):
     """A cached decision has neither a binary nor a usable TTIR snapshot."""
 
 
+def _cacheable_candidate(row):
+    """Whether this candidate reaches the same outcome on the same inputs."""
+    from .block_batching_worker import _CACHEABLE_DECLINES, _DETERMINISTIC_MODEL_LIMITS
+    status = row.get("status")
+    if status == "TTIR_COST_ESTIMATED":
+        return True
+    # _NotApplicable carries a modeled decline reason, never a frontend crash.
+    if status == "COMPILE_REJECTED":
+        return row.get("error") in _CACHEABLE_DECLINES
+    # A limit of the cost model is a property of the TTIR, and the request
+    # identity already covers the backend revision that model ships with.
+    if status == "TTIR_MODEL_UNSUPPORTED":
+        return row.get("error") in _DETERMINISTIC_MODEL_LIMITS
+    return False
+
+
 def _cacheable_selection(report):
     from .block_batching_worker import _cacheable_decline
     selection = report["selection"]
-    # model_complete only guarantees a baseline score. Do not turn unmodeled
-    # candidates or unaudited refusals into a persistent F1 decision.
-    return (selection.get("model_complete") is True and not selection.get("failure_kind")
-            and all(row.get("status") == "TTIR_COST_ESTIMATED" for row in selection["candidates"].values()) and all(
+    # A decision persists when every outcome behind it reproduces, not only
+    # when the model priced everything. A kernel the model cannot price is a
+    # stable fact about that kernel, so each process rediscovering it buys
+    # nothing. Resource limits and abnormal exits still arrive as a
+    # failure_kind and stay retryable.
+    return (not selection.get("failure_kind")
+            and all(_cacheable_candidate(row) for row in selection["candidates"].values()) and all(
                 _cacheable_decline({k: v
                                     for k, v in decline.items()
                                     if k not in ("factor", "axis")})
@@ -143,9 +162,10 @@ def _select_ttir(backend, frozen, options, env_vars, contract, scalar_arguments,
     arch, _, limit, _ = backend.parse_options(options).block_compile_context
     if limit is None:
         raise ValueError("automatic TTIR selection requires explicit AIC/AIV core counts")
-    a3 = arch.startswith("Ascend910_93")
-    contract = dict(contract, a3_resource_policy=a3)
-    if a3:
+    from .block_batching import uses_grouping_policy
+    legacy = uses_grouping_policy(arch)
+    contract = dict(contract, legacy_resource_policy=legacy)
+    if legacy:
         contract['cv_empirical_short_batch'] = False
     axis = options.get("block_batching_axis", -1)
     if cv:
@@ -174,9 +194,9 @@ def _select_ttir(backend, frozen, options, env_vars, contract, scalar_arguments,
         rows.append(row)
         prepared["unmerged" if factor == 1 else f"a{selected_axis}_f{factor}"] = module, metadata
     selection = _native("rank_ttir", contract, candidates=rows)
-    if a3:
-        selection.update(model="ttir-a3-grouping-v1",
-                         reason="A3_TTIR_GROUPING" if selection['factor'] > 1 else "A3_KEEP_BASELINE")
+    if legacy:
+        selection.update(model="ttir-legacy-grouping-v1",
+                         reason="LEGACY_TTIR_GROUPING" if selection['factor'] > 1 else "LEGACY_KEEP_BASELINE")
     chosen = selection["selected_key"]
     snapshot = _pack_ttir(*prepared[chosen], output) if chosen != "unmerged" else None
     plan["declines"] = [dict(axis=a, factor=f, **decline) for (a, f), decline in declines.items()]
@@ -190,7 +210,11 @@ def compile_auto_bundle(backend, src, options, compile_variant, *, env_vars):
     from triton import knobs
 
     common = {k: v for k, v in options.items() if k not in ("block_auto_contract", "block_batching_grid")}
-    baseline_options = dict(common, block_batching_factor=1, block_batching_axis=-1)
+    # F1 is the ordinary artifact. The parent-resolved device snapshot only
+    # spares the candidate worker a device query the parent repeats here, so
+    # keeping it would split F1 away from the entry a plain launch or a warmup
+    # writes, and no automatic launch would ever hit the compilation cache.
+    baseline_options = dict(common, block_batching_factor=1, block_batching_axis=-1, block_compile_context=None)
     if not options.get("block_auto_contract"):
         return compile_variant(baseline_options)
     contract = json.loads(options["block_auto_contract"])
@@ -201,10 +225,15 @@ def compile_auto_bundle(backend, src, options, compile_variant, *, env_vars):
     positions = compilation._runtime_positions(src)
     if isinstance(positions, BatchDecline):
         return compile_variant(baseline_options)
-    scalar_arguments = [contract["arguments"].get(src.fn.arg_names[index], {}).get("value") for index in positions]
-    frozen = compilation._freeze_source(backend, src, baseline_options, normalized.block_batching_backend_revision)
+    from .block_batching import _generalize_data_arguments
+    arguments = contract["arguments"]
+    has_integer = any(type(arg.get("value")) is int for arg in arguments.values())
+    frozen = compilation._freeze_source(backend, src, baseline_options, normalized.block_batching_backend_revision,
+                                        scalar_positions=positions if has_integer else ())
     if isinstance(frozen, BatchDecline):
         return compile_variant(baseline_options)
+    _generalize_data_arguments(arguments, vars(frozen).get("block_auto_data_arguments", ()))
+    scalar_arguments = [arguments.get(src.fn.arg_names[index], {}).get("value") for index in positions]
     # The hook supplies the same immutable environment to F1 and each child.
     env_vars = dict(env_vars)
     selection_options = dict(common, block_batching_factor=1)
@@ -257,8 +286,12 @@ def _compile_selected(backend, frozen, common, baseline_options, compile_variant
     factor, axis = selection["factor"], selection["selected_axis"]
     if type(factor) is not int or factor not in (1, 2, 4) or (factor > 1 and axis not in (0, 1, 2)):
         raise BatchCompileError("invalid TTIR selection", kind="ProtocolError", stage="select")
-    baseline = compile_variant(baseline_options, frozen)
-    if baseline.hash != _variant_key(frozen, backend, backend.parse_options(baseline_options), env_vars):
+    # The frozen source exists to give the candidate a byte-identical reference,
+    # and it carries a cache identity of its own. Without a candidate to compare
+    # against, F1 is the ordinary artifact, so compiling it from the original
+    # source keeps the entry an ordinary launch or a warmup already wrote.
+    baseline = compile_variant(baseline_options, frozen if factor > 1 else None)
+    if factor > 1 and baseline.hash != _variant_key(frozen, backend, backend.parse_options(baseline_options), env_vars):
         raise BatchCompileError("baseline cache identity changed", kind="InvalidArtifact", stage="bind")
     result, declines = None, []
     if factor > 1:
@@ -295,4 +328,6 @@ def _compile_selected(backend, frozen, common, baseline_options, compile_variant
     selection.pop("factor")
     result.block_auto_selection = dict(selection, selected_factor=factor, candidate_plan=plan,
                                        compile_rejections=declines)
+    if "block_auto_data_arguments" in vars(frozen):
+        result.block_auto_data_arguments = frozen.block_auto_data_arguments
     return result

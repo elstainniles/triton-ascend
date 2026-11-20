@@ -2242,7 +2242,7 @@ class AutoTilingTuner(Autotuner):
     def _default_block_batching(self, options):
         # Apply after Config/caller options are combined, preserving explicit
         # factors and kernels with a same-named argument.
-        if "block_batching_factor" not in self.arg_names:
+        if "block_batching_factor" not in getattr(self, "arg_names", ()):
             options.setdefault("block_batching_factor", 1)
 
     def _run_autotune(self, *args, **kwargs):

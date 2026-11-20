@@ -9,18 +9,19 @@ Programming Model
 -----------------
 
 .. autosummary::
+    :toctree: generated
     :nosignatures:
 
     tensor
     tensor_descriptor
     program_id
     num_programs
-    map_elementwise
 
 Creation Ops
 ------------
 
 .. autosummary::
+    :toctree: generated
     :nosignatures:
 
     arange
@@ -34,6 +35,7 @@ Shape Manipulation Ops
 ----------------------
 
 .. autosummary::
+    :toctree: generated
     :nosignatures:
 
     broadcast
@@ -52,6 +54,7 @@ Linear Algebra Ops
 ------------------
 
 .. autosummary::
+    :toctree: generated
     :nosignatures:
 
     dot
@@ -61,6 +64,7 @@ Memory/Pointer Ops
 ------------------
 
 .. autosummary::
+    :toctree: generated
     :nosignatures:
 
     load
@@ -75,6 +79,7 @@ Indexing Ops
 ------------
 
 .. autosummary::
+    :toctree: generated
     :nosignatures:
 
     flip
@@ -86,72 +91,38 @@ Math Ops
 --------
 
 .. autosummary::
+    :toctree: generated
     :nosignatures:
 
     abs
-    add
     cdiv
     ceil
     clamp
     cos
-    div
     div_rn
     erf
     exp
     exp2
     fdiv
-    floordiv
     floor
     fma
     log
     log2
     maximum
     minimum
-    mod
-    mul
-    neg
     rsqrt
     sigmoid
     sin
     softmax
     sqrt
     sqrt_rn
-    sub
     umulhi
-
-Logical Ops
------------
-
-.. autosummary::
-    :nosignatures:
-
-    and
-    or
-    xor
-    not
-    logical_and
-    logical_or
-    invert
-    lshift
-    rshift
-
-Comparison Ops
---------------
-
-.. autosummary::
-    :nosignatures:
-
-    gt
-    ge
-    lt
-    le
-    eq
-    ne
 
 Reduction Ops
 -------------
 
 .. autosummary::
+    :toctree: generated
     :nosignatures:
 
     argmax
@@ -159,7 +130,6 @@ Reduction Ops
     max
     min
     reduce
-    reduce_or
     sum
     xor_sum
 
@@ -167,10 +137,10 @@ Scan/Sort Ops
 -------------
 
 .. autosummary::
+    :toctree: generated
     :nosignatures:
 
     associative_scan
-    bitonic_merge
     cumprod
     cumsum
     histogram
@@ -181,6 +151,7 @@ Atomic Ops
 ----------
 
 .. autosummary::
+    :toctree: generated
     :nosignatures:
 
     atomic_add
@@ -196,29 +167,29 @@ Random Number Generation
 ------------------------
 
 .. autosummary::
+    :toctree: generated
     :nosignatures:
 
     randint4x
     randint
     rand
-    rand4x
     randn
-    randn4x
 
 Iterators
 ---------
 
 .. autosummary::
+    :toctree: generated
     :nosignatures:
 
     range
     static_range
-    condition
 
 Compiler Hint Ops
 -----------------
 
 .. autosummary::
+    :toctree: generated
     :nosignatures:
 
     assume
@@ -231,6 +202,7 @@ Debug Ops
 ---------
 
 .. autosummary::
+    :toctree: generated
     :nosignatures:
 
     static_print
@@ -242,29 +214,7 @@ Inline Assembly
 ---------------
 
 .. autosummary::
+    :toctree: generated
     :nosignatures:
 
     inline_asm_elementwise
-
-
-.. toctree::
-    :maxdepth: 1
-    :class: sidebar-groups-only
-
-    triton.language/programming_model
-    triton.language/creation_ops
-    triton.language/shape_manipulation_ops
-    triton.language/linear_algebra_ops
-    triton.language/memory_pointer_ops
-    triton.language/indexing_ops
-    triton.language/math_ops
-    triton.language/logical_ops
-    triton.language/comparison_ops
-    triton.language/reduction_ops
-    triton.language/scan_sort_ops
-    triton.language/atomic_ops
-    triton.language/random_number_generation
-    triton.language/iterators
-    triton.language/compiler_hint_ops
-    triton.language/debug_ops
-    triton.language/inline_assembly

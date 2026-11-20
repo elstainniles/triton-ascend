@@ -1,4 +1,3 @@
-import pytest
 import triton
 import triton.language as tl
 import torch
@@ -24,7 +23,6 @@ def triton_softmax_2d(in_ptr, out_ptr, ynumel: tl.constexpr, XB: tl.constexpr, Y
     tl.store(out_ptr + idx, ret)
 
 
-@pytest.mark.skip(reason="Temporarily failing; to be fixed by the npuir package replacement")
 def test_softmax_2d():
     shape = (16, 32)
     xnumel, ynumel = shape

@@ -1,7 +1,3 @@
-import triton
-import triton.language as tl
-
-
 @triton.jit
 def triton_compile_hint(in_ptr0, out_ptr0, xnumel, XBLOCK: tl.constexpr, XBLOCK_SUB: tl.constexpr):
     xoffset = tl.program_id(0) * XBLOCK

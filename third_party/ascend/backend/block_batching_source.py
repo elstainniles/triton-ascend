@@ -34,6 +34,7 @@ class FrozenSource(ASTSource):
         snapshot = Path(directory) / 'input.ttir'
         snapshot.write_bytes(data)
         source = cls.__new__(cls)
+        source.fn = None
         source.name, source.ext, source.language = record['name'], record['ext'], Language[record['language']]
         source.path = str(snapshot)
         source.block_batching_source_hash, source.digest = record['fingerprint'], record['digest']

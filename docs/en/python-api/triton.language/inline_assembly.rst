@@ -1,1 +1,0 @@
-../../../zh/python-api/triton.language/inline_assembly.rst

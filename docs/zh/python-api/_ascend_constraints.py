@@ -1,44 +1,38 @@
 # _ascend_constraints.py
-# Ascend platform constraints for Triton API
+# Ascend platform constraints for Triton / TLA API
 # Fields: constraints (text list), example (optional file name)
+
+# TLA entries use _TLA_PREFIX; their examples live under docs/zh/examples/tla.
+_TLA_PREFIX = "triton.language.extra.tla"
 
 CONSTRAINTS = {
     "triton.Config": {
         "constraints": [
-            "``num_stages``: Not applicable on Ascend",
-            "``num_ctas``: Not applicable on Ascend",
-            "``maxnreg``: No effect on Ascend",
+            "``num_stages``: 适用于 SM80+ GPU 的软件流水线阶段数，Ascend 平台不适用",
+            "``num_ctas``: 块集群特性仅适用于 SM90+ GPU，Ascend 平台不适用",
+            "``maxnreg``: 对应 PTX .maxnreg 指令，非所有平台支持，Ascend 平台无效",
         ],
         "example":
         "triton.Config",
     },
     "triton.autotune": {
         "constraints": [
-            "``use_cuda_graph``: Not applicable on Ascend",
+            "``use_cuda_graph``: CUDA Graph 是 NVIDIA 特性，Ascend 平台不适用",
         ],
         "example": "triton.autotune",
     },
     "triton.extension.buffer.language.alloc": {
         "constraints": [
-            "Shape: each element must be a positive integer.",
+            "DataType: Ascend supports int8, int16, int32, uint8, uint64, int64, fp32, bf16, bool. Does not support uint16, uint32, fp16.",
+            "Shape: Each element must be a positive integer.",
             "Address space: must fit within the specified address space size limits.",
         ],
-        "dtype_support":
-        """
-            +--------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            | 平台         | uint8 | int8 | uint16 | int16 | uint32 | int32 | uint64 | int64 | fp16 | fp32 | fp64 | bf16 | fp8e(e4m3) | fp8e5(e5m2) | bool |
-            +==============+=======+======+========+=======+========+=======+========+=======+======+======+======+======+============+=============+======+
-            | Ascend A2/A3 |   √   |  √   |   ×    |   √   |   ×    |   √   |   √    |   √   |  ×   |  √   |  ×   |  √   |     ×      |      ×      |  √   |
-            +--------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            | Ascend 950   |   √   |  √   |   ×    |   √   |   ×    |   √   |   √    |   √   |  ×   |  √   |  ×   |  √   |     ×      |      ×      |  √   |
-            +--------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            """,
         "example":
         "triton.extension.buffer.language.alloc",
     },
     "triton.extension.buffer.language.fixpipe": {
         "constraints": [
-            "DataType: Operates on L0C to UB data movement (Ascend 950PR&950DT products/Ascend hardware specific).",
+            "DataType: Operates on L0C to UB data movement (Ascend 950/Ascend hardware specific).",
             "Source must be the result of a dot (matrix multiply) operation.",
             "Destination must be a buffer with UB memory scope.",
         ],
@@ -60,818 +54,317 @@ CONSTRAINTS = {
         ],
         "example": "triton.extension.buffer.language.to_tensor",
     },
-    "triton.extension.buffer.language.subview": {},
-    "triton.extension.buffer.language.address_space": {},
-    "triton.extension.buffer.language.buffer_type": {
-        "replace_docstring": [
-            "Represents the type of a buffer, including its element type, shape,",
-            "address space, and optional strides.",
-            "",
-            ":param element_ty: the data type of each element in the buffer.",
-            ":type element_ty: tl.dtype",
-            ":param shape: the shape of the buffer as a list of dimensions.",
-            ":type shape: List[int]",
-            ":param space: the target-specific address space of the buffer.",
-            ":type space: address_space, optional",
-            ":param strides: the strides of the buffer.",
-            ":type strides: List[int], optional",
-        ],
-    },
-    "triton.extension.buffer.language.buffer": {},
     "triton.language.permute": {
-        "constraints": [],
-        "dtype_support": """
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            |                                     | uint8 | int8 | uint16 | int16 | uint32 | int32 | uint64 | int64 | fp16 | fp32 | fp64 | bf16 | fp8e(e4m3) | fp8e5(e5m2) | bool |
-            +=====================================+=======+======+========+=======+========+=======+========+=======+======+======+======+======+============+=============+======+
-            | Atlas A2 products/Atlas A3 products | √     | √    | ×      | √     | ×      | √     | ×      | √     | √    | √    | ×    | √    | ×          | ×           | √    |
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            | Ascend 950PR&950DT products         | √     | √    | √      | √     | √      | √     | √      | √     | √    | √    | ×    | √    | √          | √           | √    |
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            """,
-        "example": "triton.language.permute",
+        "constraints": [
+            "DataType: Ascend A2/A3 does not support fp64, fp8e4, fp8e5, uint16, uint32, uint64 (hardware limitation).",
+        ],
+        "example":
+        "triton.language.permute",
     },
     "triton.heuristics": {
         "example": "triton.heuristics",
     },
     "triton.jit": {
-        "example":
-        "triton.jit",
-        "replace_docstring": [
-            "Decorator for JIT-compiling a function using the Triton compiler.",
-            "",
-            ":note: When a jit'd function is called, arguments are",
-            "    implicitly converted to pointers if they have a :code:`.data_ptr()` method",
-            "    and a `.dtype` attribute.",
-            "",
-            ":note: This function will be compiled and run on the device. It will only have access to:",
-            "",
-            "       * python primitives,",
-            "       * builtins within the triton package,",
-            "       * arguments to this function,",
-            "       * other jit'd functions",
-            "",
-            ":param fn: the function to be jit-compiled",
-            ":type fn: Callable",
-        ],
+        "example": "triton.jit",
     },
     "triton.language.abs": {
-        "constraints": [],
-        "dtype_support": """
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            |                                     | uint8 | int8 | uint16 | int16 | uint32 | int32 | uint64 | int64 | fp16 | fp32 | fp64 | bf16 | fp8e(e4m3) | fp8e5(e5m2) | bool |
-            +=====================================+=======+======+========+=======+========+=======+========+=======+======+======+======+======+============+=============+======+
-            | Atlas A2 products/Atlas A3 products | √     | √    | ×      | √     | ×      | √     | ×      | √     | √    | √    | ×    | √    | ×          | ×           | √    |
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            | Ascend 950PR&950DT products         | √     | √    | √      | √     | √      | √     | √      | √     | √    | √    | ×    | √    | √          | √           | √    |
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            """,
-        "example": "triton.language.abs",
+        "constraints": [
+            "DataType: Ascend A2/A3 does not support uint16/uint32/uint64/fp64, \
+                Ascend 950 does not support fp64.",
+        ],
+        "example":
+        "triton.language.abs",
     },
     "triton.language.add": {
-        "constraints": [],
-        "dtype_support":
-        """
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            |                                     | uint8 | int8 | uint16 | int16 | uint32 | int32 | uint64 | int64 | fp16 | fp32 | fp64 | bf16 | fp8e(e4m3) | fp8e5(e5m2) | bool |
-            +=====================================+=======+======+========+=======+========+=======+========+=======+======+======+======+======+============+=============+======+
-            | Atlas A2 products/Atlas A3 products | √     | √    | ×      | √     | ×      | √     | ×      | √     | √    | √    | ×    | √    | ×          | ×           | √    |
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            | Ascend 950PR&950DT products         | √     | √    | √      | √     | √      | √     | √      | √     | √    | √    | ×    | √    | √          | √           | √    |
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            """,
-        "example":
-        "triton.language.add",
-        "replace_docstring": [
-            "Computes the element-wise sum of x and y.",
-            "",
-            "This is the function form of the + operator.",
-            "",
-            ":param x: the first input tensor",
-            ":type x: Block",
-            ":param y: the second input tensor",
-            ":type y: Block",
-            ":param sanitize_overflow: insert an integer-overflow check when overflow",
-            "    sanitization is enabled at compile time; set to False to emit plain",
-            "    wrapping arithmetic. Ignored for floating-point operands.",
-            ":type sanitize_overflow: bool",
+        "constraints": [
+            "DataType: Ascend A2/A3/950 does not support fp8/fp64.",
         ],
+        "example": "triton.language.add",
     },
     "triton.language.advance": {
-        "constraints": ["Compilation issues may arise when used with complex loops and branch statements."],
-        "dtype_support": """
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            |                                     | uint8 | int8 | uint16 | int16 | uint32 | int32 | uint64 | int64 | fp16 | fp32 | fp64 | bf16 | fp8e(e4m3) | fp8e5(e5m2) | bool |
-            +=====================================+=======+======+========+=======+========+=======+========+=======+======+======+======+======+============+=============+======+
-            | Atlas A2 products/Atlas A3 products | √     | √    | ×      | √     | ×      | √     | ×      | √     | √    | √    | ×    | √    | ×          | ×           | ×    |
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            | Ascend 950PR&950DT products         | √     | √    | √      | √     | √      | √     | √      | √     | √    | √    | ×    | √    | √          | √           | ×    |
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            """,
-        "example": "triton.language.advance",
+        "constraints": [
+            "DataType: Ascend A2/A3 does not support uint16/uint32/uint64/fp64, \
+                Ascend 950 does not support fp64 (hardware limitation).",
+            "Compilation issues may arise when used with complex loops and branch statements."
+        ],
+        "example":
+        "triton.language.advance",
     },
     "triton.language.arange": {
         "constraints": [
             "Arguments must be tl.constexpr of uint or int type (int64 not supported).",
             "start and end must be greater than or equal to 0.",
-            "end - start <= 1048576 (TRITON_MAX_TENSOR_NUMEL).",
-            "``relaxed_requirement`` (extension parameter): Range=(end-start) is not required to be a power of 2.",
+            "end - start < 1048576 (TRITON_MAX_TENSOR_NUMEL), applicable to both NV and Ascend.",
+            "``relaxed_requirement`` (Ascend extension): CUDA requires range=(end-start) to be a power of 2, Ascend has no such requirement.",
         ],
-        "dtype_support":
-        """
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            |                                     | uint8 | int8 | uint16 | int16 | uint32 | int32 | uint64 | int64 | fp16 | fp32 | fp64 | bf16 | fp8e(e4m3) | fp8e5(e5m2) | bool |
-            +=====================================+=======+======+========+=======+========+=======+========+=======+======+======+======+======+============+=============+======+
-            | Atlas A2 products/Atlas A3 products | √     | √    | ×      | √     | ×      | √     | ×      | ×     | ×    | ×    | ×    | ×    | ×          | ×           | ×    |
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            | Ascend 950PR&950DT products         | √     | √    | √      | √     | ×      | √     | ×      | ×     | ×    | ×    | ×    | ×    | ×          | ×           | ×    |
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            """,
         "example":
         "triton.language.arange",
     },
     "triton.language.argmax": {
         "constraints": [
+            "DataType: Ascend A2/A3 does not support fp64, uint16, uint32, uint64; Ascend 950 does not fp64, fp8e4(E4M3), fp8e5(E5M2) (hardware limitation).",
             "``keep_dims=True`` requires more test coverage; currently verified for 3D tensor with dim=2.",
         ],
-        "dtype_support": """
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            |                                     | uint8 | int8 | uint16 | int16 | uint32 | int32 | uint64 | int64 | fp16 | fp32 | fp64 | bf16 | fp8e(e4m3) | fp8e5(e5m2) | bool |
-            +=====================================+=======+======+========+=======+========+=======+========+=======+======+======+======+======+============+=============+======+
-            | Atlas A2 products/Atlas A3 products | √     | √    | ×      | √     | ×      | √     | ×      | √     | √    | √    | ×    | √    | ×          | ×           | √    |
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            | Ascend 950PR&950DT products         | √     | √    | √      | √     | √      | √     | √      | √     | √    | √    | ×    | √    | ×          | ×           | √    |
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            """,
-        "example": "triton.language.argmax",
+        "example":
+        "triton.language.argmax",
     },
     "triton.language.argmin": {
         "constraints": [
+            "DataType: Ascend A2/A3 does not support fp64, uint16, uint32, uint64; Ascend 950 does not fp64, fp8e4(E4M3), fp8e5(E5M2) (hardware limitation).",
             "``keep_dims=True`` requires more test coverage; currently verified for 3D tensor with dim=2.",
         ],
-        "dtype_support": """
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            |                                     | uint8 | int8 | uint16 | int16 | uint32 | int32 | uint64 | int64 | fp16 | fp32 | fp64 | bf16 | fp8e(e4m3) | fp8e5(e5m2) | bool |
-            +=====================================+=======+======+========+=======+========+=======+========+=======+======+======+======+======+============+=============+======+
-            | Atlas A2 products/Atlas A3 products | √     | √    | ×      | √     | ×      | √     | ×      | √     | √    | √    | ×    | √    | ×          | ×           | √    |
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            | Ascend 950PR&950DT products         | √     | √    | √      | √     | √      | √     | √      | √     | √    | √    | ×    | √    | ×          | ×           | √    |
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            """,
-        "example": "triton.language.argmin",
-    },
-    "triton.language.bitonic_merge": {
-        "constraints": [],
-        "dtype_support":
-        """
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            |                                     | uint8 | int8 | uint16 | int16 | uint32 | int32 | uint64 | int64 | fp16 | fp32 | fp64 | bf16 | fp8e(e4m3) | fp8e5(e5m2) | bool |
-            +=====================================+=======+======+========+=======+========+=======+========+=======+======+======+======+======+============+=============+======+
-            | Atlas A2 products/Atlas A3 products | √     | √    | ×      | √     | ×      | √     | ×      | √     | √    | √    | ×    | √    | ×          | ×           | √    |
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            | Ascend 950PR&950DT products         | √     | √    | ×      | √     | ×      | √     | ×      | √     | √    | √    | ×    | √    | √          | √           | √    |
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            """,
         "example":
-        "triton.language.bitonic_merge",
-        "replace_docstring": [
-            "Merge the values in ``input`` along the given dimension using a bitonic sorting network.",
-            "",
-            ":param input: the input tensor to be merge-sorted.",
-            ":param dim: the dimension along which to merge. If None, the last dimension is used.",
-            ":param descending: whether to sort in descending order. Default is False.",
-        ],
+        "triton.language.argmin",
     },
     "triton.language.associative_scan": {
         "constraints": [
+            "DataType: Ascend A2/A3 does not support uint16, uint32, uint64 (hardware limitation).",
             "reverse=True requires alignment when loading data with tl.load, and mask cannot be used to filter redundant data indices",
         ],
-        "dtype_support":
-        """
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            |                                     | uint8 | int8 | uint16 | int16 | uint32 | int32 | uint64 | int64 | fp16 | fp32 | fp64 | bf16 | fp8e(e4m3) | fp8e5(e5m2) | bool |
-            +=====================================+=======+======+========+=======+========+=======+========+=======+======+======+======+======+============+=============+======+
-            | Atlas A2 products/Atlas A3 products | √     | √    | ×      | √     | ×      | √     | ×      | √     | √    | √    | ×    | √    | ×          | ×           | √    |
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            | Ascend 950PR&950DT products         | √     | √    | √      | √     | √      | √     | √      | √     | √    | √    | ×    | ×    | ×          | ×           | √    |
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            """,
         "example":
         "triton.language.associative_scan",
     },
     "triton.language.assume": {
-        "constraints": [],
-        "dtype_support":
-        """
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            |                                     | uint8 | int8 | uint16 | int16 | uint32 | int32 | uint64 | int64 | fp16 | fp32 | fp64 | bf16 | fp8e(e4m3) | fp8e5(e5m2) | bool |
-            +=====================================+=======+======+========+=======+========+=======+========+=======+======+======+======+======+============+=============+======+
-            | Atlas A2 products/Atlas A3 products | ×     | ×    | ×      | ×     | ×      | ×     | ×      | ×     | ×    | ×    | ×    | ×    | ×          | ×           | ✓    |
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            | Ascend 950PR&950DT products         | ×     | ×    | ×      | ×     | ×      | ×     | ×      | ×     | ×    | ×    | ×    | ×    | ×          | ×           | ✓    |
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            """,
-        "example":
-        "triton.language.assume",
-        "replace_docstring": [
-            "Allow the compiler to assume that the given condition is True.",
-            "",
-            ":param cond: the condition that the compiler may assume to be True.",
-        ],
+        "example": "triton.language.assume",
     },
     "triton.language.atomic_add": {
         "constraints": [
-            "``sem``: \"acquire\",\"release\",\"relaxed\" are not supported",
-            "``scope``: \"cta\",\"sys\" are not supported",
+            "DataType: Ascend does not support fp64 (hardware limitation).",
+            "``sem``: Ascend does not support \"acquire\",\"release\",\"relaxed\"",
+            "``scope``: Ascend does not support \"cta\",\"sys\"",
         ],
-        "dtype_support":
-        """
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            |                                     | uint8 | int8 | uint16 | int16 | uint32 | int32 | uint64 | int64 | fp16 | fp32 | fp64 | bf16 | fp8e(e4m3) | fp8e5(e5m2) | bool |
-            +=====================================+=======+======+========+=======+========+=======+========+=======+======+======+======+======+============+=============+======+
-            | Atlas A2 products/Atlas A3 products | ×     | ×    | ×      | ×     | ×      | √     | ×      | √     | √    | √    | ×    | √    | ×          | ×           | ×    |
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            | Ascend 950PR&950DT products         | ×     | ×    | ×      | ×     | √      | √     | √      | √     | √    | √    | ×    | √    | ×          | ×           | ×    |
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            """,
         "example":
         "triton.language.atomic_add",
     },
     "triton.language.atomic_and": {
         "constraints": [
-            "``sem``: \"acquire\",\"release\",\"relaxed\" are not supported",
-            "``scope``: \"cta\",\"sys\" are not supported",
+            "``sem``: Ascend does not support \"acquire\",\"release\",\"relaxed\"",
+            "``scope``: Ascend does not support \"cta\",\"sys\"",
         ],
-        "dtype_support":
-        """
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            |                                     | uint8 | int8 | uint16 | int16 | uint32 | int32 | uint64 | int64 | fp16 | fp32 | fp64 | bf16 | fp8e(e4m3) | fp8e5(e5m2) | bool |
-            +=====================================+=======+======+========+=======+========+=======+========+=======+======+======+======+======+============+=============+======+
-            | Atlas A2 products/Atlas A3 products | ×     | ×    | ×      | ×     | ×      | √     | ×      | √     | ×    | ×    | ×    | ×    | ×          | ×           | ×    |
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            | Ascend 950PR&950DT products         | ×     | ×    | ×      | ×     | √      | √     | √      | √     | ×    | ×    | ×    | ×    | ×          | ×           | ×    |
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            """,
         "example":
         "triton.language.atomic_and",
     },
     "triton.language.atomic_cas": {
         "constraints": [
-            "``sem``: \"acquire\",\"release\",\"relaxed\" are not supported",
-            "``scope``: \"cta\",\"sys\" are not supported",
+            "DataType: Ascend does not support fp64 (hardware limitation).",
+            "``sem``: Ascend does not support \"acquire\",\"release\",\"relaxed\"",
+            "``scope``: Ascend does not support \"cta\",\"sys\"",
         ],
-        "dtype_support":
-        """
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            |                                     | uint8 | int8 | uint16 | int16 | uint32 | int32 | uint64 | int64 | fp16 | fp32 | fp64 | bf16 | fp8e(e4m3) | fp8e5(e5m2) | bool |
-            +=====================================+=======+======+========+=======+========+=======+========+=======+======+======+======+======+============+=============+======+
-            | Atlas A2 products/Atlas A3 products | ×     | ×    | ×      | √     | ×      | √     | ×      | √     | √    | √    | ×    | √    | ×          | ×           | ×    |
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            | Ascend 950PR&950DT products         | ×     | ×    | √      | √     | √      | √     | √      | √     | √    | √    | ×    | √    | ×          | ×           | ×    |
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            """,
         "example":
         "triton.language.atomic_cas",
     },
     "triton.language.atomic_max": {
         "constraints": [
-            "``sem``: \"acquire\",\"release\",\"relaxed\" are not supported",
-            "``scope``: \"cta\",\"sys\" are not supported",
+            "``sem``: Ascend does not support \"acquire\",\"release\",\"relaxed\"",
+            "``scope``: Ascend does not support \"cta\",\"sys\"",
         ],
-        "dtype_support":
-        """
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            |                                     | uint8 | int8 | uint16 | int16 | uint32 | int32 | uint64 | int64 | fp16 | fp32 | fp64 | bf16 | fp8e(e4m3) | fp8e5(e5m2) | bool |
-            +=====================================+=======+======+========+=======+========+=======+========+=======+======+======+======+======+============+=============+======+
-            | Atlas A2 products/Atlas A3 products | ×     | ×    | ×      | ×     | ×      | √     | ×      | √     | ×    | √    | ×    | ×    | ×          | ×           | ×    |
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            | Ascend 950PR&950DT products         | ×     | ×    | ×      | ×     | √      | √     | √      | √     | ×    | √    | ×    | ×    | ×          | ×           | ×    |
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            """,
         "example":
         "triton.language.atomic_max",
     },
     "triton.language.atomic_min": {
         "constraints": [
-            "``sem``: \"acquire\",\"release\",\"relaxed\" are not supported",
-            "``scope``: \"cta\",\"sys\" are not supported",
+            "``sem``: Ascend does not support \"acquire\",\"release\",\"relaxed\"",
+            "``scope``: Ascend does not support \"cta\",\"sys\"",
         ],
-        "dtype_support":
-        """
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            |                                     | uint8 | int8 | uint16 | int16 | uint32 | int32 | uint64 | int64 | fp16 | fp32 | fp64 | bf16 | fp8e(e4m3) | fp8e5(e5m2) | bool |
-            +=====================================+=======+======+========+=======+========+=======+========+=======+======+======+======+======+============+=============+======+
-            | Atlas A2 products/Atlas A3 products | ×     | ×    | ×      | ×     | ×      | √     | ×      | √     | ×    | √    | ×    | ×    | ×          | ×           | ×    |
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            | Ascend 950PR&950DT products         | ×     | ×    | ×      | ×     | √      | √     | √      | √     | ×    | √    | ×    | ×    | ×          | ×           | ×    |
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            """,
         "example":
         "triton.language.atomic_min",
     },
     "triton.language.atomic_or": {
         "constraints": [
-            "``sem``: \"acquire\",\"release\",\"relaxed\" are not supported",
-            "``scope``: \"cta\",\"sys\" are not supported",
+            "``sem``: Ascend does not support \"acquire\",\"release\",\"relaxed\"",
+            "``scope``: Ascend does not support \"cta\",\"sys\"",
         ],
-        "dtype_support":
-        """
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            |                                     | uint8 | int8 | uint16 | int16 | uint32 | int32 | uint64 | int64 | fp16 | fp32 | fp64 | bf16 | fp8e(e4m3) | fp8e5(e5m2) | bool |
-            +=====================================+=======+======+========+=======+========+=======+========+=======+======+======+======+======+============+=============+======+
-            | Atlas A2 products/Atlas A3 products | ×     | ×    | ×      | ×     | ×      | √     | ×      | √     | ×    | ×    | ×    | ×    | ×          | ×           | ×    |
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            | Ascend 950PR&950DT products         | ×     | ×    | ×      | ×     | √      | √     | √      | √     | ×    | ×    | ×    | ×    | ×          | ×           | ×    |
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            """,
         "example":
         "triton.language.atomic_or",
     },
     "triton.language.atomic_xchg": {
         "constraints": [
-            "``sem``: \"acquire\",\"release\",\"relaxed\" are not supported",
-            "``scope``: \"cta\",\"sys\" are not supported",
+            "DataType: Ascend does not support fp64 (hardware limitation).",
+            "``sem``: Ascend does not support \"acquire\",\"release\",\"relaxed\"",
+            "``scope``: Ascend does not support \"cta\",\"sys\"",
         ],
-        "dtype_support":
-        """
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            |                                     | uint8 | int8 | uint16 | int16 | uint32 | int32 | uint64 | int64 | fp16 | fp32 | fp64 | bf16 | fp8e(e4m3) | fp8e5(e5m2) | bool |
-            +=====================================+=======+======+========+=======+========+=======+========+=======+======+======+======+======+============+=============+======+
-            | Atlas A2 products/Atlas A3 products | ×     | ×    | ×      | ×     | ×      | √     | ×      | √     | ×    | √    | ×    | ×    | ×          | ×           | ×    |
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            | Ascend 950PR&950DT products         | ×     | ×    | ×      | ×     | √      | √     | √      | √     | ×    | √    | ×    | ×    | ×          | ×           | ×    |
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            """,
         "example":
         "triton.language.atomic_xchg",
     },
     "triton.language.atomic_xor": {
         "constraints": [
-            "``sem``: \"acquire\",\"release\",\"relaxed\" are not supported",
-            "``scope``: \"cta\",\"sys\" are not supported",
+            "``sem``: Ascend does not support \"acquire\",\"release\",\"relaxed\"",
+            "``scope``: Ascend does not support \"cta\",\"sys\"",
         ],
-        "dtype_support":
-        """
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            |                                     | uint8 | int8 | uint16 | int16 | uint32 | int32 | uint64 | int64 | fp16 | fp32 | fp64 | bf16 | fp8e(e4m3) | fp8e5(e5m2) | bool |
-            +=====================================+=======+======+========+=======+========+=======+========+=======+======+======+======+======+============+=============+======+
-            | Atlas A2 products/Atlas A3 products | ×     | ×    | ×      | ×     | ×      | √     | ×      | √     | ×    | ×    | ×    | ×    | ×          | ×           | ×    |
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            | Ascend 950PR&950DT products         | ×     | ×    | ×      | ×     | √      | √     | √      | √     | ×    | ×    | ×    | ×    | ×          | ×           | ×    |
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            """,
         "example":
         "triton.language.atomic_xor",
     },
     "triton.language.broadcast": {
-        "constraints": [],
-        "dtype_support": """
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            |                                     | uint8 | int8 | uint16 | int16 | uint32 | int32 | uint64 | int64 | fp16 | fp32 | fp64 | bf16 | fp8e(e4m3) | fp8e5(e5m2) | bool |
-            +=====================================+=======+======+========+=======+========+=======+========+=======+======+======+======+======+============+=============+======+
-            | Atlas A2 products/Atlas A3 products | √     | √    | ×      | √     | ×      | √     | ×      | √     | √    | √    | ×    | √    | ×          | ×           | √    |
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            | Ascend 950PR&950DT products         | √     | √    | √      | √     | √      | √     | √      | √     | √    | √    | ×    | √    | √          | √           | √    |
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            """,
-        "example": "triton.language.broadcast",
+        "constraints": [
+            "DataType: Ascend A2/A3 does not support fp64, fp8e4, fp8e5, uint16, uint32, uint64 (hardware limitation).",
+        ],
+        "example":
+        "triton.language.broadcast",
     },
     "triton.language.broadcast_to": {
         "constraints": [
+            "DataType: Ascend A2/A3 does not support fp64, fp8e4, fp8e5, uint16, uint32, uint64 (hardware limitation).",
             "The rank of the input tensor's shape must match the rank of the target shape.",
         ],
-        "dtype_support": """
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            |                                     | uint8 | int8 | uint16 | int16 | uint32 | int32 | uint64 | int64 | fp16 | fp32 | fp64 | bf16 | fp8e(e4m3) | fp8e5(e5m2) | bool |
-            +=====================================+=======+======+========+=======+========+=======+========+=======+======+======+======+======+============+=============+======+
-            | Atlas A2 products/Atlas A3 products | √     | √    | ×      | √     | ×      | √     | ×      | √     | √    | √    | ×    | √    | ×          | ×           | √    |
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            | Ascend 950PR&950DT products         | √     | √    | √      | √     | √      | √     | √      | √     | √    | √    | ×    | √    | √          | √           | √    |
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            """,
-        "example": "triton.language.broadcast_to",
+        "example":
+        "triton.language.broadcast_to",
     },
     "triton.language.cast": {
-        "constraints": [],
-        "dtype_support": """
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            |                                     | uint8 | int8 | uint16 | int16 | uint32 | int32 | uint64 | int64 | fp16 | fp32 | fp64 | bf16 | fp8e(e4m3) | fp8e5(e5m2) | bool |
-            +=====================================+=======+======+========+=======+========+=======+========+=======+======+======+======+======+============+=============+======+
-            | Atlas A2 products/Atlas A3 products | √     | √    | ×      | √     | ×      | √     | ×      | √     | √    | √    | ×    | √    | ×          | ×           | √    |
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            | Ascend 950PR&950DT products         | √     | √    | √      | √     | √      | √     | √      | √     | √    | √    | ×    | √    | √          | √           | √    |
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            """,
-        "example": "triton.language.cast",
+        "constraints": [
+            "DataType: Ascend A2/A3 does not support fp64, fp8e4, fp8e5, uint16, uint32, uint64 (hardware limitation).",
+        ],
+        "example":
+        "triton.language.cast",
     },
     "triton.language.cat": {
         "constraints": [
-            "Only support 1D tensor concatenation.",
+            "DataType: Ascend A2/A3 does not support uint16, uint32, uint64 (hardware limitation).",
+            "``can_reorder``: Both Ascend and GPU only support can_reorder=True",
         ],
-        "dtype_support": """
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            |                                     | uint8 | int8 | uint16 | int16 | uint32 | int32 | uint64 | int64 | fp16 | fp32 | fp64 | bf16 | fp8e(e4m3) | fp8e5(e5m2) | bool |
-            +=====================================+=======+======+========+=======+========+=======+========+=======+======+======+======+======+============+=============+======+
-            | Atlas A2 products/Atlas A3 products | √     | √    | ×      | √     | ×      | √     | ×      | √     | √    | √    | ×    | √    | ×          | ×           | √    |
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            | Ascend 950PR&950DT products         | √     | √    | √      | √     | √      | √     | √      | √     | √    | √    | ×    | √    | √          | √           | √    |
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            """,
-        "example": "triton.language.cat",
+        "example":
+        "triton.language.cat",
     },
     "triton.language.cdiv": {
         "constraints": [
+            "DataType: Ascend A2/A3 does not support uint16/uint32/uint64/bool, \
+                Ascend 950 does not support bool.",
             "Input Range: 0~16777216",
         ],
-        "dtype_support": """
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            |                                     | uint8 | int8 | uint16 | int16 | uint32 | int32 | uint64 | int64 | fp16 | fp32 | fp64 | bf16 | fp8e(e4m3) | fp8e5(e5m2) | bool |
-            +=====================================+=======+======+========+=======+========+=======+========+=======+======+======+======+======+============+=============+======+
-            | Atlas A2 products/Atlas A3 products | √     | √    | ×      | √     | ×      | √     | ×      | √     | ×    | ×    | ×    | ×    | ×          | ×           | ×    |
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            | Ascend 950PR&950DT products         | √     | √    | √      | √     | √      | √     | √      | √     | ×    | ×    | ×    | ×    | ×          | ×           | ×    |
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            """,
-        "example": "triton.language.cdiv",
+        "example":
+        "triton.language.cdiv",
     },
     "triton.language.ceil": {
-        "constraints": [],
-        "dtype_support": """
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            |                                     | uint8 | int8 | uint16 | int16 | uint32 | int32 | uint64 | int64 | fp16 | fp32 | fp64 | bf16 | fp8e(e4m3) | fp8e5(e5m2) | bool |
-            +=====================================+=======+======+========+=======+========+=======+========+=======+======+======+======+======+============+=============+======+
-            | Atlas A2 products/Atlas A3 products | ×     | ×    | ×      | ×     | ×      | ×     | ×      | ×     | ×    | √    | ×    | ×    | ×          | ×           | ×    |
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            | Ascend 950PR&950DT products         | ×     | ×    | ×      | ×     | ×      | ×     | ×      | ×     | ×    | √    | ×    | ×    | ×          | ×           | ×    |
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            """,
+        "constraints": [
+            "DataType: Ascend A2/A3/950 does not support fp64.",
+        ],
         "example": "triton.language.ceil",
     },
     "triton.language.clamp": {
-        "constraints": [],
-        "dtype_support": """
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            |                                     | uint8 | int8 | uint16 | int16 | uint32 | int32 | uint64 | int64 | fp16 | fp32 | fp64 | bf16 | fp8e(e4m3) | fp8e5(e5m2) | bool |
-            +=====================================+=======+======+========+=======+========+=======+========+=======+======+======+======+======+============+=============+======+
-            | Atlas A2 products/Atlas A3 products | ×     | ×    | ×      | ×     | ×      | ×     | ×      | ×     | √    | √    | ×    | √    | ×          | ×           | ×    |
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            | Ascend 950PR&950DT products         | ×     | ×    | ×      | ×     | ×      | ×     | ×      | ×     | √    | √    | ×    | √    | √          | √           | ×    |
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            """,
+        "constraints": [
+            "DataType: Ascend A2/A3/950 does not support fp64.",
+        ],
         "example": "triton.language.clamp",
     },
     "triton.language.compile_hint": {
         "constraints": [
-            "hint_name parameter must be of the string type.",
-            "the hint_val of the list type supports only integer arrays and does not support floating-point numbers or mixed types",
+            "DataType: Ascend does not support fp64, uint16, uint32, uint64, uint8 (hardware limitation).",
+            "hint_name 参数必须为字符串类型",
+            "list 类型 hint_val 仅支持整数数组，不支持浮点数或混合类型",
         ],
-        "dtype_support":
-        """
-            +-------------------------------------+------+-------+-------+-------+--------+--------+--------+-------+------+------+------+------+------+
-            |                                     | int8 | int16 | int32 | uint8 | uint16 | uint32 | uint64 | int64 | fp16 | fp32 | fp64 | bf16 | bool |
-            +=====================================+======+=======+=======+=======+========+========+========+=======+======+======+======+======+======+
-            | Atlas A2 products/Atlas A3 products | ✓    | ✓     | ✓     | ×     | ×      | ×      | ×      | ✓     | ✓    | ✓    | ×    | ✓    | ✓    |
-            +-------------------------------------+------+-------+-------+-------+--------+--------+--------+-------+------+------+------+------+------+
-            """,
         "example":
         "triton.language.compile_hint",
     },
     "triton.language.core.__rshift__": {
         "constraints": [
-            "``other``: only scalars are supported;tensor ars not supported(x >> 2 is valid,x >> y[y is tensor] is not currently supported.)",
+            "DataType: Ascend does not support uint16, uint32, uint64, uint8 (hardware limitation).",
+            "``other``: 仅支持标量，不支持 tensor（即 x >> 2 合法，x >> y（y 为 tensor）暂不支持）",
         ],
-        "dtype_support":
-        """
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            |                                     | uint8 | int8 | uint16 | int16 | uint32 | int32 | uint64 | int64 | fp16 | fp32 | fp64 | bf16 | fp8e(e4m3) | fp8e5(e5m2) | bool |
-            +=====================================+=======+======+========+=======+========+=======+========+=======+======+======+======+======+============+=============+======+
-            | Atlas A2 products/Atlas A3 products | ×     | √    | ×      | √     | ×      | √     | ×      | √     | ×    | ×    | ×    | ×    | ×          | ×           | √    |
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            | Ascend 950PR&950DT products         | √     | √    | ×      | √     | ×      | √     | ×      | √     | ×    | ×    | ×    | ×    | ×          | ×           | √    |
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            """,
     },
     "triton.language.cos": {
-        "constraints": [],
-        "dtype_support": """
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            |                                     | uint8 | int8 | uint16 | int16 | uint32 | int32 | uint64 | int64 | fp16 | fp32 | fp64 | bf16 | fp8e(e4m3) | fp8e5(e5m2) | bool |
-            +=====================================+=======+======+========+=======+========+=======+========+=======+======+======+======+======+============+=============+======+
-            | Atlas A2 products/Atlas A3 products | ×     | ×    | ×      | ×     | ×      | ×     | ×      | ×     | ×    | √    | ×    | ×    | ×          | ×           | ×    |
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            | Ascend 950PR&950DT products         | ×     | ×    | ×      | ×     | ×      | ×     | ×      | ×     | ×    | √    | ×    | ×    | ×          | ×           | ×    |
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            """,
+        "constraints": [
+            "DataType: Ascend A2/A3/950 does not support fp64.",
+        ],
         "example": "triton.language.cos",
     },
     "triton.language.cumprod": {
         "constraints": [
+            "DataType: Ascend A2/A3 does not support uint16, uint32, uint64 (hardware limitation).",
             "reverse=True requires alignment when loading data with tl.load, and mask cannot be used to filter redundant data indices",
         ],
-        "dtype_support":
-        """
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            |                                     | uint8 | int8 | uint16 | int16 | uint32 | int32 | uint64 | int64 | fp16 | fp32 | fp64 | bf16 | fp8e(e4m3) | fp8e5(e5m2) | bool |
-            +=====================================+=======+======+========+=======+========+=======+========+=======+======+======+======+======+============+=============+======+
-            | Atlas A2 products/Atlas A3 products | √     | √    | ×      | √     | ×      | √     | ×      | √     | √    | √    | ×    | √    | ×          | ×           | √    |
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            | Ascend 950PR&950DT products         | √     | √    | √      | √     | √      | √     | √      | √     | √    | √    | ×    | √    | ×          | ×           | √    |
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            """,
         "example":
         "triton.language.cumprod",
     },
     "triton.language.cumsum": {
         "constraints": [
+            "DataType: Ascend A2/A3 does not support uint16, uint32, uint64 (hardware limitation).",
             "reverse=True requires alignment when loading data with tl.load, and mask cannot be used to filter redundant data indices",
         ],
-        "dtype_support":
-        """
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            |                                     | uint8 | int8 | uint16 | int16 | uint32 | int32 | uint64 | int64 | fp16 | fp32 | fp64 | bf16 | fp8e(e4m3) | fp8e5(e5m2) | bool |
-            +=====================================+=======+======+========+=======+========+=======+========+=======+======+======+======+======+============+=============+======+
-            | Atlas A2 products/Atlas A3 products | √     | √    | ×      | √     | ×      | √     | ×      | √     | √    | √    | ×    | √    | ×          | ×           | √    |
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            | Ascend 950PR&950DT products         | √     | √    | √      | √     | √      | √     | √      | √     | √    | √    | ×    | √    | √          | √           | √    |
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            """,
         "example":
         "triton.language.cumsum",
     },
     "triton.language.debug_barrier": {
-        "constraints": [],
-        "dtype_support": """
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            |                                     | uint8 | int8 | uint16 | int16 | uint32 | int32 | uint64 | int64 | fp16 | fp32 | fp64 | bf16 | fp8e(e4m3) | fp8e5(e5m2) | bool |
-            +=====================================+=======+======+========+=======+========+=======+========+=======+======+======+======+======+============+=============+======+
-            | Atlas A2 products/Atlas A3 products | ×     | ×    | ×      | ×     | ×      | ×     | ×      | ×     | ×    | ×    | ×    | ×    | ×          | ×           | ×    |
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            | Ascend 950PR&950DT products         | ×     | ×    | ×      | ×     | ×      | ×     | ×      | ×     | ×    | ×    | ×    | ×    | ×          | ×           | ×    |
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            """,
         "example": "triton.language.debug_barrier",
     },
     "triton.language.device_assert": {
-        "constraints": [],
-        "dtype_support": """
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            |                                     | uint8 | int8 | uint16 | int16 | uint32 | int32 | uint64 | int64 | fp16 | fp32 | fp64 | bf16 | fp8e(e4m3) | fp8e5(e5m2) | bool |
-            +=====================================+=======+======+========+=======+========+=======+========+=======+======+======+======+======+============+=============+======+
-            | Atlas A2 products/Atlas A3 products | ×     | ×    | ×      | ×     | ×      | ×     | ×      | ×     | ×    | ×    | ×    | ×    | ×          | ×           | ✓    |
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            | Ascend 950PR&950DT products         | ×     | ×    | ×      | ×     | ×      | ×     | ×      | ×     | ×    | ×    | ×    | ×    | ×          | ×           | ✓    |
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            """,
         "example": "triton.language.device_assert",
     },
     "triton.language.device_print": {
         "constraints": [
+            "DataType: Ascend A2/A3 does not support uint16/uint32/uint64/fp64, \
+                Ascend 950 does not support fp64 (hardware limitation).",
             "``prefix``: the first argument must be a string prefix; omitting it causes a compilation error.",
             "Set environment variable ``TRITON_DEVICE_PRINT=1`` to enable.",
         ],
-        "dtype_support":
-        """
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            |                                     | uint8 | int8 | uint16 | int16 | uint32 | int32 | uint64 | int64 | fp16 | fp32 | fp64 | bf16 | fp8e(e4m3) | fp8e5(e5m2) | bool |
-            +=====================================+=======+======+========+=======+========+=======+========+=======+======+======+======+======+============+=============+======+
-            | Atlas A2 products/Atlas A3 products | ✓     | ✓    | ×      | ✓     | ×      | ✓     | ×      | ✓     | ✓    | ✓    | ×    | ✓    | ×          | ×           | ✓    |
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            | Ascend 950PR&950DT products         | ✓     | ✓    | ✓      | ✓     | ✓      | ✓     | ✓      | ✓     | ✓    | ✓    | ×    | ✓    | ✓          | ✓           | ✓    |
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            """,
         "example":
         "triton.language.device_print",
-        "replace_docstring": [
-            "Print the values at runtime from the device. String formatting does not work for runtime values, so you should",
-            "provide the values you want to print as arguments. The first value must be a string, all following values must",
-            "be scalars or tensors.",
-            "",
-            "Calling the Python builtin :code:`print` is the same as calling this function, and the requirements for the arguments will match",
-            "this function (not the normal requirements for :code:`print`).",
-            "",
-            ".. highlight:: python",
-            ".. code-block:: python",
-            "",
-            "    tl.device_print(\"pid\", pid)",
-            "    print(\"pid\", pid)",
-            "",
-            "On Ascend, device_print is available when the environment variable ``TRITON_DEVICE_PRINT=1``",
-            "is set. The output is streamed through a device buffer of limited size.",
-            "",
-            ":param prefix: a prefix to print before the values. This is required to be a string literal.",
-            ":param args: the values to print. They can be any tensor or scalar.",
-            ":param hex: print all values as hex instead of decimal",
-        ],
     },
     "triton.language.div": {
-        "constraints": [],
-        "dtype_support": """
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            |                                     | uint8 | int8 | uint16 | int16 | uint32 | int32 | uint64 | int64 | fp16 | fp32 | fp64 | bf16 | fp8e(e4m3) | fp8e5(e5m2) | bool |
-            +=====================================+=======+======+========+=======+========+=======+========+=======+======+======+======+======+============+=============+======+
-            | Atlas A2 products/Atlas A3 products | √     | √    | ×      | √     | ×      | √     | ×      | √     | √    | √    | ×    | √    | ×          | ×           | √    |
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            | Ascend 950PR&950DT products         | √     | √    | √      | √     | √      | √     | √      | √     | √    | √    | ×    | √    | √          | √           | √    |
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            """,
+        "constraints": [
+            "DataType: Ascend A2/A3/950 does not support uint8/uint16/uint32/uint64/fp8/fp64.",
+        ],
         "example": "triton.language.div",
     },
     "triton.language.div_rn": {
         "constraints": [],
-        "dtype_support": """
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            |                                     | uint8 | int8 | uint16 | int16 | uint32 | int32 | uint64 | int64 | fp16 | fp32 | fp64 | bf16 | fp8e(e4m3) | fp8e5(e5m2) | bool |
-            +=====================================+=======+======+========+=======+========+=======+========+=======+======+======+======+======+============+=============+======+
-            | Atlas A2 products/Atlas A3 products | ×     | ×    | ×      | ×     | ×      | ×     | ×      | ×     | ×    | √    | ×    | ×    | ×          | ×           | ×    |
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            | Ascend 950PR&950DT products         | ×     | ×    | ×      | ×     | ×      | ×     | ×      | ×     | ×    | √    | ×    | ×    | ×          | ×           | ×    |
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            """,
         "example": "triton.language.div_rn",
-    },
-    "triton.language.dot": {
-        "constraints": [],
-        "dtype_support":
-        """
-            +-------------------------------------+------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            |                                     | int4 | uint8 | int8 | uint16 | int16 | uint32 | int32 | uint64 | int64 | fp16 | fp32 | fp64 | bf16 | fp8e(e4m3) | fp8e5(e5m2) | bool |
-            +=====================================+======+=======+======+========+=======+========+=======+========+=======+======+======+======+======+============+=============+======+
-            | Atlas A2 products/Atlas A3 products | √    | ×     | √    | ×      | ×     | ×      | ×     | ×      | ×     | √    | √    | ×    | √    | ×          | ×           | ×    |
-            +-------------------------------------+------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            | Ascend 950PR&950DT products         | ×    | ×     | √    | ×      | ×     | ×      | ×     | ×      | ×     | √    | √    | ×    | √    | √          | √           | ×    |
-            +-------------------------------------+------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            """,
-        "replace_docstring": [
-            "Returns the matrix product of two blocks.",
-            "",
-            "The two blocks must both be two-dimensional or three-dimensional and have compatible inner dimensions.",
-            "For three-dimensional blocks, `tl.dot` performs the batched matrix product,",
-            "where the first dimension of each block represents the batch dimension.",
-            "",
-            ":param input: The first tensor to be multiplied.",
-            ":type input: 2~8D tensor",
-            ":param other: The second tensor to be multiplied.",
-            ":type other: 2~8D tensor",
-            ":param acc: The accumulator tensor. If not None, the result is added to this tensor.",
-            ":type acc: 2~8D tensor",
-            ":param input_precision: How to exercise the Tensor Cores for f32 x f32. If",
-            "  the device does not have Tensor Cores or the inputs are not of dtype f32,",
-            "  this option is ignored. For devices that do have tensor cores, the",
-            "  default precision is tf32.",
-            ":type input_precision: string. Available options: :code:`\"tf32\"`, :code:`\"tf32x3\"`, :code:`\"ieee\"`. Default: :code:`\"tf32\"`.",
-            ":param allow_tf32: *Deprecated.* If true, input_precision is set to \"tf32\".",
-            "  Only one of :code:`input_precision` and :code:`allow_tf32` can be",
-            "  specified (i.e. at least one must be :code:`None`).",
-        ],
-        "example":
-        "triton.language.dot",
     },
     "triton.language.dot_scaled": {
         "constraints": [
-            "``lhs_k_pack``: not supported on Ascend.",
-            "``rhs_k_pack``: not supported on Ascend.",
-            "the recommended input range for the input matrices lhs and rhs is [-5, 5]",
-            "``K``: must be a multiple of 64.",
-            "``lhs_scale``/``rhs_scale`` shape: on Ascend 950PR&950DT products with fp8 data types, the scale shape is ``[M, K // 16]`` (``[N, K // 16]`` for rhs_scale).",
+            "DataType: Ascend does not support fp4, fp8 (hardware limitation).",
+            "``lhs_k_pack``: 不支持 fp4/fp8 格式，矩阵解压缩能力缺失（硬件限制）",
+            "``rhs_k_pack``: 不支持 fp4/fp8 格式，矩阵解压缩能力缺失（硬件限制）",
+            "Ascend 不支持 fp4、fp8 格式（硬件限制）",
+            "输入矩阵 lhs、rhs 推荐输入范围为 [-5, 5]",
         ],
-        "dtype_support":
-        """
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+-------------+
-            |                                     | uint8 | int8 | uint16 | int16 | uint32 | int32 | uint64 | int64 | fp16 | fp32 | fp64 | bf16 | fp8e(e4m3) | fp8e5(e5m2) | bool | fp4e2(e2m1) |
-            +=====================================+=======+======+========+=======+========+=======+========+=======+======+======+======+======+============+=============+======+=============+
-            | Atlas A2 products/Atlas A3 products | ×     | ×    | ×      | ×     | ×      | ×     | ×      | ×     | √    | ×    | ×    | √    | ×          | ×           | ×    | ×           |
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+-------------+
-            | Ascend 950PR&950DT products         | ×     | ×    | ×      | ×     | ×      | ×     | ×      | ×     | √    | ×    | ×    | √    | √          | √           | ×    | √           |
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+-------------+
-            """,
         "example":
         "triton.language.dot_scaled",
-        "replace_docstring": [
-            "Returns the matrix product of two blocks in microscaling format.",
-            "",
-            "lhs and rhs use microscaling formats described here:",
-            "https://www.opencompute.org/documents/ocp-microscaling-formats-mx-v1-0-spec-final-pdf",
-            "",
-            ":param lhs: the first tensor to be multiplied.",
-            ":type lhs: 2D tensor.",
-            ":param lhs_scale: scale factor for lhs tensor, represented as an uint8/int8 tensor.",
-            "    Shape should be [M, K // 32] when lhs is [M, K].",
-            ":type lhs_scale: tensor",
-            ":param lhs_format: format of the lhs tensor.",
-            ":type lhs_format: str",
-            ":param rhs: the second tensor to be multiplied.",
-            ":type rhs: 2D tensor.",
-            ":param rhs_scale: scale factor for rhs tensor, represented as an uint8/int8 tensor.",
-            "    Shape should be [N, K // 32] when rhs is [K, N].",
-            ":type rhs_scale: tensor",
-            ":param rhs_format: format of the rhs tensor.",
-            ":type rhs_format: str",
-            ":param acc: the accumulator tensor. If not None, the result is accumulated into it.",
-            ":type acc: 2D tensor",
-            ":param fast_math: if True, enables faster but potentially less accurate math.",
-            ":type fast_math: bool",
-            ":param out_dtype: the output data type.",
-            ":type out_dtype: tl.dtype",
-            ":returns: the matrix product of lhs and rhs in microscaling format.",
-            ":rtype: tensor",
-        ],
     },
     "triton.language.equal": {
-        "constraints": [],
-        "dtype_support":
-        """
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            |                                     | uint8 | int8 | uint16 | int16 | uint32 | int32 | uint64 | int64 | fp16 | fp32 | fp64 | bf16 | fp8e(e4m3) | fp8e5(e5m2) | bool |
-            +=====================================+=======+======+========+=======+========+=======+========+=======+======+======+======+======+============+=============+======+
-            | Atlas A2 products/Atlas A3 products | √     | √    | ×      | √     | ×      | √     | ×      | √     | √    | √    | ×    | √    | ×          | ×           | √    |
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            | Ascend 950PR&950DT products         | √     | √    | √      | √     | √      | √     | √      | √     | √    | √    | ×    | √    | √          | √           | √    |
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            """,
+        "constraints": [
+            "DataType: Ascend A2/A3 does not support uint16/uint32/uint64/fp64, \
+                Ascend 950 does not support fp64.",
+        ],
     },
     "triton.language.erf": {
-        "constraints": [],
-        "dtype_support": """
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            |                                     | uint8 | int8 | uint16 | int16 | uint32 | int32 | uint64 | int64 | fp16 | fp32 | fp64 | bf16 | fp8e(e4m3) | fp8e5(e5m2) | bool |
-            +=====================================+=======+======+========+=======+========+=======+========+=======+======+======+======+======+============+=============+======+
-            | Atlas A2 products/Atlas A3 products | ×     | ×    | ×      | ×     | ×      | ×     | ×      | ×     | ×    | √    | ×    | ×    | ×          | ×           | ×    |
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            | Ascend 950PR&950DT products         | ×     | ×    | ×      | ×     | ×      | ×     | ×      | ×     | ×    | √    | ×    | ×    | ×          | ×           | ×    |
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            """,
+        "constraints": [
+            "DataType: Ascend A2/A3/950 does not support fp64.",
+        ],
         "example": "triton.language.erf",
     },
     "triton.language.exp": {
-        "constraints": [],
-        "dtype_support": """
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            |                                     | uint8 | int8 | uint16 | int16 | uint32 | int32 | uint64 | int64 | fp16 | fp32 | fp64 | bf16 | fp8e(e4m3) | fp8e5(e5m2) | bool |
-            +=====================================+=======+======+========+=======+========+=======+========+=======+======+======+======+======+============+=============+======+
-            | Atlas A2 products/Atlas A3 products | ×     | ×    | ×      | ×     | ×      | ×     | ×      | ×     | √    | √    | ×    | ×    | ×          | ×           | ×    |
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            | Ascend 950PR&950DT products         | ×     | ×    | ×      | ×     | ×      | ×     | ×      | ×     | √    | √    | ×    | ×    | ×          | ×           | ×    |
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            """,
+        "constraints": [
+            "DataType: Ascend A2/A3/950 does not support fp64.",
+        ],
         "example": "triton.language.exp",
     },
     "triton.language.exp2": {
-        "constraints": [],
-        "dtype_support": """
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            |                                     | uint8 | int8 | uint16 | int16 | uint32 | int32 | uint64 | int64 | fp16 | fp32 | fp64 | bf16 | fp8e(e4m3) | fp8e5(e5m2) | bool |
-            +=====================================+=======+======+========+=======+========+=======+========+=======+======+======+======+======+============+=============+======+
-            | Atlas A2 products/Atlas A3 products | ×     | ×    | ×      | ×     | ×      | ×     | ×      | ×     | ×    | √    | ×    | ×    | ×          | ×           | ×    |
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            | Ascend 950PR&950DT products         | ×     | ×    | ×      | ×     | ×      | ×     | ×      | ×     | ×    | √    | ×    | ×    | ×          | ×           | ×    |
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            """,
+        "constraints": [
+            "DataType: Ascend A2/A3/950 does not support fp64.",
+        ],
         "example": "triton.language.exp2",
     },
     "triton.language.expand_dims": {
-        "constraints": [],
-        "dtype_support": """
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            |                                     | uint8 | int8 | uint16 | int16 | uint32 | int32 | uint64 | int64 | fp16 | fp32 | fp64 | bf16 | fp8e(e4m3) | fp8e5(e5m2) | bool |
-            +=====================================+=======+======+========+=======+========+=======+========+=======+======+======+======+======+============+=============+======+
-            | Atlas A2 products/Atlas A3 products | √     | √    | ×      | √     | ×      | √     | ×      | √     | √    | √    | ×    | √    | ×          | ×           | √    |
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            | Ascend 950PR&950DT products         | √     | √    | √      | √     | √      | √     | √      | √     | √    | √    | ×    | √    | √          | √           | √    |
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            """,
-        "example": "triton.language.expand_dims",
+        "constraints": [
+            "DataType: Ascend A2/A3 does not support fp64, fp8e4, fp8e5, uint16, uint32, uint64 (hardware limitation).",
+        ],
+        "example":
+        "triton.language.expand_dims",
     },
     "triton.language.fdiv": {
-        "constraints": [],
-        "dtype_support": """
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            |                                     | uint8 | int8 | uint16 | int16 | uint32 | int32 | uint64 | int64 | fp16 | fp32 | fp64 | bf16 | fp8e(e4m3) | fp8e5(e5m2) | bool |
-            +=====================================+=======+======+========+=======+========+=======+========+=======+======+======+======+======+============+=============+======+
-            | Atlas A2 products/Atlas A3 products | ×     | ×    | ×      | ×     | ×      | ×     | ×      | ×     | √    | √    | ×    | √    | ×          | ×           | ×    |
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            | Ascend 950PR&950DT products         | ×     | ×    | ×      | ×     | ×      | ×     | ×      | ×     | √    | √    | ×    | √    | √          | √           | ×    |
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            """,
+        "constraints": [
+            "DataType: Ascend A2/A3/950 does not support fp64.",
+        ],
         "example": "triton.language.fdiv",
     },
     "triton.language.extra.cann.extension.index_select_simd": {
         "constraints": [
+            "DataType: Ascend A2/A3 does not support fp64, fp8e4, fp8e5, uint16, uint32, uint64 (hardware limitation).",
             "``index``: The data type of the index must be int32 or int64.",
             "``dim``: The dimension cannot be the trailing axis (the last dimension), i.e., dim < len(src_shape) - 1.",
             "The index_select operation is not supported along the trailing axis (the last dimension).",
             "Out-of-bounds indices are not checked; users must ensure index validity on their own.",
             "The index must be a 1D tensor.",
         ],
-        "dtype_support":
-        """
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            |                                     | uint8 | int8 | uint16 | int16 | uint32 | int32 | uint64 | int64 | fp16 | fp32 | fp64 | bf16 | fp8e(e4m3) | fp8e5(e5m2) | bool |
-            +=====================================+=======+======+========+=======+========+=======+========+=======+======+======+======+======+============+=============+======+
-            | Atlas A2 products/Atlas A3 products | √     | √    | ×      | √     | ×      | √     | ×      | √     | √    | √    | ×    | √    | ×          | ×           | √    |
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            | Ascend 950PR&950DT products         | √     | √    | ×      | √     | ×      | √     | ×      | √     | √    | √    | ×    | √    | ×          | ×           | √    |
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            """,
     },
     "triton.language.extra.cann.extension.ascend_address_space": {
         "constraints": [
@@ -904,79 +397,43 @@ CONSTRAINTS = {
         "example": "triton.language.extra.cann.extension.debug_barrier",
     },
     "triton.language.extra.cann.extension.extract_slice": {
-        "constraints": [],
-        "dtype_support": """
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            |                                     | uint8 | int8 | uint16 | int16 | uint32 | int32 | uint64 | int64 | fp16 | fp32 | fp64 | bf16 | fp8e(e4m3) | fp8e5(e5m2) | bool |
-            +=====================================+=======+======+========+=======+========+=======+========+=======+======+======+======+======+============+=============+======+
-            | Atlas A2 products/Atlas A3 products | √     | √    | √      | √     | √      | √     | √      | √     | √    | √    | ×    | √    | ×          | ×           | ×    |
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            | Ascend 950PR&950DT products         | √     | √    | √      | √     | √      | √     | √      | √     | √    | √    | ×    | √    | ×          | ×           | ×    |
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            """,
+        "constraints": [
+            "DataType: Ascend does not support bool (hardware limitation).",
+        ],
         "example": "triton.language.extra.cann.extension.extract_slice",
     },
     "triton.language.extra.cann.extension.get_element": {
-        "constraints": [],
-        "dtype_support": """
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            |                                     | uint8 | int8 | uint16 | int16 | uint32 | int32 | uint64 | int64 | fp16 | fp32 | fp64 | bf16 | fp8e(e4m3) | fp8e5(e5m2) | bool |
-            +=====================================+=======+======+========+=======+========+=======+========+=======+======+======+======+======+============+=============+======+
-            | Atlas A2 products/Atlas A3 products | √     | √    | √      | √     | √      | √     | √      | √     | √    | √    | ×    | √    | ×          | ×           | ×    |
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            | Ascend 950PR&950DT products         | √     | √    | √      | √     | √      | √     | √      | √     | √    | √    | ×    | √    | ×          | ×           | ×    |
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            """,
+        "constraints": [
+            "DataType: Ascend does not support bool (hardware limitation).",
+        ],
         "example": "triton.language.extra.cann.extension.get_element",
     },
     "triton.language.extra.cann.extension.insert_slice": {
-        "constraints": [],
-        "dtype_support": """
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            |                                     | uint8 | int8 | uint16 | int16 | uint32 | int32 | uint64 | int64 | fp16 | fp32 | fp64 | bf16 | fp8e(e4m3) | fp8e5(e5m2) | bool |
-            +=====================================+=======+======+========+=======+========+=======+========+=======+======+======+======+======+============+=============+======+
-            | Atlas A2 products/Atlas A3 products | √     | √    | √      | √     | √      | √     | √      | √     | √    | √    | ×    | √    | ×          | ×           | ×    |
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            | Ascend 950PR&950DT products         | √     | √    | √      | √     | √      | √     | √      | √     | √    | √    | ×    | √    | ×          | ×           | ×    |
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            """,
+        "constraints": [
+            "DataType: Ascend does not support bool (hardware limitation).",
+        ],
         "example": "triton.language.extra.cann.extension.insert_slice",
     },
     "triton.language.extra.cann.extension.multibuffer": {
         "constraints": [
             "only support bufferize equals 2.",
         ],
-        "dtype_support": """
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            |                                     | uint8 | int8 | uint16 | int16 | uint32 | int32 | uint64 | int64 | fp16 | fp32 | fp64 | bf16 | fp8e(e4m3) | fp8e5(e5m2) | bool |
-            +=====================================+=======+======+========+=======+========+=======+========+=======+======+======+======+======+============+=============+======+
-            | Atlas A2 products/Atlas A3 products | √     | √    | √      | √     | √      | √     | √      | √     | √    | √    | ×    | √    | ×          | ×           | √    |
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            | Ascend 950PR&950DT products         | √     | √    | √      | √     | √      | √     | √      | √     | √    | √    | ×    | √    | ×          | ×           | √    |
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            """,
         "example": "triton.language.extra.cann.extension.multibuffer",
     },
     "triton.language.extra.cann.extension.parallel": {
         "constraints": [
+            "DataType: Ascend A2/A3 does not support uint16/uint32/uint64/fp64, \
+                Ascend 950 does not support fp64 (hardware limitation).",
             "When using ``parallel`` as an iterator, the operations within the loop body must have no dependencies and no conflicts between them:",
             "Memory access (load/store) operations can be executed in parallel.",
             "Compute operations are allowed, but there must be no more than one compute operation. Multiple compute operations would produce intermediate UB buffers, which cannot be accessed in parallel.",
         ],
-        "dtype_support":
-        """
-            +-------------------------------------+------+-------+-------+-------+--------+--------+--------+-------+------+------+------+------+------+
-            |                                     | int8 | int16 | int32 | uint8 | uint16 | uint32 | uint64 | int64 | fp16 | fp32 | fp64 | bf16 | bool |
-            +=====================================+======+=======+=======+=======+========+========+========+=======+======+======+======+======+======+
-            | Atlas A2 products/Atlas A3 products | ✓    | ✓     | ✓     | ×     | ×      | ×      | ×      | ✓     | ×    | ×    | ×    | ×    | ×    |
-            +-------------------------------------+------+-------+-------+-------+--------+--------+--------+-------+------+------+------+------+------+
-            """,
         "example":
         "triton.language.extra.cann.extension.parallel",
     },
     "triton.language.extra.cann.extension.scope": {
         "constraints": [
-            "core_mode: must be 'vector', 'cube'.",
+            "core_mode: must be 'vector', 'cube', 'SIMT', or 'SIMD'.",
             "Each kernel supports one cube scope and one vector scope; they execute in parallel.",
             "Explicit synchronization (sync_block_set/sync_block_wait) required for cross-scope data dependencies.",
         ],
@@ -1027,131 +484,58 @@ CONSTRAINTS = {
         "example":
         "triton.language.extra.cann.extension.sync_block_wait",
     },
-    "triton.language.extra.cann.extension.sub_vec_num": {
-        "constraints": [
-            "Only valid in mixed AIC+AIV scenarios (Cube + Vector cores).",
-            "Using it in pure-Cube or pure-Vector kernels will cause a compilation error.",
-        ],
-        "example":
-        "triton.language.extra.cann.extension.sub_vec_num",
-    },
     "triton.language.flip": {
-        "constraints": [],
-        "dtype_support": """
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            |                                     | uint8 | int8 | uint16 | int16 | uint32 | int32 | uint64 | int64 | fp16 | fp32 | fp64 | bf16 | fp8e(e4m3) | fp8e5(e5m2) | bool |
-            +=====================================+=======+======+========+=======+========+=======+========+=======+======+======+======+======+============+=============+======+
-            | Atlas A2 products/Atlas A3 products | √     | √    | ×      | √     | ×      | √     | ×      | √     | √    | √    | ×    | √    | ×          | ×           | √    |
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            | Ascend 950PR&950DT products         | √     | √    | ×      | √     | ×      | √     | ×      | √     | √    | √    | ×    | √    | ×          | ×           | √    |
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            """,
+        "constraints": [
+            "DataType: Ascend does not support fp64, uint16, uint32, uint64, uint8 (hardware limitation).",
+        ],
         "example": "triton.language.flip",
     },
     "triton.language.floor": {
-        "constraints": [],
-        "dtype_support": """
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            |                                     | uint8 | int8 | uint16 | int16 | uint32 | int32 | uint64 | int64 | fp16 | fp32 | fp64 | bf16 | fp8e(e4m3) | fp8e5(e5m2) | bool |
-            +=====================================+=======+======+========+=======+========+=======+========+=======+======+======+======+======+============+=============+======+
-            | Atlas A2 products/Atlas A3 products | ×     | ×    | ×      | ×     | ×      | ×     | ×      | ×     | ×    | √    | ×    | ×    | ×          | ×           | ×    |
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            | Ascend 950PR&950DT products         | ×     | ×    | ×      | ×     | ×      | ×     | ×      | ×     | ×    | √    | ×    | ×    | ×          | ×           | ×    |
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            """,
+        "constraints": [
+            "DataType: Ascend A2/A3/950 does not support fp64.",
+        ],
         "example": "triton.language.floor",
     },
     "triton.language.fma": {
-        "constraints": [],
-        "dtype_support": """
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            |                                     | uint8 | int8 | uint16 | int16 | uint32 | int32 | uint64 | int64 | fp16 | fp32 | fp64 | bf16 | fp8e(e4m3) | fp8e5(e5m2) | bool |
-            +=====================================+=======+======+========+=======+========+=======+========+=======+======+======+======+======+============+=============+======+
-            | Atlas A2 products/Atlas A3 products | ×     | ×    | ×      | ×     | ×      | ×     | ×      | ×     | √    | √    | ×    | √    | ×          | ×           | ×    |
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            | Ascend 950PR&950DT products         | ×     | ×    | ×      | ×     | ×      | ×     | ×      | ×     | √    | √    | ×    | √    | √          | √           | ×    |
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            """,
+        "constraints": [
+            "DataType: Ascend A2/A3/950 does not support fp64.",
+        ],
         "example": "triton.language.fma",
     },
     "triton.language.floordiv": {
-        "constraints": [],
-        "dtype_support": """
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            |                                     | uint8 | int8 | uint16 | int16 | uint32 | int32 | uint64 | int64 | fp16 | fp32 | fp64 | bf16 | fp8e(e4m3) | fp8e5(e5m2) | bool |
-            +=====================================+=======+======+========+=======+========+=======+========+=======+======+======+======+======+============+=============+======+
-            | Atlas A2 products/Atlas A3 products | √     | √    | ×      | √     | ×      | √     | ×      | √     | ×    | ×    | ×    | ×    | ×          | ×           | √    |
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            | Ascend 950PR&950DT products         | √     | √    | √      | √     | √      | √     | √      | √     | ×    | ×    | ×    | ×    | ×          | ×           | ×    |
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            """,
+        "constraints": [
+            "DataType: Ascend A2/A3 does not support uint16/uint32/uint64.",
+        ],
         "example": "triton.language.floordiv",
     },
     "triton.language.full": {
-        "constraints": [],
-        "dtype_support": """
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            |                                     | uint8 | int8 | uint16 | int16 | uint32 | int32 | uint64 | int64 | fp16 | fp32 | fp64 | bf16 | fp8e(e4m3) | fp8e5(e5m2) | bool |
-            +=====================================+=======+======+========+=======+========+=======+========+=======+======+======+======+======+============+=============+======+
-            | Atlas A2 products/Atlas A3 products | √     | √    | ×      | √     | ×      | √     | ×      | √     | √    | √    | ×    | √    | ×          | ×           | √    |
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            | Ascend 950PR&950DT products         | √     | √    | √      | √     | √      | √     | √      | √     | √    | √    | ×    | √    | ×          | ×           | √    |
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            """,
+        "constraints": [
+            "DataType: Ascend A2/A3 does not support uint16, uint32, uint64 (hardware limitation).",
+        ],
         "example": "triton.language.full",
     },
     "triton.language.gather": {
-        "constraints": [],
-        "dtype_support": """
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            |                                     | uint8 | int8 | uint16 | int16 | uint32 | int32 | uint64 | int64 | fp16 | fp32 | fp64 | bf16 | fp8e(e4m3) | fp8e5(e5m2) | bool |
-            +=====================================+=======+======+========+=======+========+=======+========+=======+======+======+======+======+============+=============+======+
-            | Atlas A2 products/Atlas A3 products | ×     | ×    | ×      | ×     | ×      | ×     | ×      | ×     | √    | √    | ×    | √    | ×          | ×           | √    |
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            | Ascend 950PR&950DT products         | ×     | ×    | ×      | ×     | ×      | ×     | ×      | ×     | √    | √    | ×    | √    | √          | √           | √    |
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            """,
+        "constraints": [
+            "DataType: Ascend does not support fp64 (hardware limitation).",
+        ],
         "example": "triton.language.gather",
     },
     "triton.language.greater_than": {
-        "constraints": [],
-        "dtype_support":
-        """
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            |                                     | uint8 | int8 | uint16 | int16 | uint32 | int32 | uint64 | int64 | fp16 | fp32 | fp64 | bf16 | fp8e(e4m3) | fp8e5(e5m2) | bool |
-            +=====================================+=======+======+========+=======+========+=======+========+=======+======+======+======+======+============+=============+======+
-            | Atlas A2 products/Atlas A3 products | √     | √    | ×      | √     | ×      | √     | ×      | √     | √    | √    | ×    | √    | ×          | ×           | √    |
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            | Ascend 950PR&950DT products         | √     | √    | √      | √     | √      | √     | √      | √     | √    | √    | ×    | √    | ×          | ×           | √    |
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            """,
+        "constraints": [
+            "DataType: Ascend does not support fp64, uint16, uint32, uint64 (hardware limitation).",
+        ],
     },
     "triton.language.greater_equal": {
-        "constraints": [],
-        "dtype_support":
-        """
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            |                                     | uint8 | int8 | uint16 | int16 | uint32 | int32 | uint64 | int64 | fp16 | fp32 | fp64 | bf16 | fp8e(e4m3) | fp8e5(e5m2) | bool |
-            +=====================================+=======+======+========+=======+========+=======+========+=======+======+======+======+======+============+=============+======+
-            | Atlas A2 products/Atlas A3 products | √     | √    | ×      | √     | ×      | √     | ×      | √     | √    | √    | ×    | √    | ×          | ×           | √    |
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            | Ascend 950PR&950DT products         | √     | √    | √      | √     | √      | √     | √      | √     | √    | √    | ×    | √    | √          | √           | √    |
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            """,
+        "constraints": [
+            "DataType: Ascend A2/A3 does not support uint16/uint32/uint64/fp64, \
+                Ascend 950 does not support fp64.",
+        ],
     },
     "triton.language.histogram": {
         "constraints": [
+            "triton3.2 does not support mask",
             "input range is limited to [0, num_bins-1]",
         ],
-        "dtype_support": """
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            |                                     | uint8 | int8 | uint16 | int16 | uint32 | int32 | uint64 | int64 | fp16 | fp32 | fp64 | bf16 | fp8e(e4m3) | fp8e5(e5m2) | bool |
-            +=====================================+=======+======+========+=======+========+=======+========+=======+======+======+======+======+============+=============+======+
-            | Atlas A2 products/Atlas A3 products | √     | √    | ×      | √     | ×      | √     | ×      | √     | ×    | ×    | ×    | ×    | ×          | ×           | ×    |
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            | Ascend 950PR&950DT products         | √     | √    | √      | √     | √      | √     | √      | √     | ×    | ×    | ×    | ×    | ×          | ×           | ×    |
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            """,
         "example": "triton.language.histogram",
     },
     "triton.language.inline_asm_elementwise": {
@@ -1160,617 +544,196 @@ CONSTRAINTS = {
             "Only the 'l' LLVM constraint is supported.",
             "Only 1-D input tensors are supported; higher-dimensional tensors must be flattened.",
         ],
-        "dtype_support":
-        """
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            |                                     | uint8 | int8 | uint16 | int16 | uint32 | int32 | uint64 | int64 | fp16 | fp32 | fp64 | bf16 | fp8e(e4m3) | fp8e5(e5m2) | bool |
-            +=====================================+=======+======+========+=======+========+=======+========+=======+======+======+======+======+============+=============+======+
-            | Atlas A2 products/Atlas A3 products | ✓     | ✓    | ×      | ✓     | ×      | ✓     | ×      | ✓     | ×    | ✓    | ×    | ×    | ×          | ×           | ×    |
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            | Ascend 950PR&950DT products         | ✓     | ✓    | ✓      | ✓     | ✓      | ✓     | ×      | ✓     | ×    | ✓    | ×    | ×    | ×          | ×           | ×    |
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            """,
         "example":
         "triton.language.inline_asm_elementwise",
-        "replace_docstring": [
-            "Execute inline assembly over a tensor. Essentially, this is :code:`map`",
-            "where the function is inline assembly.",
-            "",
-            "The input tensors :code:`args` are implicitly broadcasted to the same shape.",
-            "",
-            ":code:`dtype` can be a tuple of types, in which case the output is a",
-            "tuple of tensors.",
-            "",
-            "Each invocation of the inline asm processes :code:`pack` elements at a",
-            "time. Exactly which set of inputs a block receives is unspecified.",
-            "Input elements of size less than 4 bytes are packed into 4-byte",
-            "registers.",
-            "",
-            "This op does not support empty :code:`dtype` -- the inline asm must",
-            "return at least one tensor, even if you don't need it. You can work",
-            "around this by returning a dummy tensor of arbitrary type; it shouldn't",
-            "cost you anything if you don't use it.",
-            "",
-            ":param asm: the inline assembly code",
-            ":param constraints: the LLVM constraint string (only 'l' is supported on Ascend)",
-            ":param args: the input tensors",
-            ":param dtype: the output data type(s)",
-            ":param is_pure: whether the assembly is pure (no side effects)",
-            ":param pack: the number of elements to process at a time",
-        ],
     },
     "triton.language.interleave": {
-        "constraints": [],
-        "dtype_support": """
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            |                                     | uint8 | int8 | uint16 | int16 | uint32 | int32 | uint64 | int64 | fp16 | fp32 | fp64 | bf16 | fp8e(e4m3) | fp8e5(e5m2) | bool |
-            +=====================================+=======+======+========+=======+========+=======+========+=======+======+======+======+======+============+=============+======+
-            | Atlas A2 products/Atlas A3 products | √     | √    | ×      | √     | ×      | √     | ×      | √     | √    | √    | ×    | √    | ×          | ×           | √    |
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            | Ascend 950PR&950DT products         | √     | √    | √      | √     | √      | √     | √      | √     | √    | √    | ×    | √    | √          | √           | √    |
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            """,
-        "example": "triton.language.interleave",
+        "constraints": [
+            "DataType: Ascend A2/A3 does not support fp64, fp8e4, fp8e5, uint16, uint32, uint64 (hardware limitation).",
+        ],
+        "example":
+        "triton.language.interleave",
     },
     "triton.language.join": {
-        "constraints": [],
-        "dtype_support": """
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            |                                     | uint8 | int8 | uint16 | int16 | uint32 | int32 | uint64 | int64 | fp16 | fp32 | fp64 | bf16 | fp8e(e4m3) | fp8e5(e5m2) | bool |
-            +=====================================+=======+======+========+=======+========+=======+========+=======+======+======+======+======+============+=============+======+
-            | Atlas A2 products/Atlas A3 products | √     | √    | ×      | √     | ×      | √     | ×      | √     | √    | √    | ×    | √    | ×          | ×           | √    |
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            | Ascend 950PR&950DT products         | √     | √    | √      | √     | √      | √     | √      | √     | √    | √    | ×    | √    | √          | √           | √    |
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            """,
-        "example": "triton.language.join",
+        "constraints": [
+            "DataType: Ascend A2/A3 does not support fp64, fp8e4, fp8e5, uint16, uint32, uint64 (hardware limitation).",
+        ],
+        "example":
+        "triton.language.join",
     },
     "triton.language.less_equal": {
-        "constraints": [],
-        "dtype_support":
-        """
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            |                                     | uint8 | int8 | uint16 | int16 | uint32 | int32 | uint64 | int64 | fp16 | fp32 | fp64 | bf16 | fp8e(e4m3) | fp8e5(e5m2) | bool |
-            +=====================================+=======+======+========+=======+========+=======+========+=======+======+======+======+======+============+=============+======+
-            | Atlas A2 products/Atlas A3 products | ×     | √    | ×      | √     | ×      | √     | ×      | √     | √    | √    | ×    | √    | ×          | ×           | √    |
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            | Ascend 950PR&950DT products         | √     | √    | √      | √     | √      | √     | √      | √     | √    | √    | ×    | √    | √          | √           | √    |
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            """,
+        "constraints": [
+            "DataType: Ascend A2/A3 does not support uint16/uint32/uint64/fp64, \
+                Ascend 950 does not support fp64.",
+        ],
     },
     "triton.language.less_than": {
-        "constraints": [],
-        "dtype_support":
-        """
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            |                                     | uint8 | int8 | uint16 | int16 | uint32 | int32 | uint64 | int64 | fp16 | fp32 | fp64 | bf16 | fp8e(e4m3) | fp8e5(e5m2) | bool |
-            +=====================================+=======+======+========+=======+========+=======+========+=======+======+======+======+======+============+=============+======+
-            | Atlas A2 products/Atlas A3 products | √     | √    | ×      | √     | ×      | √     | ×      | √     | √    | √    | ×    | √    | ×          | ×           | √    |
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            | Ascend 950PR&950DT products         | √     | √    | √      | √     | √      | √     | √      | √     | √    | √    | ×    | √    | √          | √           | √    |
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            """,
+        "constraints": [
+            "DataType: Ascend A2/A3 does not support uint16/uint32/uint64/fp64, \
+                Ascend 950 does not support fp64.",
+        ],
     },
     "triton.language.load": {
         "constraints": [
-            "``cache_modifier``: Ascend 950PR&950DT products SIMT-only accepts the Triton upstream strings (``''``, ``'.ca'``, ``'.cg'``, ``'.cv'``); the backend folds them to a two-level cache / uncache mapping (``'.ca'`` -> cache, ``'.cg'`` / ``'.cv'`` -> uncache). Effective on global memory; ignored on shared memory. A2/A3 and non-SIMT-only paths ignore the modifier.",
+            "DataType: Ascend A2/A3 does not support uint16/uint32/uint64/fp64, \
+                Ascend 950 does not support fp64 (hardware limitation).",
+            "``cache_modifier``: Ascend A5 SIMT-only accepts the Triton upstream strings (``''``, ``'.ca'``, ``'.cg'``, ``'.cv'``); the backend folds them to a two-level cache / uncache mapping (``'.ca'`` -> cache, ``'.cg'`` / ``'.cv'`` -> uncache). Effective on global memory; ignored on shared memory. A2/A3 and non-SIMT-only paths ignore the modifier.",
             "``eviction_policy``: has no effect on Ascend.",
-            "``volatile``: ``bool``; on Ascend 950PR&950DT products SIMT-only, guarantees memory ordering and prevents the compiler/hardware from hoisting or eliding the load. Effective on both global and shared memory. A2/A3 and non-SIMT-only paths ignore the modifier.",
+            "``volatile``: ``bool``; on Ascend A5 SIMT-only, guarantees memory ordering and prevents the compiler/hardware from hoisting or eliding the load. Effective on both global and shared memory. A2/A3 and non-SIMT-only paths ignore the modifier.",
             "Compatibility issues with branch and loop statements: \
                 Complex pointer and mask calculations involving branches or loops may cause compilation failures.",
         ],
-        "dtype_support":
-        """
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            |                                     | uint8 | int8 | uint16 | int16 | uint32 | int32 | uint64 | int64 | fp16 | fp32 | fp64 | bf16 | fp8e(e4m3) | fp8e5(e5m2) | bool |
-            +=====================================+=======+======+========+=======+========+=======+========+=======+======+======+======+======+============+=============+======+
-            | Atlas A2 products/Atlas A3 products | √     | √    | ×      | √     | ×      | √     | ×      | √     | √    | √    | ×    | √    | ×          | ×           | √    |
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            | Ascend 950PR&950DT products         | √     | √    | √      | √     | √      | √     | √      | √     | √    | √    | ×    | √    | √          | √           | √    |
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            """,
         "example":
         "triton.language.load",
-        "replace_docstring": [
-            "Return a tensor of data whose values are loaded from memory at location defined by `pointer`:",
-            "",
-            "    (1) If `pointer` is a single element pointer, a scalar is be loaded. In",
-            "        this case:",
-            "",
-            "        - `mask` and `other` must also be scalars,",
-            "        - `other` is implicitly typecast to `pointer.dtype.element_ty`, and",
-            "        - `boundary_check` and `padding_option` must be empty.",
-            "",
-            "    (2) If `pointer` is an N-dimensional tensor of pointers, an",
-            "        N-dimensional tensor is loaded. In this case:",
-            "",
-            "        - `mask` and `other` are implicitly broadcast to `pointer.shape`,",
-            "        - `other` is implicitly typecast to `pointer.dtype.element_ty`, and",
-            "        - `boundary_check` and `padding_option` must be empty.",
-            "",
-            "    (3) If `pointer` is a block pointer defined by `make_block_ptr`, a",
-            "        tensor is loaded. In this case:",
-            "",
-            "        - `mask` and `other` must be `None`, and",
-            "        - `boundary_check` and `padding_option` can be specified to control the behavior of out-of-bound access.",
-            "",
-            ":param pointer: Pointer to the data to be loaded",
-            ":type pointer: `triton.PointerType`, or block of `dtype=triton.PointerType`",
-            ":param mask: if `mask[idx]` is false, do not load the data at address `pointer[idx]`",
-            "    (must be `None` with block pointers)",
-            ":type mask: Block of `triton.int1`, optional",
-            ":param other: if `mask[idx]` is false, return `other[idx]`",
-            ":type other: Block, optional",
-            ":param boundary_check: tuple of integers, indicating the dimensions which should do the boundary check",
-            ":type boundary_check: tuple of ints, optional",
-            ":param padding_option: should be one of {\"\", \"zero\", \"nan\"}, the padding value to use while out of bounds. \"\" means an undefined value.",
-            ":param cache_modifier: changes cache option for the load operation.",
-            "  On Ascend 950PR&950DT products SIMT-only, accepts the upstream strings (``''``, ``'.ca'``, ``'.cg'``, ``'.cv'``);",
-            "  the backend folds them to a two-level cache / uncache mapping.",
-            "  Effective on global memory; ignored on shared memory.",
-            "  A2/A3 and non-SIMT-only paths ignore the modifier.",
-            ":type cache_modifier: str, optional, should be one of {\"\", \".ca\", \".cg\", \".cv\"}",
-            ":param eviction_policy: has no effect on Ascend.",
-            ":type eviction_policy: str, optional",
-            ":param volatile: on Ascend 950PR&950DT products SIMT-only, guarantees memory ordering and prevents",
-            "  the compiler/hardware from hoisting or eliding the load.",
-            "  Effective on both global and shared memory.",
-            "  A2/A3 and non-SIMT-only paths ignore the modifier.",
-            ":type volatile: bool, optional",
-        ],
     },
     "triton.language.load_tensor_descriptor": {
         "constraints": [
-            "`make_tensor_descriptor`, `load_tensor_descriptor` and `store_tensor_descriptor`. Do not mix them with `tl.load()` or `tl.store()`.",
+            "DataType: Ascend A2/A3 does not support uint16/uint32/uint64/fp64, \
+                Ascend 950 does not support fp64 (hardware limitation).",
+            "`make_tensor_descriptor`, `load_tensor_descriptor` and `store_tensor_descriptor` \
+                must be used as a suite in Triton 3.2.x. Do not mix them with `tl.load()` or `tl.store()`.",
+            "Compatibility issues exist for certain functions (e.g. cast) in Triton 3.2.x."
         ],
-        "dtype_support":
-        """
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            |                                     | uint8 | int8 | uint16 | int16 | uint32 | int32 | uint64 | int64 | fp16 | fp32 | fp64 | bf16 | fp8e(e4m3) | fp8e5(e5m2) | bool |
-            +=====================================+=======+======+========+=======+========+=======+========+=======+======+======+======+======+============+=============+======+
-            | Atlas A2 products/Atlas A3 products | √     | √    | ×      | √     | ×      | √     | ×      | √     | √    | √    | ×    | √    | ×          | ×           | ×    |
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            | Ascend 950PR&950DT products         | √     | √    | √      | √     | √      | √     | √      | √     | √    | √    | ×    | √    | √          | √           | ×    |
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            """,
         "example":
         "triton.language.load_tensor_descriptor",
     },
     "triton.language.log": {
-        "constraints": [],
-        "dtype_support": """
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            |                                     | uint8 | int8 | uint16 | int16 | uint32 | int32 | uint64 | int64 | fp16 | fp32 | fp64 | bf16 | fp8e(e4m3) | fp8e5(e5m2) | bool |
-            +=====================================+=======+======+========+=======+========+=======+========+=======+======+======+======+======+============+=============+======+
-            | Atlas A2 products/Atlas A3 products | ×     | ×    | ×      | ×     | ×      | ×     | ×      | ×     | ×    | √    | ×    | ×    | ×          | ×           | ×    |
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            | Ascend 950PR&950DT products         | ×     | ×    | ×      | ×     | ×      | ×     | ×      | ×     | ×    | √    | ×    | ×    | ×          | ×           | ×    |
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            """,
+        "constraints": [
+            "DataType: Ascend A2/A3/950 does not support fp64.",
+        ],
         "example": "triton.language.log",
     },
     "triton.language.log2": {
-        "constraints": [],
-        "dtype_support": """
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            |                                     | uint8 | int8 | uint16 | int16 | uint32 | int32 | uint64 | int64 | fp16 | fp32 | fp64 | bf16 | fp8e(e4m3) | fp8e5(e5m2) | bool |
-            +=====================================+=======+======+========+=======+========+=======+========+=======+======+======+======+======+============+=============+======+
-            | Atlas A2 products/Atlas A3 products | ×     | ×    | ×      | ×     | ×      | ×     | ×      | ×     | ×    | √    | ×    | ×    | ×          | ×           | ×    |
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            | Ascend 950PR&950DT products         | ×     | ×    | ×      | ×     | ×      | ×     | ×      | ×     | ×    | √    | ×    | ×    | ×          | ×           | ×    |
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            """,
-        "example": "triton.language.log2",
-    },
-    "triton.language.map_elementwise": {
         "constraints": [
-            "`while` loops are not supported inside the scalar function. Reason: The compilation "
-            "implementation of `map_elementwise` (TritonToLinalg Pass) needs to promote all operations "
-            "in the scalar function to the tensor level for vectorization. However, the `scf.condition` "
-            "in the `scf.while` operation requires a scalar `i1` type condition value, which cannot be "
-            "promoted to a tensor, so the compiler reports an error during the conversion phase. "
-            "`if/elif/else` branches and `for` loops are not subject to this limitation because their "
-            "control flow can be vectorized.",
-            "`pack` has no semantic effect on NPU backends as the implementation is always vectorized.",
+            "DataType: Ascend A2/A3/950 does not support fp64.",
         ],
-        "example":
-        "triton.language.map_elementwise",
-        "replace_docstring": [
-            "Map a scalar function over a tensor.",
-            "",
-            "The input tensors :code:`args` are implicitly broadcasted to the same shape.",
-            "",
-            "This may be useful in allowing control flow over single elements in a tensor,",
-            "for example a multi-branch function with :code:`if`/:code:`elif`/:code:`else`",
-            "chains or :code:`for` loops, providing more flexible element-wise computation",
-            "than :code:`tl.where` which only supports binary selection.",
-            "",
-            ".. highlight:: python",
-            ".. code-block:: python",
-            "",
-            "    @triton.jit",
-            "    def compare_scalar(x, y):",
-            "        if x < y:",
-            "            return -1",
-            "        elif x == y:",
-            "            return 0",
-            "        else:",
-            "            return 1",
-            "",
-            "    @triton.jit",
-            "    def compare(x, y):",
-            "        return tl.map_elementwise(compare_scalar, x, y)",
-            "",
-            ":param scalar_fn: the function to map over.",
-            ":param pack: the number of elements to be processed by one function call.",
-            "  On Ascend, this parameter has no semantic effect as the implementation",
-            "  is always vectorized.",
-            ":return: one tensor or a tuple of tensors, depending on the mapped function.",
-        ],
+        "example": "triton.language.log2",
     },
     "triton.language.make_block_ptr": {
         "constraints": [
+            "DataType: Ascend A2/A3 does not support uint16/uint32/uint64/fp64, \
+                Ascend 950 does not support fp64 (hardware limitation).",
             "Transpose logic can only be implemented by adjusting the `order` parameter. \
                 Do not reorder strides to achieve transpose.",
             "Compatibility issues may occur when used together with branch and loop statements."
         ],
-        "dtype_support":
-        """
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            |                                     | uint8 | int8 | uint16 | int16 | uint32 | int32 | uint64 | int64 | fp16 | fp32 | fp64 | bf16 | fp8e(e4m3) | fp8e5(e5m2) | bool |
-            +=====================================+=======+======+========+=======+========+=======+========+=======+======+======+======+======+============+=============+======+
-            | Atlas A2 products/Atlas A3 products | √     | √    | ×      | √     | ×      | √     | ×      | √     | √    | √    | ×    | √    | ×          | ×           | √    |
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            | Ascend 950PR&950DT products         | √     | √    | √      | √     | √      | √     | √      | √     | √    | √    | ×    | √    | √          | √           | √    |
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            """,
         "example":
         "triton.language.make_block_ptr",
     },
     "triton.language.make_tensor_descriptor": {
         "constraints": [
-            "`make_tensor_descriptor`, `load_tensor_descriptor` and `store_tensor_descriptor`. Do not mix them with `tl.load()` or `tl.store()`.",
+            "DataType: Ascend A2/A3 does not support uint16/uint32/uint64/fp64, \
+                Ascend 950 does not support fp64 (hardware limitation).",
+            "`make_tensor_descriptor`, `load_tensor_descriptor` and `store_tensor_descriptor` \
+                must be used as a suite in Triton 3.2.x. Do not mix them with `tl.load()` or `tl.store()`.",
+            "Compatibility issues exist for certain functions (e.g. cast) in Triton 3.2.x."
         ],
-        "dtype_support":
-        """
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            |                                     | uint8 | int8 | uint16 | int16 | uint32 | int32 | uint64 | int64 | fp16 | fp32 | fp64 | bf16 | fp8e(e4m3) | fp8e5(e5m2) | bool |
-            +=====================================+=======+======+========+=======+========+=======+========+=======+======+======+======+======+============+=============+======+
-            | Atlas A2 products/Atlas A3 products | √     | √    | ×      | √     | ×      | √     | ×      | √     | √    | √    | ×    | √    | ×          | ×           | ×    |
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            | Ascend 950PR&950DT products         | √     | √    | √      | √     | √      | √     | √      | √     | √    | √    | ×    | √    | √          | √           | ×    |
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            """,
         "example":
         "triton.language.make_tensor_descriptor",
-        "replace_docstring": [
-            "Make a tensor descriptor object for loading/storing blocks of data from global memory.",
-            "",
-            ":param base: the base pointer of the tensor, must be 16-byte aligned",
-            ":param shape: A list of non-negative integers representing the tensor shape",
-            ":param strides: A list of tensor strides. Leading dimensions must be multiples",
-            "    of 16-byte strides and the last dimension must be contiguous.",
-            ":param block_shape: The shape of block to be loaded/stored from global memory",
-            "",
-            ".. rubric:: Notes",
-            "",
-            "On Ascend, `make_tensor_descriptor`, `load_tensor_descriptor` and `store_tensor_descriptor`",
-            "must be used together as a suite. Do not mix them with `tl.load()` or `tl.store()`.",
-            "",
-            "Currently only 2-5 dimensional tensors are supported.",
-        ],
     },
     "triton.language.max": {
         "constraints": [
+            "DataType: Ascend A2/A3 does not support fp64, uint16, uint32, uint64; Ascend 950 does not fp64, fp8e4(E4M3), fp8e5(E5M2) (hardware limitation).",
             "``return_indices``: return_indices=True is not supported when axis=None.",
             "``keep_dims=True`` requires more test coverage; currently verified for 3D tensor with dim=2.",
         ],
-        "dtype_support":
-        """
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            |                                     | uint8 | int8 | uint16 | int16 | uint32 | int32 | uint64 | int64 | fp16 | fp32 | fp64 | bf16 | fp8e(e4m3) | fp8e5(e5m2) | bool |
-            +=====================================+=======+======+========+=======+========+=======+========+=======+======+======+======+======+============+=============+======+
-            | Atlas A2 products/Atlas A3 products | √     | √    | ×      | √     | ×      | √     | ×      | √     | √    | √    | ×    | √    | ×          | ×           | √    |
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            | Ascend 950PR&950DT products         | √     | √    | √      | √     | √      | √     | √      | √     | √    | √    | ×    | √    | ×          | ×           | √    |
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            """,
         "example":
         "triton.language.max",
     },
     "triton.language.max_constancy": {
         "constraints": [
+            "DataType: Ascend A2/A3 does not support uint16/uint32/uint64/fp64, \
+                Ascend 950 does not support fp64 (hardware limitation).",
             "``values``: rank must match the rank of ``input`` (e.g. ``[1, 1]`` for a 2-D input).",
         ],
-        "dtype_support":
-        """
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            |                                     | uint8 | int8 | uint16 | int16 | uint32 | int32 | uint64 | int64 | fp16 | fp32 | fp64 | bf16 | fp8e(e4m3) | fp8e5(e5m2) | bool |
-            +=====================================+=======+======+========+=======+========+=======+========+=======+======+======+======+======+============+=============+======+
-            | Atlas A2 products/Atlas A3 products | ✓     | ✓    | ×      | ✓     | ×      | ✓     | ×      | ✓     | ✓    | ✓    | ×    | ✓    | ×          | ×           | ✓    |
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            | Ascend 950PR&950DT products         | ✓     | ✓    | ✓      | ✓     | ✓      | ✓     | ✓      | ✓     | ✓    | ✓    | ×    | ✓    | ✓          | ✓           | ✓    |
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            """,
         "example":
         "triton.language.max_constancy",
-        "replace_docstring": [
-            "Let the compiler know that the first ``value`` elements in ``input`` are constant.",
-            "",
-            "For example, if ``values`` is [4], then each group of 4 values in ``input``",
-            "should all be equal, e.g. [0, 0, 0, 0, 1, 1, 1, 1].",
-            "",
-            ":param input: the input tensor.",
-            ":param values: the number of leading constant values per dimension.",
-        ],
     },
     "triton.language.max_contiguous": {
         "constraints": [
+            "DataType: Ascend A2/A3 does not support uint16/uint32/uint64/fp64, \
+                Ascend 950 does not support fp64 (hardware limitation).",
             "``values``: rank must match the rank of ``input`` (e.g. ``[1, 1]`` for a 2-D input).",
         ],
-        "dtype_support":
-        """
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            |                                     | uint8 | int8 | uint16 | int16 | uint32 | int32 | uint64 | int64 | fp16 | fp32 | fp64 | bf16 | fp8e(e4m3) | fp8e5(e5m2) | bool |
-            +=====================================+=======+======+========+=======+========+=======+========+=======+======+======+======+======+============+=============+======+
-            | Atlas A2 products/Atlas A3 products | ✓     | ✓    | ×      | ✓     | ×      | ✓     | ×      | ✓     | ✓    | ✓    | ×    | ✓    | ×          | ×           | ✓    |
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            | Ascend 950PR&950DT products         | ✓     | ✓    | ✓      | ✓     | ✓      | ✓     | ✓      | ✓     | ✓    | ✓    | ×    | ✓    | ✓          | ✓           | ✓    |
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            """,
         "example":
         "triton.language.max_contiguous",
-        "replace_docstring": [
-            "Let the compiler know that the first ``value`` elements in ``input`` are contiguous.",
-            "",
-            ":param input: the input tensor.",
-            ":param values: the number of leading contiguous values per dimension.",
-        ],
     },
     "triton.language.maximum": {
-        "constraints": [],
-        "dtype_support": """
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            |                                     | uint8 | int8 | uint16 | int16 | uint32 | int32 | uint64 | int64 | fp16 | fp32 | fp64 | bf16 | fp8e(e4m3) | fp8e5(e5m2) | bool |
-            +=====================================+=======+======+========+=======+========+=======+========+=======+======+======+======+======+============+=============+======+
-            | Atlas A2 products/Atlas A3 products | √     | √    | ×      | √     | ×      | √     | ×      | √     | √    | √    | ×    | √    | ×          | ×           | √    |
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            | Ascend 950PR&950DT products         | √     | √    | ×      | √     | ×      | √     | √      | √     | √    | √    | ×    | √    | √          | √           | √    |
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            """,
+        "constraints": [
+            "DataType: Ascend does not support fp64 (hardware limitation).",
+        ],
         "example": "triton.language.maximum",
     },
     "triton.language.min": {
         "constraints": [
+            "DataType: Ascend A2/A3 does not support fp64, uint16, uint32, uint64; Ascend 950 does not fp64, fp8e4(E4M3), fp8e5(E5M2) (hardware limitation).",
             "``return_indices``: return_indices=True is not supported when axis=None.",
             "``keep_dims=True`` requires more test coverage; currently verified for 3D tensor with dim=2.",
         ],
-        "dtype_support":
-        """
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            |                                     | uint8 | int8 | uint16 | int16 | uint32 | int32 | uint64 | int64 | fp16 | fp32 | fp64 | bf16 | fp8e(e4m3) | fp8e5(e5m2) | bool |
-            +=====================================+=======+======+========+=======+========+=======+========+=======+======+======+======+======+============+=============+======+
-            | Atlas A2 products/Atlas A3 products | √     | √    | ×      | √     | ×      | √     | ×      | √     | √    | √    | ×    | √    | ×          | ×           | √    |
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            | Ascend 950PR&950DT products         | √     | √    | √      | √     | √      | √     | √      | √     | √    | √    | ×    | √    | ×          | ×           | √    |
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            """,
         "example":
         "triton.language.min",
     },
     "triton.language.minimum": {
-        "constraints": [],
-        "dtype_support": """
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            |                                     | uint8 | int8 | uint16 | int16 | uint32 | int32 | uint64 | int64 | fp16 | fp32 | fp64 | bf16 | fp8e(e4m3) | fp8e5(e5m2) | bool |
-            +=====================================+=======+======+========+=======+========+=======+========+=======+======+======+======+======+============+=============+======+
-            | Atlas A2 products/Atlas A3 products | √     | √    | ×      | √     | ×      | √     | ×      | √     | √    | √    | ×    | √    | ×          | ×           | √    |
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            | Ascend 950PR&950DT products         | √     | √    | ×      | √     | ×      | √     | √      | √     | √    | √    | ×    | √    | √          | √           | √    |
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            """,
+        "constraints": [
+            "DataType: Ascend does not support fp64 (hardware limitation).",
+        ],
         "example": "triton.language.minimum",
     },
     "triton.language.mod": {
-        "constraints": [],
-        "dtype_support": """
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            |                                     | uint8 | int8 | uint16 | int16 | uint32 | int32 | uint64 | int64 | fp16 | fp32 | fp64 | bf16 | fp8e(e4m3) | fp8e5(e5m2) | bool |
-            +=====================================+=======+======+========+=======+========+=======+========+=======+======+======+======+======+============+=============+======+
-            | Atlas A2 products/Atlas A3 products | √     | √    | ×      | √     | ×      | √     | ×      | √     | √    | √    | ×    | √    | ×          | ×           | √    |
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            | Ascend 950PR&950DT products         | √     | √    | √      | √     | √      | √     | √      | √     | √    | √    | ×    | √    | √          | √           | √    |
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            """,
-        "example": "triton.language.mod",
-    },
-    "triton.language.mul": {
-        "constraints": [],
-        "dtype_support":
-        """
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            |                                     | uint8 | int8 | uint16 | int16 | uint32 | int32 | uint64 | int64 | fp16 | fp32 | fp64 | bf16 | fp8e(e4m3) | fp8e5(e5m2) | bool |
-            +=====================================+=======+======+========+=======+========+=======+========+=======+======+======+======+======+============+=============+======+
-            | Atlas A2 products/Atlas A3 products | √     | √    | ×      | √     | ×      | √     | ×      | √     | √    | √    | ×    | √    | ×          | ×           | √    |
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            | Ascend 950PR&950DT products         | √     | √    | √      | √     | √      | √     | √      | √     | √    | √    | ×    | √    | √          | √           | √    |
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            """,
-        "example":
-        "triton.language.mul",
-        "replace_docstring": [
-            "Computes the element-wise product of x and y.",
-            "",
-            "This is the function form of the * operator.",
-            "",
-            ":param x: the first input tensor",
-            ":type x: Block",
-            ":param y: the second input tensor",
-            ":type y: Block",
-            ":param sanitize_overflow: insert an integer-overflow check when overflow",
-            "    sanitization is enabled at compile time; set to False to emit plain",
-            "    wrapping arithmetic. Ignored for floating-point operands.",
-            ":type sanitize_overflow: bool",
+        "constraints": [
+            "DataType: Ascend A2/A3 does not support uint16/uint32/uint64/fp8/fp64, \
+                Ascend 950 does not support fp8/fp64.",
         ],
+        "example":
+        "triton.language.mod",
     },
     "triton.language.multiple_of": {
         "constraints": [
+            "DataType: Ascend A2/A3 does not support uint16/uint32/uint64/fp64, \
+                Ascend 950 does not support fp64 (hardware limitation).",
             "``values``: describes the divisibility of the first value along each dimension, so its rank must match ``input`` (e.g. ``[1, 1]`` for a 2-D input).",
         ],
-        "dtype_support":
-        """
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            |                                     | uint8 | int8 | uint16 | int16 | uint32 | int32 | uint64 | int64 | fp16 | fp32 | fp64 | bf16 | fp8e(e4m3) | fp8e5(e5m2) | bool |
-            +=====================================+=======+======+========+=======+========+=======+========+=======+======+======+======+======+============+=============+======+
-            | Atlas A2 products/Atlas A3 products | ✓     | ✓    | ×      | ✓     | ×      | ✓     | ×      | ✓     | ✓    | ✓    | ×    | ✓    | ×          | ×           | ✓    |
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            | Ascend 950PR&950DT products         | ✓     | ✓    | ✓      | ✓     | ✓      | ✓     | ✓      | ✓     | ✓    | ✓    | ×    | ✓    | ✓          | ✓           | ✓    |
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            """,
         "example":
         "triton.language.multiple_of",
-        "replace_docstring": [
-            "Let the compiler know that the values in ``input`` are all multiples of ``value``.",
-            "",
-            ":param input: the input tensor.",
-            ":param values: the divisor each leading value is a multiple of, per dimension.",
-        ],
     },
     "triton.language.neg": {
-        "constraints": [],
-        "dtype_support": """
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            |                                     | uint8 | int8 | uint16 | int16 | uint32 | int32 | uint64 | int64 | fp16 | fp32 | fp64 | bf16 | fp8e(e4m3) | fp8e5(e5m2) | bool |
-            +=====================================+=======+======+========+=======+========+=======+========+=======+======+======+======+======+============+=============+======+
-            | Atlas A2 products/Atlas A3 products | ×     | √    | ×      | √     | ×      | √     | ×      | √     | √    | √    | ×    | √    | ×          | ×           | ×    |
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            | Ascend 950PR&950DT products         | ×     | √    | ×      | √     | ×      | √     | ×      | √     | √    | √    | ×    | √    | ×          | ×           | ×    |
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            """,
+        "constraints": [
+            "DataType: Ascend does not support bool, fp64, uint16, uint32, uint64 (hardware limitation).",
+        ],
         "example": "triton.language.neg",
     },
     "triton.language.rand": {
-        "constraints": [],
-        "dtype_support": """
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            |                                     | uint8 | int8 | uint16 | int16 | uint32 | int32 | uint64 | int64 | fp16 | fp32 | fp64 | bf16 | fp8e(e4m3) | fp8e5(e5m2) | bool |
-            +=====================================+=======+======+========+=======+========+=======+========+=======+======+======+======+======+============+=============+======+
-            | Atlas A2 products/Atlas A3 products | √     | √    | √      | √     | √      | √     | √      | √     | ×    | ×    | ×    | ×    | ×          | ×           | √    |
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            | Ascend 950PR&950DT products         | √     | √    | √      | √     | √      | √     | √      | √     | ×    | ×    | ×    | ×    | ×          | ×           | √    |
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            """,
         "example": "triton.language.rand",
     },
-    "triton.language.rand4x": {
-        "example": "triton.language.rand4x",
-    },
     "triton.language.randint": {
-        "constraints": [],
-        "dtype_support": """
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            |                                     | uint8 | int8 | uint16 | int16 | uint32 | int32 | uint64 | int64 | fp16 | fp32 | fp64 | bf16 | fp8e(e4m3) | fp8e5(e5m2) | bool |
-            +=====================================+=======+======+========+=======+========+=======+========+=======+======+======+======+======+============+=============+======+
-            | Atlas A2 products/Atlas A3 products | √     | √    | √      | √     | √      | √     | √      | √     | ×    | ×    | ×    | ×    | ×          | ×           | √    |
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            | Ascend 950PR&950DT products         | √     | √    | √      | √     | √      | √     | √      | √     | ×    | ×    | ×    | ×    | ×          | ×           | √    |
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            """,
         "example": "triton.language.randint",
     },
     "triton.language.randint4x": {
-        "constraints": [],
-        "dtype_support": """
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            |                                     | uint8 | int8 | uint16 | int16 | uint32 | int32 | uint64 | int64 | fp16 | fp32 | fp64 | bf16 | fp8e(e4m3) | fp8e5(e5m2) | bool |
-            +=====================================+=======+======+========+=======+========+=======+========+=======+======+======+======+======+============+=============+======+
-            | Atlas A2 products/Atlas A3 products | √     | √    | √      | √     | √      | √     | √      | √     | ×    | ×    | ×    | ×    | ×          | ×           | √    |
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            | Ascend 950PR&950DT products         | √     | √    | √      | √     | √      | √     | √      | √     | ×    | ×    | ×    | ×    | ×          | ×           | √    |
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            """,
         "example": "triton.language.randint4x",
     },
     "triton.language.randn": {
-        "constraints": [],
-        "dtype_support": """
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            |                                     | uint8 | int8 | uint16 | int16 | uint32 | int32 | uint64 | int64 | fp16 | fp32 | fp64 | bf16 | fp8e(e4m3) | fp8e5(e5m2) | bool |
-            +=====================================+=======+======+========+=======+========+=======+========+=======+======+======+======+======+============+=============+======+
-            | Atlas A2 products/Atlas A3 products | √     | √    | √      | √     | √      | √     | √      | √     | ×    | ×    | ×    | ×    | ×          | ×           | √    |
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            | Ascend 950PR&950DT products         | √     | √    | √      | √     | √      | √     | √      | √     | ×    | ×    | ×    | ×    | ×          | ×           | √    |
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            """,
         "example": "triton.language.randn",
-    },
-    "triton.language.randn4x": {
-        "example": "triton.language.randn4x",
     },
     "triton.language.range": {
         "constraints": [
+            "DataType: Ascend A2/A3 does not support uint16/uint32/uint64/fp64, \
+                Ascend 950 does not support fp64 (hardware limitation).",
             "``disallow_acc_multi_buffer``, ``flatten``, ``disable_licm``: related functionality is incomplete on Ascend.",
+            "``warp_specialize``: only supported on Blackwell GPU; has no effect on Ascend.",
         ],
-        "dtype_support":
-        """
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            |                                     | uint8 | int8 | uint16 | int16 | uint32 | int32 | uint64 | int64 | fp16 | fp32 | fp64 | bf16 | fp8e(e4m3) | fp8e5(e5m2) | bool |
-            +=====================================+=======+======+========+=======+========+=======+========+=======+======+======+======+======+============+=============+======+
-            | Atlas A2 products/Atlas A3 products | ✓     | ✓    | ×      | ✓     | ×      | ✓     | ×      | ✓     | ×    | ×    | ×    | ×    | ×          | ×           | ×    |
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            | Ascend 950PR&950DT products         | ✓     | ✓    | ✓      | ✓     | ✓      | ✓     | ✓      | ✓     | ×    | ×    | ×    | ×    | ×          | ×           | ×    |
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            """,
         "example":
         "triton.language.range",
-        "replace_docstring": [
-            "Iterator that counts upward forever.",
-            "",
-            ".. rubric:: Notes",
-            "",
-            "This is a special iterator used to implement similar semantics to",
-            "Python's :code:`range` in the context of :code:`triton.jit` functions.",
-            "In addition, it allows user to pass extra attributes to the compiler.",
-            "",
-            ":param arg1: the start value.",
-            ":param arg2: the end value.",
-            ":param step: the step value.",
-            ":param num_stages: pipeline the loop into this many stages (so there are",
-            "    :code:`num_stages` iterations of the loop in flight at once).",
-            "",
-            "    Note this is subtly different than passing :code:`num_stages` as a",
-            "    kernel argument. The kernel argument only pipelines loads that feed",
-            "    into :code:`dot` operations, while this attribute tries to pipeline most",
-            "    (though not all) loads in this loop.",
-            ":param loop_unroll_factor: Tells the Triton IR level loop unroller how many",
-            "    times to unroll a for loop that this range is used with. Less than 2 for",
-            "    this value implies no unrolling.",
-            ":param disallow_acc_multi_buffer: If true, prevent the accumulator of the dot",
-            "    operation in the loop to be multi-buffered, if applicable.",
-            ":param flatten: automatically flatten the loop nest starting at this loop to",
-            "    create a single flattened loop. The compiler will try to pipeline the",
-            "    flattened loop which can avoid stage stalling.",
-            ":param warp_specialize: has no effect on Ascend.",
-            ":param disable_licm: Tells the compiler it shouldn't hoist loop invariant",
-            "    code outside the loop. This is often useful to avoid creating long liveranges",
-            "    within a loop.",
-        ],
     },
     "triton.language.ravel": {
-        "constraints": [],
-        "dtype_support": """
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            |                                     | uint8 | int8 | uint16 | int16 | uint32 | int32 | uint64 | int64 | fp16 | fp32 | fp64 | bf16 | fp8e(e4m3) | fp8e5(e5m2) | bool |
-            +=====================================+=======+======+========+=======+========+=======+========+=======+======+======+======+======+============+=============+======+
-            | Atlas A2 products/Atlas A3 products | √     | √    | ×      | √     | ×      | √     | ×      | √     | √    | √    | ×    | √    | ×          | ×           | √    |
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            | Ascend 950PR&950DT products         | √     | √    | √      | √     | √      | √     | √      | √     | √    | √    | ×    | √    | √          | √           | √    |
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            """,
-        "example": "triton.language.ravel",
+        "constraints": [
+            "DataType: Ascend A2/A3 does not support fp64, fp8e4, fp8e5, uint16, uint32, uint64 (hardware limitation).",
+        ],
+        "example":
+        "triton.language.ravel",
     },
     "triton.language.reduce": {
         "constraints": [
+            "DataType: Ascend A2/A3 does not support uint16, uint32, uint64; Ascend 950 does not fp8e4(E4M3), fp8e5(E5M2) (hardware limitation).",
             "``keep_dims=True`` requires more test coverage; currently verified for 3D tensor with dim=2.",
             "Multi-input reduce fallback notation: ``K`` is the number of input tensors; ``T[i]`` and ``Res[i]`` are input tensor ``i`` and its scalar result, respectively; ``L = shape(T[0])[0]`` is the reduction length; ``x[i]`` is the current element passed to combine-region argument ``i``; and ``s[i]`` is the carried state passed to argument ``K + i`` (``0 <= i < K``).",
             "``R`` is the number of effective combine-region operations: only operations backward-reachable from ``tt.reduce.return`` are counted, while ``ext``, ``trunc``, and ``bitcast`` are ignored. The explicit ``scf.for`` fallback is attempted only when ``K > 2`` and ``R != 1``; ``R = 1`` keeps the existing single-reduction lowering.",
@@ -1779,165 +742,59 @@ CONSTRAINTS = {
             "Combine region: it must have exactly ``2K`` block arguments and ``K`` ``tt.reduce.return`` operands. The fallback initializes ``s[i]`` from ``T[i][0]`` and combines elements in order for ``i = 1 ... L - 1``.",
             "Semantics and performance: this path clones the combine region into a sequential ``scf.for``. It can have a different floating-point rounding order from a tree reduction, and it does not guarantee that every multi-input ``reduce`` will pass later lowering or have equivalent performance.",
         ],
-        "dtype_support":
-        """
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            |                                     | uint8 | int8 | uint16 | int16 | uint32 | int32 | uint64 | int64 | fp16 | fp32 | fp64 | bf16 | fp8e(e4m3) | fp8e5(e5m2) | bool |
-            +=====================================+=======+======+========+=======+========+=======+========+=======+======+======+======+======+============+=============+======+
-            | Atlas A2 products/Atlas A3 products | √     | √    | ×      | √     | ×      | √     | ×      | √     | √    | √    | ×    | √    | ×          | ×           | √    |
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            | Ascend 950PR&950DT products         | √     | √    | √      | √     | √      | √     | √      | √     | √    | √    | ×    | √    | ×          | ×           | √    |
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            """,
         "example":
         "triton.language.reduce",
     },
-    "triton.language.reduce_or": {
-        "constraints": [],
-        "dtype_support": """
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            |                                     | uint8 | int8 | uint16 | int16 | uint32 | int32 | uint64 | int64 | fp16 | fp32 | fp64 | bf16 | fp8e(e4m3) | fp8e5(e5m2) | bool |
-            +=====================================+=======+======+========+=======+========+=======+========+=======+======+======+======+======+============+=============+======+
-            | Atlas A2 products/Atlas A3 products | √     | √    | ×      | √     | ×      | √     | ×      | ×     | ×    | ×    | ×    | ×    | ×          | ×           | ×    |
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            | Ascend 950PR&950DT products         | √     | √    | √      | √     | √      | √     | √      | √     | ×    | ×    | ×    | ×    | ×          | ×           | ×    |
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            """,
-        "example": "triton.language.reduce_or",
-    },
     "triton.language.reshape": {
         "constraints": [
+            "DataType: Ascend A2/A3 does not support fp64, fp8e4, fp8e5, uint16, uint32, uint64 (hardware limitation).",
             "``can_reorder``: Only supports False",
         ],
-        "dtype_support": """
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            |                                     | uint8 | int8 | uint16 | int16 | uint32 | int32 | uint64 | int64 | fp16 | fp32 | fp64 | bf16 | fp8e(e4m3) | fp8e5(e5m2) | bool |
-            +=====================================+=======+======+========+=======+========+=======+========+=======+======+======+======+======+============+=============+======+
-            | Atlas A2 products/Atlas A3 products | √     | √    | ×      | √     | ×      | √     | ×      | √     | √    | √    | ×    | √    | ×          | ×           | √    |
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            | Ascend 950PR&950DT products         | √     | √    | √      | √     | √      | √     | √      | √     | √    | √    | ×    | √    | √          | √           | √    |
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            """,
-        "example": "triton.language.reshape",
+        "example":
+        "triton.language.reshape",
     },
     "triton.language.rsqrt": {
-        "constraints": [],
-        "dtype_support": """
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            |                                     | uint8 | int8 | uint16 | int16 | uint32 | int32 | uint64 | int64 | fp16 | fp32 | fp64 | bf16 | fp8e(e4m3) | fp8e5(e5m2) | bool |
-            +=====================================+=======+======+========+=======+========+=======+========+=======+======+======+======+======+============+=============+======+
-            | Atlas A2 products/Atlas A3 products | ×     | ×    | ×      | ×     | ×      | ×     | ×      | ×     | ×    | √    | ×    | ×    | ×          | ×           | ×    |
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            | Ascend 950PR&950DT products         | ×     | ×    | ×      | ×     | ×      | ×     | ×      | ×     | ×    | √    | ×    | ×    | ×          | ×           | ×    |
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            """,
+        "constraints": [
+            "DataType: Ascend does not support fp64 (hardware limitation).",
+        ],
         "example": "triton.language.rsqrt",
     },
     "triton.language.sigmoid": {
-        "constraints": [],
-        "dtype_support": """
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            |                                     | uint8 | int8 | uint16 | int16 | uint32 | int32 | uint64 | int64 | fp16 | fp32 | fp64 | bf16 | fp8e(e4m3) | fp8e5(e5m2) | bool |
-            +=====================================+=======+======+========+=======+========+=======+========+=======+======+======+======+======+============+=============+======+
-            | Atlas A2 products/Atlas A3 products | ×     | ×    | ×      | ×     | ×      | ×     | ×      | ×     | √    | √    | ×    | ×    | ×          | ×           | ×    |
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            | Ascend 950PR&950DT products         | ×     | ×    | ×      | ×     | ×      | ×     | ×      | ×     | √    | √    | ×    | ×    | ×          | ×           | ×    |
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            """,
+        "constraints": [
+            "DataType: Ascend does not support fp64 (hardware limitation).",
+        ],
         "example": "triton.language.sigmoid",
     },
     "triton.language.sin": {
-        "constraints": [],
-        "dtype_support": """
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            |                                     | uint8 | int8 | uint16 | int16 | uint32 | int32 | uint64 | int64 | fp16 | fp32 | fp64 | bf16 | fp8e(e4m3) | fp8e5(e5m2) | bool |
-            +=====================================+=======+======+========+=======+========+=======+========+=======+======+======+======+======+============+=============+======+
-            | Atlas A2 products/Atlas A3 products | ×     | ×    | ×      | ×     | ×      | ×     | ×      | ×     | ×    | √    | ×    | ×    | ×          | ×           | ×    |
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            | Ascend 950PR&950DT products         | ×     | ×    | ×      | ×     | ×      | ×     | ×      | ×     | ×    | √    | ×    | ×    | ×          | ×           | ×    |
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            """,
+        "constraints": [
+            "DataType: Ascend does not support fp64 (hardware limitation).",
+        ],
         "example": "triton.language.sin",
     },
     "triton.language.softmax": {
         "constraints": [
-            "``ieee_rounding``: PTX precise rounding is not used, this parameter is invalid.",
+            "DataType: Ascend does not support fp64 (hardware limitation).",
+            "``ieee_rounding``: Ascend does not use PTX precise rounding, this parameter is invalid.",
         ],
-        "dtype_support": """
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            |                                     | uint8 | int8 | uint16 | int16 | uint32 | int32 | uint64 | int64 | fp16 | fp32 | fp64 | bf16 | fp8e(e4m3) | fp8e5(e5m2) | bool |
-            +=====================================+=======+======+========+=======+========+=======+========+=======+======+======+======+======+============+=============+======+
-            | Atlas A2 products/Atlas A3 products | ×     | ×    | ×      | ×     | ×      | ×     | ×      | ×     | √    | √    | ×    | √    | ×          | ×           | ×    |
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            | Ascend 950PR&950DT products         | ×     | ×    | ×      | ×     | ×      | ×     | ×      | ×     | √    | √    | ×    | √    | √          | √           | ×    |
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            """,
-        "example": "triton.language.softmax",
+        "example":
+        "triton.language.softmax",
     },
     "triton.language.sort": {
         "constraints": [
             "Note: tl.sort may have precision problems in big shape or multidimensional shape, more recommendeded to use triton.language.extra.cann.extension.sort."
         ],
-        "dtype_support":
-        """
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            |                                     | uint8 | int8 | uint16 | int16 | uint32 | int32 | uint64 | int64 | fp16 | fp32 | fp64 | bf16 | fp8e(e4m3) | fp8e5(e5m2) | bool |
-            +=====================================+=======+======+========+=======+========+=======+========+=======+======+======+======+======+============+=============+======+
-            | Atlas A2 products/Atlas A3 products | ×     | √    | ×      | √     | ×      | ×     | ×      | ×     | √    | √    | ×    | √    | ×          | ×           | ×    |
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            | Ascend 950PR&950DT products         | ×     | √    | ×      | √     | ×      | √     | ×      | √     | √    | √    | ×    | √    | √          | √           | √    |
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            """,
         "example":
         "triton.language.sort",
-        "replace_docstring": [
-            "Sorts the values in ``x`` along the given dimension.",
-            "",
-            ":param x: the input tensor to be sorted.",
-            ":param dim: the dimension along which to sort. If None, the last dimension is used.",
-            ":param descending: whether to sort in descending order. Default is False.",
-        ],
     },
     "triton.language.topk": {
-        "constraints": [],
-        "dtype_support":
-        """
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            |                                     | uint8 | int8 | uint16 | int16 | uint32 | int32 | uint64 | int64 | fp16 | fp32 | fp64 | bf16 | fp8e(e4m3) | fp8e5(e5m2) | bool |
-            +=====================================+=======+======+========+=======+========+=======+========+=======+======+======+======+======+============+=============+======+
-            | Atlas A2 products/Atlas A3 products | ×     | √    | ×      | √     | ×      | ×     | ×      | ×     | √    | √    | ×    | √    | ×          | ×           | ×    |
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            | Ascend 950PR&950DT products         | ×     | √    | ×      | √     | ×      | √     | ×      | √     | √    | √    | ×    | √    | √          | √           | √    |
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            """,
-        "example":
-        "triton.language.topk",
-        "replace_docstring": [
-            "Returns the k largest (or smallest) elements of the input tensor along",
-            "the specified dimension.",
-            "",
-            "The elements are returned in sorted order (largest first).",
-            "",
-            ":param x: The input tensor.",
-            ":type x: Tensor",
-            ":param k: The number of top elements to return. Must be a positive power",
-            "    of two no larger than the selected dimension.",
-            ":type k: int",
-            ":param dim: The dimension along which to find the top k elements. If",
-            "    None, uses the last dimension. Currently only the last dimension is",
-            "    supported.",
-            ":type dim: int, optional",
-            ":param descending: If set to True, returns k largest elements. If set to",
-            "    False, returns k smallest elements.",
-            ":type descending: bool, optional",
-            ":returns: A tensor containing the k largest elements along the specified",
-            "    dimension.",
-            ":rtype: Tensor",
+        "constraints": [
+            "DataType: Ascend does not support bool, fp64, int32, int64, uint8 (hardware limitation).",
         ],
+        "example": "triton.language.topk",
     },
     "triton.language.extra.cann.extension.sort": {
         "constraints": [
-            "DataType: uint8/int32/int64/fp64/bool are not supported.",
+            "DataType: Ascend does not support bool, fp64, int32, int64, uint8 (hardware limitation).",
         ],
         "example": "triton.language.extra.cann.extension.sort",
     },
@@ -1954,643 +811,162 @@ CONSTRAINTS = {
         "triton.language.extra.cann.extension.dot",
     },
     "triton.language.split": {
-        "constraints": [],
-        "dtype_support": """
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            |                                     | uint8 | int8 | uint16 | int16 | uint32 | int32 | uint64 | int64 | fp16 | fp32 | fp64 | bf16 | fp8e(e4m3) | fp8e5(e5m2) | bool |
-            +=====================================+=======+======+========+=======+========+=======+========+=======+======+======+======+======+============+=============+======+
-            | Atlas A2 products/Atlas A3 products | √     | √    | ×      | √     | ×      | √     | ×      | √     | √    | √    | ×    | √    | ×          | ×           | √    |
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            | Ascend 950PR&950DT products         | √     | √    | √      | √     | √      | √     | √      | √     | √    | √    | ×    | √    | √          | √           | √    |
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            """,
-        "example": "triton.language.split",
+        "constraints": [
+            "DataType: Ascend A2/A3 does not support fp64, fp8e4, fp8e5, uint16, uint32, uint64 (hardware limitation).",
+        ],
+        "example":
+        "triton.language.split",
     },
     "triton.language.sqrt": {
-        "constraints": [],
-        "dtype_support": """
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            |                                     | uint8 | int8 | uint16 | int16 | uint32 | int32 | uint64 | int64 | fp16 | fp32 | fp64 | bf16 | fp8e(e4m3) | fp8e5(e5m2) | bool |
-            +=====================================+=======+======+========+=======+========+=======+========+=======+======+======+======+======+============+=============+======+
-            | Atlas A2 products/Atlas A3 products | ×     | ×    | ×      | ×     | ×      | ×     | ×      | ×     | ×    | √    | ×    | ×    | ×          | ×           | ×    |
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            | Ascend 950PR&950DT products         | ×     | ×    | ×      | ×     | ×      | ×     | ×      | ×     | ×    | √    | ×    | ×    | ×          | ×           | ×    |
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            """,
+        "constraints": [
+            "DataType: Ascend does not support fp64 (hardware limitation).",
+        ],
         "example": "triton.language.sqrt",
     },
-    "triton.language.sqrt_rn": {
-        "constraints": [],
-        "dtype_support": """
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            |                                     | uint8 | int8 | uint16 | int16 | uint32 | int32 | uint64 | int64 | fp16 | fp32 | fp64 | bf16 | fp8e(e4m3) | fp8e5(e5m2) | bool |
-            +=====================================+=======+======+========+=======+========+=======+========+=======+======+======+======+======+============+=============+======+
-            | Atlas A2 products/Atlas A3 products | ×     | ×    | ×      | ×     | ×      | ×     | ×      | ×     | ×    | √    | ×    | ×    | ×          | ×           | ×    |
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            | Ascend 950PR&950DT products         | ×     | ×    | ×      | ×     | ×      | ×     | ×      | ×     | ×    | √    | ×    | ×    | ×          | ×           | ×    |
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            """,
-        "example": "triton.language.sqrt_rn",
-    },
     "triton.language.static_print": {
-        "constraints": [],
-        "dtype_support":
-        """
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            |                                     | uint8 | int8 | uint16 | int16 | uint32 | int32 | uint64 | int64 | fp16 | fp32 | fp64 | bf16 | fp8e(e4m3) | fp8e5(e5m2) | bool |
-            +=====================================+=======+======+========+=======+========+=======+========+=======+======+======+======+======+============+=============+======+
-            | Atlas A2 products/Atlas A3 products | ×     | ✓    | ×      | ✓     | ×      | ✓     | ×      | ✓     | ✓    | ✓    | ×    | ✓    | ×          | ×           | ✓    |
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            | Ascend 950PR&950DT products         | ×     | ✓    | ×      | ✓     | ×      | ✓     | ×      | ✓     | ✓    | ✓    | ×    | ✓    | ×          | ×           | ✓    |
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            """,
+        "constraints": [
+            "DataType: Ascend A2/A3 does not support uint16/uint32/uint64/fp64, \
+                Ascend 950 does not support fp64 (hardware limitation).",
+        ],
         "example":
         "triton.language.static_print",
-        "replace_docstring": [
-            "Print the values at compile time.  The parameters are the same as the builtin :code:`print`.",
-            "",
-            "NOTE: Calling the Python builtin :code:`print` is not the same as calling this,",
-            "it instead maps to :code:`device_print`, which has special requirements for the arguments.",
-            "",
-            ":param values: the values to print at compile time.",
-            ":param sep: string inserted between values. Default is a single space.",
-            ":param end: string appended after the last value. Default is a newline.",
-        ],
     },
     "triton.language.static_assert": {
         "constraints": [
             "``cond``: must be a compile-time constant (tl.constexpr); a non-constant condition causes a compilation error.",
         ],
-        "dtype_support":
-        """
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            |                                     | uint8 | int8 | uint16 | int16 | uint32 | int32 | uint64 | int64 | fp16 | fp32 | fp64 | bf16 | fp8e(e4m3) | fp8e5(e5m2) | bool |
-            +=====================================+=======+======+========+=======+========+=======+========+=======+======+======+======+======+============+=============+======+
-            | Atlas A2 products/Atlas A3 products | ×     | ×    | ×      | ×     | ×      | ×     | ×      | ×     | ×    | ×    | ×    | ×    | ×          | ×           | ✓    |
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            | Ascend 950PR&950DT products         | ×     | ×    | ×      | ×     | ×      | ×     | ×      | ×     | ×    | ×    | ×    | ×    | ×          | ×           | ✓    |
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            """,
         "example":
         "triton.language.static_assert",
-        "replace_docstring": [
-            "Assert the condition at compile time.  Does not require that the :code:`TRITON_DEBUG`",
-            "environment variable is set.",
-            "",
-            ":param cond: the compile-time condition to assert.",
-            ":param msg: message displayed when the assertion fails. Default is an empty string.",
-        ],
     },
     "triton.language.static_range": {
         "constraints": [
+            "DataType: Ascend A2/A3 does not support uint16/uint32/uint64/fp64, \
+                Ascend 950 does not support fp64 (hardware limitation).",
             "``start``, ``end``, ``step`` must be compile-time constants (tl.constexpr).",
         ],
-        "dtype_support":
-        """
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            |                                     | uint8 | int8 | uint16 | int16 | uint32 | int32 | uint64 | int64 | fp16 | fp32 | fp64 | bf16 | fp8e(e4m3) | fp8e5(e5m2) | bool |
-            +=====================================+=======+======+========+=======+========+=======+========+=======+======+======+======+======+============+=============+======+
-            | Atlas A2 products/Atlas A3 products | ✓     | ✓    | ×      | ✓     | ×      | ✓     | ×      | ✓     | ×    | ×    | ×    | ×    | ×          | ×           | ×    |
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            | Ascend 950PR&950DT products         | ✓     | ✓    | ✓      | ✓     | ✓      | ✓     | ✓      | ✓     | ×    | ×    | ×    | ×    | ×          | ×           | ×    |
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            """,
         "example":
         "triton.language.static_range",
-        "replace_docstring": [
-            "Iterator that counts upward forever.",
-            "",
-            ".. rubric:: Notes",
-            "",
-            "This is a special iterator used to implement similar semantics to",
-            "Python's :code:`range` in the context of :code:`triton.jit` functions.",
-            "In addition, it also guides the compiler to unroll the loop aggressively.",
-            "",
-            ":param arg1: the start value.",
-            ":param arg2: the end value.",
-            ":param step: the step value.",
-        ],
     },
     "triton.language.store": {
         "constraints": [
-            "``cache_modifier``: Ascend 950PR&950DT products SIMT-only accepts the Triton upstream strings (``''``, ``'.wb'``, ``'.cg'``, ``'.cs'``, ``'.wt'``); the backend folds them to a two-level cache / uncache mapping (``'.wb'`` -> cache, ``'.cg'`` / ``'.cs'`` / ``'.wt'`` -> uncache). Effective on global memory; ignored on shared memory. A2/A3 and non-SIMT-only paths ignore the modifier.",
+            "DataType: Ascend A2/A3 does not support uint16/uint32/uint64/fp64, \
+                Ascend 950 does not support fp64 (hardware limitation).",
+            "``cache_modifier``: Ascend A5 SIMT-only accepts the Triton upstream strings (``''``, ``'.wb'``, ``'.cg'``, ``'.cs'``, ``'.wt'``); the backend folds them to a two-level cache / uncache mapping (``'.wb'`` -> cache, ``'.cg'`` / ``'.cs'`` / ``'.wt'`` -> uncache). Effective on global memory; ignored on shared memory. A2/A3 and non-SIMT-only paths ignore the modifier.",
             "``eviction_policy``: has no effect on Ascend.",
             "``volatile``: not accepted (the Triton upstream ``tl.store`` signature does not expose a ``volatile=`` keyword).",
             "Compatibility issues with branch and loop statements: \
                 Complex pointer and mask calculations involving branches or loops may cause compilation failures.",
         ],
-        "dtype_support":
-        """
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            |                                     | uint8 | int8 | uint16 | int16 | uint32 | int32 | uint64 | int64 | fp16 | fp32 | fp64 | bf16 | fp8e(e4m3) | fp8e5(e5m2) | bool |
-            +=====================================+=======+======+========+=======+========+=======+========+=======+======+======+======+======+============+=============+======+
-            | Atlas A2 products/Atlas A3 products | √     | √    | ×      | √     | ×      | √     | ×      | √     | √    | √    | ×    | √    | ×          | ×           | √    |
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            | Ascend 950PR&950DT products         | √     | √    | √      | √     | √      | √     | √      | √     | √    | √    | ×    | √    | √          | √           | √    |
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            """,
         "example":
         "triton.language.store",
-        "replace_docstring": [
-            "Store a tensor of data into memory locations defined by `pointer`.",
-            "",
-            "    (1) If `pointer` is a single element pointer, a scalar is stored. In",
-            "        this case:",
-            "",
-            "        - `mask` must also be scalar, and",
-            "        - `boundary_check` and `padding_option` must be empty.",
-            "",
-            "    (2) If `pointer` is an N-dimensional tensor of pointers, an",
-            "        N-dimensional block is stored. In this case:",
-            "",
-            "        - `mask` is implicitly broadcast to `pointer.shape`, and",
-            "        - `boundary_check` must be empty.",
-            "",
-            "    (3) If `pointer` is a block pointer defined by `make_block_ptr`, a block",
-            "        of data is stored. In this case:",
-            "",
-            "        - `mask` must be None, and",
-            "        - `boundary_check` can be specified to control the behavior of out-of-bound access.",
-            "",
-            "`value` is implicitly broadcast to `pointer.shape` and typecast to `pointer.dtype.element_ty`.",
-            "",
-            ":param pointer: The memory location where the elements of `value` are stored",
-            ":type pointer: `triton.PointerType`, or block of `dtype=triton.PointerType`",
-            ":param value: The tensor of elements to be stored",
-            ":type value: Block",
-            ":param mask: If `mask[idx]` is false, do not store `value[idx]` at `pointer[idx]`",
-            ":type mask: Block of triton.int1, optional",
-            ":param boundary_check: tuple of integers, indicating the dimensions which should do the boundary check",
-            ":type boundary_check: tuple of ints, optional",
-            ":param cache_modifier: changes cache option for the store operation.",
-            "  On Ascend 950PR&950DT products SIMT-only, accepts the upstream strings (``''``, ``'.wb'``, ``'.cg'``, ``'.cs'``, ``'.wt'``);",
-            "  the backend folds them to a two-level cache / uncache mapping.",
-            "  Effective on global memory; ignored on shared memory.",
-            "  A2/A3 and non-SIMT-only paths ignore the modifier.",
-            ":type cache_modifier: str, optional, should be one of {\"\", \".wb\", \".cg\", \".cs\", \".wt\"}",
-            ":param eviction_policy: has no effect on Ascend.",
-            ":type eviction_policy: str, optional, should be one of {\"\", \"evict_first\", \"evict_last\"}",
-        ],
     },
     "triton.language.store_tensor_descriptor": {
         "constraints": [
-            "`make_tensor_descriptor`, `load_tensor_descriptor` and `store_tensor_descriptor`. Do not mix them with `tl.load()` or `tl.store()`.",
+            "DataType: Ascend A2/A3 does not support uint16/uint32/uint64/fp64, \
+                Ascend 950 does not support fp64 (hardware limitation).",
+            "`make_tensor_descriptor`, `load_tensor_descriptor` and `store_tensor_descriptor` \
+                must be used as a suite in Triton 3.2.x. Do not mix them with `tl.load()` or `tl.store()`.",
+            "Compatibility issues exist for certain functions (e.g. cast) in Triton 3.2.x."
         ],
-        "dtype_support":
-        """
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            |                                     | uint8 | int8 | uint16 | int16 | uint32 | int32 | uint64 | int64 | fp16 | fp32 | fp64 | bf16 | fp8e(e4m3) | fp8e5(e5m2) | bool |
-            +=====================================+=======+======+========+=======+========+=======+========+=======+======+======+======+======+============+=============+======+
-            | Atlas A2 products/Atlas A3 products | √     | √    | ×      | √     | ×      | √     | ×      | √     | √    | √    | ×    | √    | ×          | ×           | ×    |
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            | Ascend 950PR&950DT products         | √     | √    | √      | √     | √      | √     | √      | √     | √    | √    | ×    | √    | √          | √           | ×    |
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            """,
         "example":
         "triton.language.store_tensor_descriptor",
     },
     "triton.language.sub": {
-        "constraints": [],
-        "dtype_support":
-        """
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            |                                     | uint8 | int8 | uint16 | int16 | uint32 | int32 | uint64 | int64 | fp16 | fp32 | fp64 | bf16 | fp8e(e4m3) | fp8e5(e5m2) | bool |
-            +=====================================+=======+======+========+=======+========+=======+========+=======+======+======+======+======+============+=============+======+
-            | Atlas A2 products/Atlas A3 products | √     | √    | ×      | √     | ×      | √     | ×      | √     | √    | √    | ×    | √    | ×          | ×           | √    |
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            | Ascend 950PR&950DT products         | √     | √    | √      | √     | √      | √     | √      | √     | √    | √    | ×    | √    | √          | √           | √    |
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            """,
-        "example":
-        "triton.language.sub",
-        "replace_docstring": [
-            "Computes the element-wise difference of x and y.",
-            "",
-            "This is the function form of the - operator.",
-            "",
-            ":param x: the first input tensor",
-            ":type x: Block",
-            ":param y: the second input tensor",
-            ":type y: Block",
-            ":param sanitize_overflow: insert an integer-overflow check when overflow",
-            "    sanitization is enabled at compile time; set to False to emit plain",
-            "    wrapping arithmetic. Ignored for floating-point operands.",
-            ":type sanitize_overflow: bool",
+        "constraints": [
+            "DataType: Ascend A2/A3/950 does not support fp8/fp64.",
         ],
+        "example": "triton.language.sub",
     },
     "triton.language.sum": {
         "constraints": [
+            "DataType: Ascend A2/A3 does not support uint16, uint32, uint64.",
             "``keep_dims=True`` requires more test coverage; currently verified for 3D tensor with dim=2.",
         ],
-        "dtype_support": """
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            |                                     | uint8 | int8 | uint16 | int16 | uint32 | int32 | uint64 | int64 | fp16 | fp32 | fp64 | bf16 | fp8e(e4m3) | fp8e5(e5m2) | bool |
-            +=====================================+=======+======+========+=======+========+=======+========+=======+======+======+======+======+============+=============+======+
-            | Atlas A2 products/Atlas A3 products | √     | √    | ×      | √     | ×      | √     | ×      | √     | √    | √    | ×    | √    | ×          | ×           | √    |
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            | Ascend 950PR&950DT products         | ×     | √    | ×      | √     | ×      | √     | √      | √     | √    | √    | ×    | √    | √          | √           | √    |
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            """,
-        "example": "triton.language.sum",
-    },
-    "triton.language.swizzle2d": {
-        "constraints": [],
-        "dtype_support": """
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            |                                     | uint8 | int8 | uint16 | int16 | uint32 | int32 | uint64 | int64 | fp16 | fp32 | fp64 | bf16 | fp8e(e4m3) | fp8e5(e5m2) | bool |
-            +=====================================+=======+======+========+=======+========+=======+========+=======+======+======+======+======+============+=============+======+
-            | Atlas A2 products/Atlas A3 products | ×     | ×    | ×      | ×     | ×      | √     | ×      | √     | ×    | ×    | ×    | ×    | ×          | ×           | ×    |
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            | Ascend 950PR&950DT products         | ×     | ×    | ×      | ×     | ×      | √     | ×      | √     | ×    | ×    | ×    | ×    | ×          | ×           | ×    |
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            """,
-        "example": "triton.language.swizzle2d",
+        "example":
+        "triton.language.sum",
     },
     "triton.language.sync_block_all": {
         "constraints": [
-            "``mode``: must be one of 'all_cube','all_vector' or 'all'.",
-            "``event_id``: value range is 0-15",
+            "``mode``: 必须为 'all_cube'、'all_vector' 或 'all' 之一",
+            "``event_id``: 取值范围 0-15",
             "``status`` (Ascend extension): ascend_added",
-            "``note`` (Ascend extension): A synchronization primitive of the Ascend Cube-Vector architecture "
-            "unavailable in upstream triton.",
+            "``note`` (Ascend extension): Ascend Cube-Vector 架构同步原语，上游 Triton 不存在",
         ],
     },
     "triton.language.sync_block_set": {
         "constraints": [
-            "``sender``: core type of the sender.it must be 'cube' or 'vector",
-            "``receiver``: core type of the receiver.it must be 'cube' or 'vector' and cannot be the same as the sender.",
-            "``event_id``: The value ranges from 0 to 15(16 independent events in total)",
+            "``sender``: 发送方核心类型，必须为 'cube' 或 'vector",
+            "``receiver``: 接收方核心类型，必须为 'cube' 或 'vector'，且不能与 sender 相同",
+            "``event_id``: 取值范围 0-15（共 16 个独立事件）",
             "``status`` (Ascend extension): ascend_added",
-            "``note`` (Ascend extension): A synchronization primitive of the Ascend Cube-Vector architecture "
-            "unavailable in upstream triton.",
+            "``note`` (Ascend extension): Ascend Cube-Vector 架构同步原语，上游 Triton 不存在",
         ],
     },
     "triton.language.sync_block_wait": {
         "constraints": [
-            "``sender``: core type of the sender.it must be 'cube' or 'vector",
-            "``receiver``: core type of the receiver.it must be 'cube' or 'vector' and cannot be the same as the sender.",
-            "``event_id``: The value ranges from 0 to 15(16 independent events in total)",
+            "``sender``: 发送方核心类型，必须为 'cube' 或 'vector",
+            "``receiver``: 接收方核心类型，必须为 'cube' 或 'vector'，且不能与 sender 相同",
+            "``event_id``: 必须与对应 sync_block_set 使用的 ID 一致",
             "``status`` (Ascend extension): ascend_added",
-            "``note`` (Ascend extension): A synchronization primitive of the Ascend Cube-Vector architecture "
-            "unavailable in upstream triton.",
+            "``note`` (Ascend extension): Ascend Cube-Vector 架构同步原语，上游 Triton 不存在",
         ],
     },
     "triton.language.tensor.logical_and": {
         "constraints": [],
-        "dtype_support":
-        """
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            |                                     | uint8 | int8 | uint16 | int16 | uint32 | int32 | uint64 | int64 | fp16 | fp32 | fp64 | bf16 | fp8e(e4m3) | fp8e5(e5m2) | bool |
-            +=====================================+=======+======+========+=======+========+=======+========+=======+======+======+======+======+============+=============+======+
-            | Atlas A2 products/Atlas A3 products | √     | √    | ×      | √     | ×      | √     | ×      | √     | ×    | ×    | ×    | ×    | ×          | ×           | √    |
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            | Ascend 950PR&950DT products         | √     | √    | √      | √     | √      | √     | √      | √     | ×    | ×    | ×    | ×    | ×          | ×           | √    |
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            """,
     },
     "triton.language.tensor.logical_or": {
         "constraints": [],
-        "dtype_support":
-        """
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            |                                     | uint8 | int8 | uint16 | int16 | uint32 | int32 | uint64 | int64 | fp16 | fp32 | fp64 | bf16 | fp8e(e4m3) | fp8e5(e5m2) | bool |
-            +=====================================+=======+======+========+=======+========+=======+========+=======+======+======+======+======+============+=============+======+
-            | Atlas A2 products/Atlas A3 products | √     | √    | ×      | √     | ×      | √     | ×      | √     | ×    | ×    | ×    | ×    | ×          | ×           | √    |
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            | Ascend 950PR&950DT products         | √     | √    | √      | √     | √      | √     | √      | √     | ×    | ×    | ×    | ×    | ×          | ×           | √    |
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            """,
     },
     "triton.language.trans": {
         "constraints": [
+            "DataType: Ascend A2/A3 does not support fp64, fp8e4, fp8e5, uint16, uint32, uint64 (hardware limitation).",
             "Transpose on dimensions greater than 8 is not supported.",
         ],
-        "dtype_support": """
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            |                                     | uint8 | int8 | uint16 | int16 | uint32 | int32 | uint64 | int64 | fp16 | fp32 | fp64 | bf16 | fp8e(e4m3) | fp8e5(e5m2) | bool |
-            +=====================================+=======+======+========+=======+========+=======+========+=======+======+======+======+======+============+=============+======+
-            | Atlas A2 products/Atlas A3 products | √     | √    | ×      | √     | ×      | √     | ×      | √     | √    | √    | ×    | √    | ×          | ×           | √    |
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            | Ascend 950PR&950DT products         | √     | √    | √      | √     | √      | √     | √      | √     | √    | √    | ×    | √    | √          | √           | √    |
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            """,
-        "example": "triton.language.trans",
+        "example":
+        "triton.language.trans",
     },
     "triton.language.umulhi": {
-        "constraints": [],
-        "dtype_support": """
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            |                                     | uint8 | int8 | uint16 | int16 | uint32 | int32 | uint64 | int64 | fp16 | fp32 | fp64 | bf16 | fp8e(e4m3) | fp8e5(e5m2) | bool |
-            +=====================================+=======+======+========+=======+========+=======+========+=======+======+======+======+======+============+=============+======+
-            | Atlas A2 products/Atlas A3 products | ×     | ×    | ×      | ×     | ×      | √     | ×      | ×     | ×    | ×    | ×    | ×    | ×          | ×           | ×    |
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            | Ascend 950PR&950DT products         | ×     | ×    | ×      | ×     | ×      | √     | ×      | ×     | ×    | ×    | ×    | ×    | ×          | ×           | ×    |
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            """,
+        "constraints": [
+            "DataType: Ascend does not support int64 (hardware limitation).",
+        ],
         "example": "triton.language.umulhi",
     },
     "triton.language.view": {
-        "constraints": [],
-        "dtype_support": """
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            |                                     | uint8 | int8 | uint16 | int16 | uint32 | int32 | uint64 | int64 | fp16 | fp32 | fp64 | bf16 | fp8e(e4m3) | fp8e5(e5m2) | bool |
-            +=====================================+=======+======+========+=======+========+=======+========+=======+======+======+======+======+============+=============+======+
-            | Atlas A2 products/Atlas A3 products | √     | √    | ×      | √     | ×      | √     | ×      | √     | √    | √    | ×    | √    | ×          | ×           | √    |
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            | Ascend 950PR&950DT products         | √     | √    | √      | √     | √      | √     | √      | √     | √    | √    | ×    | √    | √          | √           | √    |
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            """,
-        "example": "triton.language.view",
+        "constraints": [
+            "DataType: Ascend A2/A3 does not support fp64, fp8e4, fp8e5, uint16, uint32, uint64 (hardware limitation).",
+        ],
+        "example":
+        "triton.language.view",
     },
     "triton.language.where": {
-        "constraints": [],
-        "dtype_support": """
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            |                                     | uint8 | int8 | uint16 | int16 | uint32 | int32 | uint64 | int64 | fp16 | fp32 | fp64 | bf16 | fp8e(e4m3) | fp8e5(e5m2) | bool |
-            +=====================================+=======+======+========+=======+========+=======+========+=======+======+======+======+======+============+=============+======+
-            | Atlas A2 products/Atlas A3 products | √     | √    | ×      | √     | ×      | √     | ×      | √     | √    | √    | ×    | √    | ×          | ×           | √    |
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            | Ascend 950PR&950DT products         | √     | √    | √      | √     | √      | √     | √      | √     | √    | √    | ×    | √    | ×          | ×           | √    |
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            """,
+        "constraints": [
+            "DataType: Ascend does not support fp64, uint16, uint32, uint64, uint8 (hardware limitation).",
+        ],
         "example": "triton.language.where",
     },
     "triton.language.xor_sum": {
         "constraints": [
+            "DataType: Ascend A2/A3 does not support uint16, uint32, uint64; Ascend 950 does not fp8e4(E4M3), fp8e5(E5M2).",
             "``keep_dims=True`` requires more test coverage; currently verified for 3D tensor with dim=2.",
         ],
-        "dtype_support": """
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            |                                     | uint8 | int8 | uint16 | int16 | uint32 | int32 | uint64 | int64 | fp16 | fp32 | fp64 | bf16 | fp8e(e4m3) | fp8e5(e5m2) | bool |
-            +=====================================+=======+======+========+=======+========+=======+========+=======+======+======+======+======+============+=============+======+
-            | Atlas A2 products/Atlas A3 products | ×     | √    | ×      | √     | ×      | √     | ×      | √     | ×    | ×    | ×    | ×    | ×          | ×           | √    |
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            | Ascend 950PR&950DT products         | ×     | √    | ×      | √     | ×      | √     | √      | √     | ×    | ×    | ×    | ×    | ×          | ×           | √    |
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            """,
-        "example": "triton.language.xor_sum",
+        "example":
+        "triton.language.xor_sum",
     },
     "triton.language.zeros": {
-        "constraints": [],
-        "dtype_support": """
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            |                                     | uint8 | int8 | uint16 | int16 | uint32 | int32 | uint64 | int64 | fp16 | fp32 | fp64 | bf16 | fp8e(e4m3) | fp8e5(e5m2) | bool |
-            +=====================================+=======+======+========+=======+========+=======+========+=======+======+======+======+======+============+=============+======+
-            | Atlas A2 products/Atlas A3 products | √     | √    | ×      | √     | ×      | √     | ×      | √     | √    | √    | ×    | √    | ×          | ×           | ×    |
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            | Ascend 950PR&950DT products         | √     | √    | √      | √     | √      | √     | √      | √     | √    | √    | ×    | √    | ×          | ×           | ×    |
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            """,
+        "constraints": [
+            "DataType: Ascend A2/A3 does not support uint16, uint32, uint64 (hardware limitation).",
+        ],
         "example": "triton.language.zeros",
     },
     "triton.language.zeros_like": {
-        "constraints": [],
-        "dtype_support": """
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            |                                     | uint8 | int8 | uint16 | int16 | uint32 | int32 | uint64 | int64 | fp16 | fp32 | fp64 | bf16 | fp8e(e4m3) | fp8e5(e5m2) | bool |
-            +=====================================+=======+======+========+=======+========+=======+========+=======+======+======+======+======+============+=============+======+
-            | Atlas A2 products/Atlas A3 products | √     | √    | ×      | √     | ×      | √     | ×      | √     | √    | √    | ×    | √    | ×          | ×           | ×    |
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            | Ascend 950PR&950DT products         | √     | √    | √      | √     | √      | √     | √      | √     | √    | √    | ×    | √    | ×          | ×           | ×    |
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            """,
+        "constraints": [
+            "DataType: Ascend A2/A3 does not support uint16, uint32, uint64 (hardware limitation).",
+        ],
         "example": "triton.language.zeros_like",
-    },
-    "triton.language.tensor": {
-        "replace_docstring": [
-            "Represents an N-dimensional array of values or pointers.",
-            "",
-            ":code:`tensor` is the fundamental data structure in Triton programs.",
-            "Most functions in :py:mod:`triton.language` operate on and return tensors.",
-            "",
-            "Most of the named member functions here are duplicates of the free functions",
-            "in :code:`triton.language`. For example, :code:`triton.language.sqrt(x)` is",
-            "equivalent to :code:`x.sqrt()`.",
-            "",
-            ":code:`tensor` also defines most of the magic/dunder methods, so you can",
-            "write :code:`x+y`, :code:`x << 2`, etc.",
-        ],
-    },
-    "triton.language.tensor_descriptor": {
-        "replace_docstring": [
-            "A descriptor representing a tensor in global memory.",
-            "",
-            "Used together with :func:`make_tensor_descriptor`, :func:`load_tensor_descriptor`",
-            "and :func:`store_tensor_descriptor` to load/store blocks of data from global memory.",
-        ],
-    },
-    # --- tensor operator syntax (no tl. prefix; documented via doc stubs) ---
-    "triton.language.invert": {
-        "constraints": [],
-        "dtype_support": """
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            |                                     | uint8 | int8 | uint16 | int16 | uint32 | int32 | uint64 | int64 | fp16 | fp32 | fp64 | bf16 | fp8e(e4m3) | fp8e5(e5m2) | bool |
-            +=====================================+=======+======+========+=======+========+=======+========+=======+======+======+======+======+============+=============+======+
-            | Atlas A2 products/Atlas A3 products | √     | √    | ×      | √     | ×      | √     | ×      | √     | ×    | ×    | ×    | ×    | ×          | ×           | √    |
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            | Ascend 950PR&950DT products         | √     | √    | ×      | √     | ×      | √     | ×      | √     | ×    | ×    | ×    | ×    | ×          | ×           | √    |
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            """,
-        "example": "triton.language.invert",
-    },
-    "triton.language.and": {
-        "constraints": [],
-        "dtype_support": """
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            |                                     | uint8 | int8 | uint16 | int16 | uint32 | int32 | uint64 | int64 | fp16 | fp32 | fp64 | bf16 | fp8e(e4m3) | fp8e5(e5m2) | bool |
-            +=====================================+=======+======+========+=======+========+=======+========+=======+======+======+======+======+============+=============+======+
-            | Atlas A2 products/Atlas A3 products | √     | √    | ×      | √     | ×      | √     | ×      | √     | ×    | ×    | ×    | ×    | ×          | ×           | √    |
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            | Ascend 950PR&950DT products         | √     | √    | √      | √     | √      | √     | √      | √     | ×    | ×    | ×    | ×    | ×          | ×           | √    |
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            """,
-        "example": "triton.language.and",
-    },
-    "triton.language.or": {
-        "constraints": [],
-        "dtype_support": """
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            |                                     | uint8 | int8 | uint16 | int16 | uint32 | int32 | uint64 | int64 | fp16 | fp32 | fp64 | bf16 | fp8e(e4m3) | fp8e5(e5m2) | bool |
-            +=====================================+=======+======+========+=======+========+=======+========+=======+======+======+======+======+============+=============+======+
-            | Atlas A2 products/Atlas A3 products | √     | √    | ×      | √     | ×      | √     | ×      | √     | ×    | ×    | ×    | ×    | ×          | ×           | √    |
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            | Ascend 950PR&950DT products         | √     | √    | ×      | √     | ×      | √     | ×      | √     | ×    | ×    | ×    | ×    | ×          | ×           | √    |
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            """,
-        "example": "triton.language.or",
-    },
-    "triton.language.xor": {
-        "constraints": [],
-        "dtype_support": """
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            |                                     | uint8 | int8 | uint16 | int16 | uint32 | int32 | uint64 | int64 | fp16 | fp32 | fp64 | bf16 | fp8e(e4m3) | fp8e5(e5m2) | bool |
-            +=====================================+=======+======+========+=======+========+=======+========+=======+======+======+======+======+============+=============+======+
-            | Atlas A2 products/Atlas A3 products | √     | √    | ×      | √     | ×      | √     | ×      | √     | ×    | ×    | ×    | ×    | ×          | ×           | √    |
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            | Ascend 950PR&950DT products         | √     | √    | ×      | √     | ×      | √     | ×      | √     | ×    | ×    | ×    | ×    | ×          | ×           | √    |
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            """,
-        "example": "triton.language.xor",
-    },
-    "triton.language.not": {
-        "constraints": [],
-        "dtype_support": """
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            |                                     | uint8 | int8 | uint16 | int16 | uint32 | int32 | uint64 | int64 | fp16 | fp32 | fp64 | bf16 | fp8e(e4m3) | fp8e5(e5m2) | bool |
-            +=====================================+=======+======+========+=======+========+=======+========+=======+======+======+======+======+============+=============+======+
-            | Atlas A2 products/Atlas A3 products | ×     | ×    | ×      | ×     | ×      | ×     | ×      | ×     | ×    | ×    | ×    | ×    | ×          | ×           | √    |
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            | Ascend 950PR&950DT products         | ×     | ×    | ×      | ×     | ×      | ×     | ×      | ×     | ×    | ×    | ×    | ×    | ×          | ×           | √    |
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            """,
-        "example": "triton.language.not",
-    },
-    "triton.language.logical_and": {
-        "constraints": [],
-        "dtype_support": """
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            |                                     | uint8 | int8 | uint16 | int16 | uint32 | int32 | uint64 | int64 | fp16 | fp32 | fp64 | bf16 | fp8e(e4m3) | fp8e5(e5m2) | bool |
-            +=====================================+=======+======+========+=======+========+=======+========+=======+======+======+======+======+============+=============+======+
-            | Atlas A2 products/Atlas A3 products | √     | √    | ×      | √     | ×      | √     | ×      | √     | ×    | ×    | ×    | ×    | ×          | ×           | √    |
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            | Ascend 950PR&950DT products         | √     | √    | √      | √     | √      | √     | √      | √     | ×    | ×    | ×    | ×    | ×          | ×           | √    |
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            """,
-        "example": "triton.language.logical_and",
-    },
-    "triton.language.logical_or": {
-        "constraints": [],
-        "dtype_support": """
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            |                                     | uint8 | int8 | uint16 | int16 | uint32 | int32 | uint64 | int64 | fp16 | fp32 | fp64 | bf16 | fp8e(e4m3) | fp8e5(e5m2) | bool |
-            +=====================================+=======+======+========+=======+========+=======+========+=======+======+======+======+======+============+=============+======+
-            | Atlas A2 products/Atlas A3 products | √     | √    | ×      | √     | ×      | √     | ×      | √     | ×    | ×    | ×    | ×    | ×          | ×           | √    |
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            | Ascend 950PR&950DT products         | √     | √    | √      | √     | √      | √     | √      | √     | ×    | ×    | ×    | ×    | ×          | ×           | √    |
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            """,
-        "example": "triton.language.logical_or",
-    },
-    "triton.language.lshift": {
-        "constraints": [],
-        "dtype_support": """
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            |                                     | uint8 | int8 | uint16 | int16 | uint32 | int32 | uint64 | int64 | fp16 | fp32 | fp64 | bf16 | fp8e(e4m3) | fp8e5(e5m2) | bool |
-            +=====================================+=======+======+========+=======+========+=======+========+=======+======+======+======+======+============+=============+======+
-            | Atlas A2 products/Atlas A3 products | √     | √    | ×      | √     | ×      | √     | ×      | √     | ×    | ×    | ×    | ×    | ×          | ×           | √    |
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            | Ascend 950PR&950DT products         | √     | √    | ×      | √     | ×      | √     | ×      | √     | ×    | ×    | ×    | ×    | ×          | ×           | √    |
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            """,
-        "example": "triton.language.lshift",
-    },
-    "triton.language.rshift": {
-        "constraints": [],
-        "dtype_support": """
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            |                                     | uint8 | int8 | uint16 | int16 | uint32 | int32 | uint64 | int64 | fp16 | fp32 | fp64 | bf16 | fp8e(e4m3) | fp8e5(e5m2) | bool |
-            +=====================================+=======+======+========+=======+========+=======+========+=======+======+======+======+======+============+=============+======+
-            | Atlas A2 products/Atlas A3 products | √     | √    | ×      | √     | ×      | √     | ×      | √     | ×    | ×    | ×    | ×    | ×          | ×           | √    |
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            | Ascend 950PR&950DT products         | √     | √    | ×      | √     | ×      | √     | ×      | √     | ×    | ×    | ×    | ×    | ×          | ×           | √    |
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            """,
-        "example": "triton.language.rshift",
-    },
-    "triton.language.gt": {
-        "constraints": [],
-        "dtype_support": """
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            |                                     | uint8 | int8 | uint16 | int16 | uint32 | int32 | uint64 | int64 | fp16 | fp32 | fp64 | bf16 | fp8e(e4m3) | fp8e5(e5m2) | bool |
-            +=====================================+=======+======+========+=======+========+=======+========+=======+======+======+======+======+============+=============+======+
-            | Atlas A2 products/Atlas A3 products | √     | √    | ×      | √     | ×      | √     | ×      | √     | √    | √    | ×    | √    | ×          | ×           | √    |
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            | Ascend 950PR&950DT products         | √     | √    | √      | √     | √      | √     | √      | √     | √    | √    | ×    | √    | ×          | ×           | √    |
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            """,
-        "example": "triton.language.gt",
-    },
-    "triton.language.ge": {
-        "constraints": [],
-        "dtype_support": """
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            |                                     | uint8 | int8 | uint16 | int16 | uint32 | int32 | uint64 | int64 | fp16 | fp32 | fp64 | bf16 | fp8e(e4m3) | fp8e5(e5m2) | bool |
-            +=====================================+=======+======+========+=======+========+=======+========+=======+======+======+======+======+============+=============+======+
-            | Atlas A2 products/Atlas A3 products | √     | √    | ×      | √     | ×      | √     | ×      | √     | √    | √    | ×    | √    | ×          | ×           | √    |
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            | Ascend 950PR&950DT products         | √     | √    | √      | √     | √      | √     | √      | √     | √    | √    | ×    | √    | √          | √           | √    |
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            """,
-        "example": "triton.language.ge",
-    },
-    "triton.language.lt": {
-        "constraints": [],
-        "dtype_support": """
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            |                                     | uint8 | int8 | uint16 | int16 | uint32 | int32 | uint64 | int64 | fp16 | fp32 | fp64 | bf16 | fp8e(e4m3) | fp8e5(e5m2) | bool |
-            +=====================================+=======+======+========+=======+========+=======+========+=======+======+======+======+======+============+=============+======+
-            | Atlas A2 products/Atlas A3 products | √     | √    | ×      | √     | ×      | √     | ×      | √     | √    | √    | ×    | √    | ×          | ×           | √    |
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            | Ascend 950PR&950DT products         | √     | √    | √      | √     | √      | √     | √      | √     | √    | √    | ×    | √    | √          | √           | √    |
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            """,
-        "example": "triton.language.lt",
-    },
-    "triton.language.le": {
-        "constraints": [],
-        "dtype_support": """
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            |                                     | uint8 | int8 | uint16 | int16 | uint32 | int32 | uint64 | int64 | fp16 | fp32 | fp64 | bf16 | fp8e(e4m3) | fp8e5(e5m2) | bool |
-            +=====================================+=======+======+========+=======+========+=======+========+=======+======+======+======+======+============+=============+======+
-            | Atlas A2 products/Atlas A3 products | √     | √    | ×      | √     | ×      | √     | ×      | √     | √    | √    | ×    | √    | ×          | ×           | √    |
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            | Ascend 950PR&950DT products         | √     | √    | √      | √     | √      | √     | √      | √     | √    | √    | ×    | √    | √          | √           | √    |
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            """,
-        "example": "triton.language.le",
-    },
-    "triton.language.eq": {
-        "constraints": [],
-        "dtype_support": """
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            |                                     | uint8 | int8 | uint16 | int16 | uint32 | int32 | uint64 | int64 | fp16 | fp32 | fp64 | bf16 | fp8e(e4m3) | fp8e5(e5m2) | bool |
-            +=====================================+=======+======+========+=======+========+=======+========+=======+======+======+======+======+============+=============+======+
-            | Atlas A2 products/Atlas A3 products | √     | √    | ×      | √     | ×      | √     | ×      | √     | √    | √    | ×    | √    | ×          | ×           | √    |
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            | Ascend 950PR&950DT products         | √     | √    | √      | √     | √      | √     | √      | √     | √    | √    | ×    | √    | √          | √           | √    |
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            """,
-        "example": "triton.language.eq",
-    },
-    "triton.language.ne": {
-        "constraints": [],
-        "dtype_support": """
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            |                                     | uint8 | int8 | uint16 | int16 | uint32 | int32 | uint64 | int64 | fp16 | fp32 | fp64 | bf16 | fp8e(e4m3) | fp8e5(e5m2) | bool |
-            +=====================================+=======+======+========+=======+========+=======+========+=======+======+======+======+======+============+=============+======+
-            | Atlas A2 products/Atlas A3 products | √     | √    | ×      | √     | ×      | √     | ×      | √     | √    | √    | ×    | √    | ×          | ×           | √    |
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            | Ascend 950PR&950DT products         | √     | √    | √      | √     | √      | √     | √      | √     | √    | √    | ×    | √    | √          | √           | √    |
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            """,
-        "example": "triton.language.ne",
-    },
-    "triton.language.condition": {
-        "constraints": [],
-        "dtype_support": """
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            |                                     | uint8 | int8 | uint16 | int16 | uint32 | int32 | uint64 | int64 | fp16 | fp32 | fp64 | bf16 | fp8e(e4m3) | fp8e5(e5m2) | bool |
-            +=====================================+=======+======+========+=======+========+=======+========+=======+======+======+======+======+============+=============+======+
-            | Atlas A2 products/Atlas A3 products | √     | √    | ×      | √     | ×      | √     | ×      | √     | √    | √    | ×    | √    | ×          | ×           | √    |
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            | Ascend 950PR&950DT products         | √     | √    | ×      | √     | ×      | √     | ×      | √     | √    | √    | ×    | √    | ×          | ×           | √    |
-            +-------------------------------------+-------+------+--------+-------+--------+-------+--------+-------+------+------+------+------+------------+-------------+------+
-            """,
-        "example": "triton.language.condition",
     },
     "triton.language.extra.cann.extension.index_put": {
         "constraints": [
-            "Only supported on Ascend 950PR&950DT products.",
+            "Only supported on Ascend 950.",
             "``ptr.dtype``: only supports float16, bfloat16, float32.",
             "``ptr`` and ``value`` must have the same rank.",
             "``index``: must be an integer tensor. If ``index.rank`` != 1, it will be reshaped to 1D.",
@@ -2603,7 +979,7 @@ CONSTRAINTS = {
     },
     "triton.language.extra.cann.extension.gather_out_to_ub": {
         "constraints": [
-            "Only supported on Ascend 950PR&950DT products.",
+            "Only supported on Ascend 950.",
             "``src.dtype``: only supports float16, bfloat16, float32.",
             "``src`` and ``index`` must have the same rank.",
             "``index``: must be an integer tensor, with rank in [1, 5].",
@@ -2617,7 +993,7 @@ CONSTRAINTS = {
     },
     "triton.language.extra.cann.extension.scatter_ub_to_out": {
         "constraints": [
-            "Only supported on Ascend 950PR&950DT products.",
+            "Only supported on Ascend 950.",
             "``ptr.dtype``: only supports float16, bfloat16, float32.",
             "``ptr``, ``index`` and ``value`` must have the same rank.",
             "``index``: must be an integer tensor, with rank in [1, 5].",
@@ -2628,1263 +1004,528 @@ CONSTRAINTS = {
         "example":
         "triton.language.extra.cann.extension.scatter_ub_to_out",
     },
-    "triton.language.extra.cann.libdevice.abs": {
-        "constraints": [
-            "Platform and compilation modes:\n\n"
-            "- Ascend 950PR&950DT products supports SIMD, SIMT.",
-        ],
-        "example": "triton.language.extra.cann.libdevice.abs",
-    },
     "triton.language.extra.cann.libdevice.acos": {
-        "constraints": [
-            "Platform and compilation modes:\n\n"
-            "- Atlas A2 products/Atlas A3 products supports SIMD.\n"
-            "- Ascend 950PR&950DT products supports SIMD, SIMT.",
-        ],
-        "example":
-        "triton.language.extra.cann.libdevice.acos",
+        "example": "triton.language.extra.cann.libdevice.acos",
     },
     "triton.language.extra.cann.libdevice.acosh": {
-        "constraints": [
-            "Platform and compilation modes:\n\n"
-            "- Atlas A2 products/Atlas A3 products supports SIMD.\n"
-            "- Ascend 950PR&950DT products supports SIMD, SIMT.",
-        ],
-        "example":
-        "triton.language.extra.cann.libdevice.acosh",
-    },
-    "triton.language.extra.cann.libdevice.add_rd": {
-        "constraints": [
-            "Platform and compilation modes:\n\n"
-            "- Ascend 950PR&950DT products supports SIMD, SIMT.",
-        ],
-        "example": "triton.language.extra.cann.libdevice.add_rd",
-    },
-    "triton.language.extra.cann.libdevice.add_rn": {
-        "constraints": [
-            "Platform and compilation modes:\n\n"
-            "- Ascend 950PR&950DT products supports SIMD, SIMT.",
-        ],
-        "example": "triton.language.extra.cann.libdevice.add_rn",
-    },
-    "triton.language.extra.cann.libdevice.add_ru": {
-        "constraints": [
-            "Platform and compilation modes:\n\n"
-            "- Ascend 950PR&950DT products supports SIMD, SIMT.",
-        ],
-        "example": "triton.language.extra.cann.libdevice.add_ru",
-    },
-    "triton.language.extra.cann.libdevice.add_rz": {
-        "constraints": [
-            "Platform and compilation modes:\n\n"
-            "- Ascend 950PR&950DT products supports SIMD, SIMT.",
-        ],
-        "example": "triton.language.extra.cann.libdevice.add_rz",
+        "example": "triton.language.extra.cann.libdevice.acosh",
     },
     "triton.language.extra.cann.libdevice.asin": {
-        "constraints": [
-            "Platform and compilation modes:\n\n"
-            "- Atlas A2 products/Atlas A3 products supports SIMD.\n"
-            "- Ascend 950PR&950DT products supports SIMD, SIMT.",
-        ],
-        "example":
-        "triton.language.extra.cann.libdevice.asin",
+        "example": "triton.language.extra.cann.libdevice.asin",
     },
     "triton.language.extra.cann.libdevice.asinh": {
-        "constraints": [
-            "Platform and compilation modes:\n\n"
-            "- Atlas A2 products/Atlas A3 products supports SIMD.\n"
-            "- Ascend 950PR&950DT products supports SIMD, SIMT.",
-        ],
-        "example":
-        "triton.language.extra.cann.libdevice.asinh",
+        "example": "triton.language.extra.cann.libdevice.asinh",
     },
     "triton.language.extra.cann.libdevice.atan": {
-        "constraints": [
-            "Platform and compilation modes:\n\n"
-            "- Atlas A2 products/Atlas A3 products supports SIMD.\n"
-            "- Ascend 950PR&950DT products supports SIMD, SIMT.",
-        ],
-        "example":
-        "triton.language.extra.cann.libdevice.atan",
+        "example": "triton.language.extra.cann.libdevice.atan",
     },
     "triton.language.extra.cann.libdevice.atan2": {
-        "constraints": [
-            "Platform and compilation modes:\n\n"
-            "- Atlas A2 products/Atlas A3 products supports SIMD.\n"
-            "- Ascend 950PR&950DT products supports SIMD, SIMT.",
-        ],
-        "example":
-        "triton.language.extra.cann.libdevice.atan2",
+        "example": "triton.language.extra.cann.libdevice.atan2",
     },
     "triton.language.extra.cann.libdevice.atanh": {
-        "constraints": [
-            "Platform and compilation modes:\n\n"
-            "- Atlas A2 products/Atlas A3 products supports SIMD.\n"
-            "- Ascend 950PR&950DT products supports SIMD, SIMT.",
-        ],
-        "example":
-        "triton.language.extra.cann.libdevice.atanh",
-    },
-    "triton.language.extra.cann.libdevice.brev": {
-        "constraints": [
-            "Platform and compilation modes:\n\n"
-            "- Ascend 950PR&950DT products supports SIMD, SIMT.",
-        ],
-        "example": "triton.language.extra.cann.libdevice.brev",
-    },
-    "triton.language.extra.cann.libdevice.byte_perm": {
-        "constraints": [
-            "Platform and compilation modes:\n\n"
-            "- Ascend 950PR&950DT products supports SIMD, SIMT.",
-        ],
-        "example": "triton.language.extra.cann.libdevice.byte_perm",
-    },
-    "triton.language.extra.cann.libdevice.cbrt": {
-        "constraints": [
-            "Platform and compilation modes:\n\n"
-            "- Ascend 950PR&950DT products supports SIMD, SIMT.",
-        ],
-        "example": "triton.language.extra.cann.libdevice.cbrt",
-    },
-    "triton.language.extra.cann.libdevice.ceil": {
-        "constraints": [
-            "Platform and compilation modes:\n\n"
-            "- Ascend 950PR&950DT products supports SIMD, SIMT.",
-        ],
-        "example": "triton.language.extra.cann.libdevice.ceil",
-    },
-    "triton.language.extra.cann.libdevice.clz": {
-        "constraints": [
-            "Platform and compilation modes:\n\n"
-            "- Ascend 950PR&950DT products supports SIMD, SIMT.",
-        ],
-        "example": "triton.language.extra.cann.libdevice.clz",
+        "example": "triton.language.extra.cann.libdevice.atanh",
     },
     "triton.language.extra.cann.libdevice.copysign": {
-        "constraints": [
-            "Platform and compilation modes:\n\n"
-            "- Atlas A2 products/Atlas A3 products supports SIMD.\n"
-            "- Ascend 950PR&950DT products supports SIMD, SIMT.",
-        ],
-        "example":
-        "triton.language.extra.cann.libdevice.copysign",
-    },
-    "triton.language.extra.cann.libdevice.cos": {
-        "constraints": [
-            "Platform and compilation modes:\n\n"
-            "- Ascend 950PR&950DT products supports SIMD, SIMT.",
-        ],
-        "example": "triton.language.extra.cann.libdevice.cos",
+        "example": "triton.language.extra.cann.libdevice.copysign",
     },
     "triton.language.extra.cann.libdevice.cosh": {
-        "constraints": [
-            "Platform and compilation modes:\n\n"
-            "- Atlas A2 products/Atlas A3 products supports SIMD.\n"
-            "- Ascend 950PR&950DT products supports SIMD, SIMT.",
-        ],
-        "example":
-        "triton.language.extra.cann.libdevice.cosh",
-    },
-    "triton.language.extra.cann.libdevice.cospi": {
-        "constraints": [
-            "Platform and compilation modes:\n\n"
-            "- Ascend 950PR&950DT products supports SIMD, SIMT.",
-        ],
-        "example": "triton.language.extra.cann.libdevice.cospi",
+        "example": "triton.language.extra.cann.libdevice.cosh",
     },
     "triton.language.extra.cann.libdevice.cyl_bessel_i0": {
-        "constraints": [
-            "Platform and compilation modes:\n\n"
-            "- Atlas A2 products/Atlas A3 products supports SIMD.\n"
-            "- Ascend 950PR&950DT products supports SIMD, SIMT.",
-        ],
-        "example":
-        "triton.language.extra.cann.libdevice.cyl_bessel_i0",
-    },
-    "triton.language.extra.cann.libdevice.cyl_bessel_i1": {
-        "constraints": [
-            "Platform and compilation modes:\n\n"
-            "- Ascend 950PR&950DT products supports SIMD, SIMT.",
-        ],
-        "example": "triton.language.extra.cann.libdevice.cyl_bessel_i1",
-    },
-    "triton.language.extra.cann.libdevice.div_rd": {
-        "constraints": [
-            "Platform and compilation modes:\n\n"
-            "- Ascend 950PR&950DT products supports SIMD, SIMT.",
-        ],
-        "example": "triton.language.extra.cann.libdevice.div_rd",
-    },
-    "triton.language.extra.cann.libdevice.div_rn": {
-        "constraints": [
-            "Platform and compilation modes:\n\n"
-            "- Ascend 950PR&950DT products supports SIMD, SIMT.",
-        ],
-        "example": "triton.language.extra.cann.libdevice.div_rn",
-    },
-    "triton.language.extra.cann.libdevice.div_ru": {
-        "constraints": [
-            "Platform and compilation modes:\n\n"
-            "- Ascend 950PR&950DT products supports SIMD, SIMT.",
-        ],
-        "example": "triton.language.extra.cann.libdevice.div_ru",
+        "example": "triton.language.extra.cann.libdevice.cyl_bessel_i0",
     },
     "triton.language.extra.cann.libdevice.div_rz": {
-        "constraints": [
-            "Platform and compilation modes:\n\n"
-            "- Atlas A2 products/Atlas A3 products supports SIMD.\n"
-            "- Ascend 950PR&950DT products supports SIMD, SIMT.",
-        ],
-        "example":
-        "triton.language.extra.cann.libdevice.div_rz",
-    },
-    "triton.language.extra.cann.libdevice.erf": {
-        "constraints": [
-            "Platform and compilation modes:\n\n"
-            "- Ascend 950PR&950DT products supports SIMD, SIMT.",
-        ],
-        "example": "triton.language.extra.cann.libdevice.erf",
-    },
-    "triton.language.extra.cann.libdevice.erfc": {
-        "constraints": [
-            "Platform and compilation modes:\n\n"
-            "- Ascend 950PR&950DT products supports SIMD, SIMT.",
-        ],
-        "example": "triton.language.extra.cann.libdevice.erfc",
-    },
-    "triton.language.extra.cann.libdevice.erfcinv": {
-        "constraints": [
-            "Platform and compilation modes:\n\n"
-            "- Ascend 950PR&950DT products supports SIMD, SIMT.",
-        ],
-        "example": "triton.language.extra.cann.libdevice.erfcinv",
-    },
-    "triton.language.extra.cann.libdevice.erfcx": {
-        "constraints": [
-            "Platform and compilation modes:\n\n"
-            "- Ascend 950PR&950DT products supports SIMD, SIMT.",
-        ],
-        "example": "triton.language.extra.cann.libdevice.erfcx",
+        "example": "triton.language.extra.cann.libdevice.div_rz",
     },
     "triton.language.extra.cann.libdevice.erfinv": {
-        "constraints": [
-            "Platform and compilation modes:\n\n"
-            "- Atlas A2 products/Atlas A3 products supports SIMD.\n"
-            "- Ascend 950PR&950DT products supports SIMD, SIMT.",
-        ],
-        "example":
-        "triton.language.extra.cann.libdevice.erfinv",
-    },
-    "triton.language.extra.cann.libdevice.exp": {
-        "constraints": [
-            "Platform and compilation modes:\n\n"
-            "- Ascend 950PR&950DT products supports SIMD, SIMT.",
-        ],
-        "example": "triton.language.extra.cann.libdevice.exp",
-    },
-    "triton.language.extra.cann.libdevice.exp10": {
-        "constraints": [
-            "Platform and compilation modes:\n\n"
-            "- Ascend 950PR&950DT products supports SIMD, SIMT.",
-        ],
-        "example": "triton.language.extra.cann.libdevice.exp10",
-    },
-    "triton.language.extra.cann.libdevice.exp2": {
-        "constraints": [
-            "Platform and compilation modes:\n\n"
-            "- Ascend 950PR&950DT products supports SIMD, SIMT.",
-        ],
-        "example": "triton.language.extra.cann.libdevice.exp2",
+        "example": "triton.language.extra.cann.libdevice.erfinv",
     },
     "triton.language.extra.cann.libdevice.expm1": {
-        "constraints": [
-            "Platform and compilation modes:\n\n"
-            "- Atlas A2 products/Atlas A3 products supports SIMD.\n"
-            "- Ascend 950PR&950DT products supports SIMD, SIMT.",
-        ],
-        "example":
-        "triton.language.extra.cann.libdevice.expm1",
-    },
-    "triton.language.extra.cann.libdevice.fast_cosf": {
-        "constraints": [
-            "Platform and compilation modes:\n\n"
-            "- Ascend 950PR&950DT products supports SIMD, SIMT.",
-        ],
-        "example": "triton.language.extra.cann.libdevice.fast_cosf",
+        "example": "triton.language.extra.cann.libdevice.expm1",
     },
     "triton.language.extra.cann.libdevice.fast_dividef": {
-        "constraints": [
-            "Platform and compilation modes:\n\n"
-            "- Atlas A2 products/Atlas A3 products supports SIMD.\n"
-            "- Ascend 950PR&950DT products supports SIMD, SIMT.",
-        ],
-        "example":
-        "triton.language.extra.cann.libdevice.fast_dividef",
-    },
-    "triton.language.extra.cann.libdevice.fast_exp10f": {
-        "constraints": [
-            "Platform and compilation modes:\n\n"
-            "- Ascend 950PR&950DT products supports SIMD, SIMT.",
-        ],
-        "example": "triton.language.extra.cann.libdevice.fast_exp10f",
+        "example": "triton.language.extra.cann.libdevice.fast_dividef",
     },
     "triton.language.extra.cann.libdevice.fast_expf": {
-        "constraints": [
-            "Platform and compilation modes:\n\n"
-            "- Atlas A2 products/Atlas A3 products supports SIMD.\n"
-            "- Ascend 950PR&950DT products supports SIMD, SIMT.",
-        ],
-        "example":
-        "triton.language.extra.cann.libdevice.fast_expf",
-    },
-    "triton.language.extra.cann.libdevice.fast_log10f": {
-        "constraints": [
-            "Platform and compilation modes:\n\n"
-            "- Ascend 950PR&950DT products supports SIMD, SIMT.",
-        ],
-        "example": "triton.language.extra.cann.libdevice.fast_log10f",
-    },
-    "triton.language.extra.cann.libdevice.fast_log2f": {
-        "constraints": [
-            "Platform and compilation modes:\n\n"
-            "- Ascend 950PR&950DT products supports SIMD, SIMT.",
-        ],
-        "example": "triton.language.extra.cann.libdevice.fast_log2f",
-    },
-    "triton.language.extra.cann.libdevice.fast_logf": {
-        "constraints": [
-            "Platform and compilation modes:\n\n"
-            "- Ascend 950PR&950DT products supports SIMD, SIMT.",
-        ],
-        "example": "triton.language.extra.cann.libdevice.fast_logf",
-    },
-    "triton.language.extra.cann.libdevice.fast_powf": {
-        "constraints": [
-            "Platform and compilation modes:\n\n"
-            "- Ascend 950PR&950DT products supports SIMD, SIMT.",
-        ],
-        "example": "triton.language.extra.cann.libdevice.fast_powf",
-    },
-    "triton.language.extra.cann.libdevice.fast_sinf": {
-        "constraints": [
-            "Platform and compilation modes:\n\n"
-            "- Ascend 950PR&950DT products supports SIMD, SIMT.",
-        ],
-        "example": "triton.language.extra.cann.libdevice.fast_sinf",
-    },
-    "triton.language.extra.cann.libdevice.fast_tanf": {
-        "constraints": [
-            "Platform and compilation modes:\n\n"
-            "- Ascend 950PR&950DT products supports SIMD, SIMT.",
-        ],
-        "example": "triton.language.extra.cann.libdevice.fast_tanf",
-    },
-    "triton.language.extra.cann.libdevice.fast_tanhf": {
-        "constraints": [
-            "Platform and compilation modes:\n\n"
-            "- Ascend 950PR&950DT products supports SIMD, SIMT.",
-        ],
-        "example": "triton.language.extra.cann.libdevice.fast_tanhf",
-    },
-    "triton.language.extra.cann.libdevice.fdim": {
-        "constraints": [
-            "Platform and compilation modes:\n\n"
-            "- Ascend 950PR&950DT products supports SIMD, SIMT.",
-        ],
-        "example": "triton.language.extra.cann.libdevice.fdim",
-    },
-    "triton.language.extra.cann.libdevice.ffs": {
-        "constraints": [
-            "Platform and compilation modes:\n\n"
-            "- Ascend 950PR&950DT products supports SIMD, SIMT.",
-        ],
-        "example": "triton.language.extra.cann.libdevice.ffs",
-    },
-    "triton.language.extra.cann.libdevice.finitef": {
-        "constraints": [
-            "Platform and compilation modes:\n\n"
-            "- Ascend 950PR&950DT products supports SIMD, SIMT.",
-        ],
-        "example": "triton.language.extra.cann.libdevice.finitef",
-    },
-    "triton.language.extra.cann.libdevice.float2half_rn": {
-        "constraints": [
-            "Platform and compilation modes:\n\n"
-            "- Ascend 950PR&950DT products supports SIMD, SIMT.",
-        ],
-        "example": "triton.language.extra.cann.libdevice.float2half_rn",
-    },
-    "triton.language.extra.cann.libdevice.float2int_rd": {
-        "constraints": [
-            "Platform and compilation modes:\n\n"
-            "- Ascend 950PR&950DT products supports SIMD, SIMT.",
-        ],
-        "example": "triton.language.extra.cann.libdevice.float2int_rd",
-    },
-    "triton.language.extra.cann.libdevice.float2int_rn": {
-        "constraints": [
-            "Platform and compilation modes:\n\n"
-            "- Ascend 950PR&950DT products supports SIMD, SIMT.",
-        ],
-        "example": "triton.language.extra.cann.libdevice.float2int_rn",
-    },
-    "triton.language.extra.cann.libdevice.float2int_ru": {
-        "constraints": [
-            "Platform and compilation modes:\n\n"
-            "- Ascend 950PR&950DT products supports SIMD, SIMT.",
-        ],
-        "example": "triton.language.extra.cann.libdevice.float2int_ru",
-    },
-    "triton.language.extra.cann.libdevice.float2int_rz": {
-        "constraints": [
-            "Platform and compilation modes:\n\n"
-            "- Ascend 950PR&950DT products supports SIMD, SIMT.",
-        ],
-        "example": "triton.language.extra.cann.libdevice.float2int_rz",
-    },
-    "triton.language.extra.cann.libdevice.float2ll_rd": {
-        "constraints": [
-            "Platform and compilation modes:\n\n"
-            "- Ascend 950PR&950DT products supports SIMD, SIMT.",
-        ],
-        "example": "triton.language.extra.cann.libdevice.float2ll_rd",
-    },
-    "triton.language.extra.cann.libdevice.float2ll_rn": {
-        "constraints": [
-            "Platform and compilation modes:\n\n"
-            "- Ascend 950PR&950DT products supports SIMD, SIMT.",
-        ],
-        "example": "triton.language.extra.cann.libdevice.float2ll_rn",
-    },
-    "triton.language.extra.cann.libdevice.float2ll_ru": {
-        "constraints": [
-            "Platform and compilation modes:\n\n"
-            "- Ascend 950PR&950DT products supports SIMD, SIMT.",
-        ],
-        "example": "triton.language.extra.cann.libdevice.float2ll_ru",
-    },
-    "triton.language.extra.cann.libdevice.float2ll_rz": {
-        "constraints": [
-            "Platform and compilation modes:\n\n"
-            "- Ascend 950PR&950DT products supports SIMD, SIMT.",
-        ],
-        "example": "triton.language.extra.cann.libdevice.float2ll_rz",
-    },
-    "triton.language.extra.cann.libdevice.float2uint_rd": {
-        "constraints": [
-            "Platform and compilation modes:\n\n"
-            "- Ascend 950PR&950DT products supports SIMD, SIMT.",
-        ],
-        "example": "triton.language.extra.cann.libdevice.float2uint_rd",
-    },
-    "triton.language.extra.cann.libdevice.float2uint_rn": {
-        "constraints": [
-            "Platform and compilation modes:\n\n"
-            "- Ascend 950PR&950DT products supports SIMD, SIMT.",
-        ],
-        "example": "triton.language.extra.cann.libdevice.float2uint_rn",
-    },
-    "triton.language.extra.cann.libdevice.float2uint_ru": {
-        "constraints": [
-            "Platform and compilation modes:\n\n"
-            "- Ascend 950PR&950DT products supports SIMD, SIMT.",
-        ],
-        "example": "triton.language.extra.cann.libdevice.float2uint_ru",
-    },
-    "triton.language.extra.cann.libdevice.float2uint_rz": {
-        "constraints": [
-            "Platform and compilation modes:\n\n"
-            "- Ascend 950PR&950DT products supports SIMD, SIMT.",
-        ],
-        "example": "triton.language.extra.cann.libdevice.float2uint_rz",
-    },
-    "triton.language.extra.cann.libdevice.float2ull_rd": {
-        "constraints": [
-            "Platform and compilation modes:\n\n"
-            "- Ascend 950PR&950DT products supports SIMD, SIMT.",
-        ],
-        "example": "triton.language.extra.cann.libdevice.float2ull_rd",
-    },
-    "triton.language.extra.cann.libdevice.float2ull_rn": {
-        "constraints": [
-            "Platform and compilation modes:\n\n"
-            "- Ascend 950PR&950DT products supports SIMD, SIMT.",
-        ],
-        "example": "triton.language.extra.cann.libdevice.float2ull_rn",
-    },
-    "triton.language.extra.cann.libdevice.float2ull_ru": {
-        "constraints": [
-            "Platform and compilation modes:\n\n"
-            "- Ascend 950PR&950DT products supports SIMD, SIMT.",
-        ],
-        "example": "triton.language.extra.cann.libdevice.float2ull_ru",
-    },
-    "triton.language.extra.cann.libdevice.float2ull_rz": {
-        "constraints": [
-            "Platform and compilation modes:\n\n"
-            "- Ascend 950PR&950DT products supports SIMD, SIMT.",
-        ],
-        "example": "triton.language.extra.cann.libdevice.float2ull_rz",
+        "example": "triton.language.extra.cann.libdevice.fast_expf",
     },
     "triton.language.extra.cann.libdevice.float_as_int": {
-        "constraints": [
-            "Platform and compilation modes:\n\n"
-            "- Atlas A2 products/Atlas A3 products supports SIMD.\n"
-            "- Ascend 950PR&950DT products supports SIMD, SIMT.",
-        ],
-        "example":
-        "triton.language.extra.cann.libdevice.float_as_int",
-    },
-    "triton.language.extra.cann.libdevice.float_as_uint": {
-        "constraints": [
-            "Platform and compilation modes:\n\n"
-            "- Ascend 950PR&950DT products supports SIMD, SIMT.",
-        ],
-        "example": "triton.language.extra.cann.libdevice.float_as_uint",
-    },
-    "triton.language.extra.cann.libdevice.floor": {
-        "constraints": [
-            "Platform and compilation modes:\n\n"
-            "- Ascend 950PR&950DT products supports SIMD, SIMT.",
-        ],
-        "example": "triton.language.extra.cann.libdevice.floor",
-    },
-    "triton.language.extra.cann.libdevice.fma": {
-        "constraints": [
-            "Platform and compilation modes:\n\n"
-            "- Ascend 950PR&950DT products supports SIMD, SIMT.",
-        ],
-        "example": "triton.language.extra.cann.libdevice.fma",
-    },
-    "triton.language.extra.cann.libdevice.fma_rd": {
-        "constraints": [
-            "Platform and compilation modes:\n\n"
-            "- Ascend 950PR&950DT products supports SIMD, SIMT.",
-        ],
-        "example": "triton.language.extra.cann.libdevice.fma_rd",
-    },
-    "triton.language.extra.cann.libdevice.fma_rn": {
-        "constraints": [
-            "Platform and compilation modes:\n\n"
-            "- Ascend 950PR&950DT products supports SIMD, SIMT.",
-        ],
-        "example": "triton.language.extra.cann.libdevice.fma_rn",
-    },
-    "triton.language.extra.cann.libdevice.fma_ru": {
-        "constraints": [
-            "Platform and compilation modes:\n\n"
-            "- Ascend 950PR&950DT products supports SIMD, SIMT.",
-        ],
-        "example": "triton.language.extra.cann.libdevice.fma_ru",
-    },
-    "triton.language.extra.cann.libdevice.fma_rz": {
-        "constraints": [
-            "Platform and compilation modes:\n\n"
-            "- Ascend 950PR&950DT products supports SIMD, SIMT.",
-        ],
-        "example": "triton.language.extra.cann.libdevice.fma_rz",
+        "example": "triton.language.extra.cann.libdevice.float_as_int",
     },
     "triton.language.extra.cann.libdevice.fmod": {
-        "constraints": [
-            "Platform and compilation modes:\n\n"
-            "- Atlas A2 products/Atlas A3 products supports SIMD.\n"
-            "- Ascend 950PR&950DT products supports SIMD, SIMT.",
-        ],
-        "example":
-        "triton.language.extra.cann.libdevice.fmod",
+        "example": "triton.language.extra.cann.libdevice.fmod",
     },
     "triton.language.extra.cann.libdevice.gamma": {
-        "constraints": [
-            "Platform and compilation modes:\n\n"
-            "- Atlas A2 products/Atlas A3 products supports SIMD.\n"
-            "- Ascend 950PR&950DT products supports SIMD, SIMT.",
-        ],
-        "example":
-        "triton.language.extra.cann.libdevice.gamma",
-    },
-    "triton.language.extra.cann.libdevice.hadd": {
-        "constraints": [
-            "Platform and compilation modes:\n\n"
-            "- Ascend 950PR&950DT products supports SIMD, SIMT.",
-        ],
-        "example": "triton.language.extra.cann.libdevice.hadd",
-    },
-    "triton.language.extra.cann.libdevice.half2float": {
-        "constraints": [
-            "Platform and compilation modes:\n\n"
-            "- Ascend 950PR&950DT products supports SIMD, SIMT.",
-        ],
-        "example": "triton.language.extra.cann.libdevice.half2float",
+        "example": "triton.language.extra.cann.libdevice.gamma",
     },
     "triton.language.extra.cann.libdevice.hypot": {
-        "constraints": [
-            "Platform and compilation modes:\n\n"
-            "- Atlas A2 products/Atlas A3 products supports SIMD.\n"
-            "- Ascend 950PR&950DT products supports SIMD, SIMT.",
-        ],
-        "example":
-        "triton.language.extra.cann.libdevice.hypot",
+        "example": "triton.language.extra.cann.libdevice.hypot",
     },
     "triton.language.extra.cann.libdevice.ilogb": {
-        "constraints": [
-            "Platform and compilation modes:\n\n"
-            "- Atlas A2 products/Atlas A3 products supports SIMD.\n"
-            "- Ascend 950PR&950DT products supports SIMD, SIMT.",
-        ],
-        "example":
-        "triton.language.extra.cann.libdevice.ilogb",
-    },
-    "triton.language.extra.cann.libdevice.int2float_rd": {
-        "constraints": [
-            "Platform and compilation modes:\n\n"
-            "- Ascend 950PR&950DT products supports SIMD, SIMT.",
-        ],
-        "example": "triton.language.extra.cann.libdevice.int2float_rd",
-    },
-    "triton.language.extra.cann.libdevice.int2float_rn": {
-        "constraints": [
-            "Platform and compilation modes:\n\n"
-            "- Ascend 950PR&950DT products supports SIMD, SIMT.",
-        ],
-        "example": "triton.language.extra.cann.libdevice.int2float_rn",
-    },
-    "triton.language.extra.cann.libdevice.int2float_ru": {
-        "constraints": [
-            "Platform and compilation modes:\n\n"
-            "- Ascend 950PR&950DT products supports SIMD, SIMT.",
-        ],
-        "example": "triton.language.extra.cann.libdevice.int2float_ru",
-    },
-    "triton.language.extra.cann.libdevice.int2float_rz": {
-        "constraints": [
-            "Platform and compilation modes:\n\n"
-            "- Ascend 950PR&950DT products supports SIMD, SIMT.",
-        ],
-        "example": "triton.language.extra.cann.libdevice.int2float_rz",
-    },
-    "triton.language.extra.cann.libdevice.int_as_float": {
-        "constraints": [
-            "Platform and compilation modes:\n\n"
-            "- Ascend 950PR&950DT products supports SIMD, SIMT.",
-        ],
-        "example": "triton.language.extra.cann.libdevice.int_as_float",
+        "example": "triton.language.extra.cann.libdevice.ilogb",
     },
     "triton.language.extra.cann.libdevice.isinf": {
-        "constraints": [
-            "Platform and compilation modes:\n\n"
-            "- Atlas A2 products/Atlas A3 products supports SIMD.\n"
-            "- Ascend 950PR&950DT products supports SIMD, SIMT.",
-        ],
-        "example":
-        "triton.language.extra.cann.libdevice.isinf",
+        "example": "triton.language.extra.cann.libdevice.isinf",
     },
     "triton.language.extra.cann.libdevice.isnan": {
-        "constraints": [
-            "Platform and compilation modes:\n\n"
-            "- Atlas A2 products/Atlas A3 products supports SIMD.\n"
-            "- Ascend 950PR&950DT products supports SIMD, SIMT.",
-        ],
-        "example":
-        "triton.language.extra.cann.libdevice.isnan",
-    },
-    "triton.language.extra.cann.libdevice.j0": {
-        "constraints": [
-            "Platform and compilation modes:\n\n"
-            "- Ascend 950PR&950DT products supports SIMD, SIMT.",
-        ],
-        "example": "triton.language.extra.cann.libdevice.j0",
-    },
-    "triton.language.extra.cann.libdevice.j1": {
-        "constraints": [
-            "Platform and compilation modes:\n\n"
-            "- Ascend 950PR&950DT products supports SIMD, SIMT.",
-        ],
-        "example": "triton.language.extra.cann.libdevice.j1",
-    },
-    "triton.language.extra.cann.libdevice.jn": {
-        "constraints": [
-            "Platform and compilation modes:\n\n"
-            "- Ascend 950PR&950DT products supports SIMD, SIMT.",
-        ],
-        "example": "triton.language.extra.cann.libdevice.jn",
+        "example": "triton.language.extra.cann.libdevice.isnan",
     },
     "triton.language.extra.cann.libdevice.ldexp": {
-        "constraints": [
-            "Platform and compilation modes:\n\n"
-            "- Atlas A2 products/Atlas A3 products supports SIMD.\n"
-            "- Ascend 950PR&950DT products supports SIMD, SIMT.",
-        ],
-        "example":
-        "triton.language.extra.cann.libdevice.ldexp",
+        "example": "triton.language.extra.cann.libdevice.ldexp",
     },
     "triton.language.extra.cann.libdevice.lgamma": {
-        "constraints": [
-            "Platform and compilation modes:\n\n"
-            "- Atlas A2 products/Atlas A3 products supports SIMD.\n"
-            "- Ascend 950PR&950DT products supports SIMD, SIMT.",
-        ],
-        "example":
-        "triton.language.extra.cann.libdevice.lgamma",
-    },
-    "triton.language.extra.cann.libdevice.ll2float_rd": {
-        "constraints": [
-            "Platform and compilation modes:\n\n"
-            "- Ascend 950PR&950DT products supports SIMD, SIMT.",
-        ],
-        "example": "triton.language.extra.cann.libdevice.ll2float_rd",
-    },
-    "triton.language.extra.cann.libdevice.ll2float_rn": {
-        "constraints": [
-            "Platform and compilation modes:\n\n"
-            "- Ascend 950PR&950DT products supports SIMD, SIMT.",
-        ],
-        "example": "triton.language.extra.cann.libdevice.ll2float_rn",
-    },
-    "triton.language.extra.cann.libdevice.ll2float_ru": {
-        "constraints": [
-            "Platform and compilation modes:\n\n"
-            "- Ascend 950PR&950DT products supports SIMD, SIMT.",
-        ],
-        "example": "triton.language.extra.cann.libdevice.ll2float_ru",
-    },
-    "triton.language.extra.cann.libdevice.ll2float_rz": {
-        "constraints": [
-            "Platform and compilation modes:\n\n"
-            "- Ascend 950PR&950DT products supports SIMD, SIMT.",
-        ],
-        "example": "triton.language.extra.cann.libdevice.ll2float_rz",
-    },
-    "triton.language.extra.cann.libdevice.llrint": {
-        "constraints": [
-            "Platform and compilation modes:\n\n"
-            "- Ascend 950PR&950DT products supports SIMD, SIMT.",
-        ],
-        "example": "triton.language.extra.cann.libdevice.llrint",
-    },
-    "triton.language.extra.cann.libdevice.llround": {
-        "constraints": [
-            "Platform and compilation modes:\n\n"
-            "- Ascend 950PR&950DT products supports SIMD, SIMT.",
-        ],
-        "example": "triton.language.extra.cann.libdevice.llround",
-    },
-    "triton.language.extra.cann.libdevice.log": {
-        "constraints": [
-            "Platform and compilation modes:\n\n"
-            "- Ascend 950PR&950DT products supports SIMD, SIMT.",
-        ],
-        "example": "triton.language.extra.cann.libdevice.log",
+        "example": "triton.language.extra.cann.libdevice.lgamma",
     },
     "triton.language.extra.cann.libdevice.log10": {
-        "constraints": [
-            "Platform and compilation modes:\n\n"
-            "- Atlas A2 products/Atlas A3 products supports SIMD.\n"
-            "- Ascend 950PR&950DT products supports SIMD, SIMT.",
-        ],
-        "example":
-        "triton.language.extra.cann.libdevice.log10",
+        "example": "triton.language.extra.cann.libdevice.log10",
     },
     "triton.language.extra.cann.libdevice.log1p": {
-        "constraints": [
-            "Platform and compilation modes:\n\n"
-            "- Atlas A2 products/Atlas A3 products supports SIMD.\n"
-            "- Ascend 950PR&950DT products supports SIMD, SIMT.",
-        ],
-        "example":
-        "triton.language.extra.cann.libdevice.log1p",
-    },
-    "triton.language.extra.cann.libdevice.log2": {
-        "constraints": [
-            "Platform and compilation modes:\n\n"
-            "- Ascend 950PR&950DT products supports SIMD, SIMT.",
-        ],
-        "example": "triton.language.extra.cann.libdevice.log2",
-    },
-    "triton.language.extra.cann.libdevice.logb": {
-        "constraints": [
-            "Platform and compilation modes:\n\n"
-            "- Ascend 950PR&950DT products supports SIMD, SIMT.",
-        ],
-        "example": "triton.language.extra.cann.libdevice.logb",
-    },
-    "triton.language.extra.cann.libdevice.max": {
-        "constraints": [
-            "Platform and compilation modes:\n\n"
-            "- Ascend 950PR&950DT products supports SIMD, SIMT.",
-        ],
-        "example": "triton.language.extra.cann.libdevice.max",
-    },
-    "triton.language.extra.cann.libdevice.min": {
-        "constraints": [
-            "Platform and compilation modes:\n\n"
-            "- Ascend 950PR&950DT products supports SIMD, SIMT.",
-        ],
-        "example": "triton.language.extra.cann.libdevice.min",
-    },
-    "triton.language.extra.cann.libdevice.mul24": {
-        "constraints": [
-            "Platform and compilation modes:\n\n"
-            "- Ascend 950PR&950DT products supports SIMD, SIMT.",
-        ],
-        "example": "triton.language.extra.cann.libdevice.mul24",
-    },
-    "triton.language.extra.cann.libdevice.mul_rd": {
-        "constraints": [
-            "Platform and compilation modes:\n\n"
-            "- Ascend 950PR&950DT products supports SIMD, SIMT.",
-        ],
-        "example": "triton.language.extra.cann.libdevice.mul_rd",
-    },
-    "triton.language.extra.cann.libdevice.mul_rn": {
-        "constraints": [
-            "Platform and compilation modes:\n\n"
-            "- Ascend 950PR&950DT products supports SIMD, SIMT.",
-        ],
-        "example": "triton.language.extra.cann.libdevice.mul_rn",
-    },
-    "triton.language.extra.cann.libdevice.mul_ru": {
-        "constraints": [
-            "Platform and compilation modes:\n\n"
-            "- Ascend 950PR&950DT products supports SIMD, SIMT.",
-        ],
-        "example": "triton.language.extra.cann.libdevice.mul_ru",
-    },
-    "triton.language.extra.cann.libdevice.mul_rz": {
-        "constraints": [
-            "Platform and compilation modes:\n\n"
-            "- Ascend 950PR&950DT products supports SIMD, SIMT.",
-        ],
-        "example": "triton.language.extra.cann.libdevice.mul_rz",
-    },
-    "triton.language.extra.cann.libdevice.mulhi": {
-        "constraints": [
-            "Platform and compilation modes:\n\n"
-            "- Ascend 950PR&950DT products supports SIMD, SIMT.",
-        ],
-        "example": "triton.language.extra.cann.libdevice.mulhi",
-    },
-    "triton.language.extra.cann.libdevice.nan": {
-        "constraints": [
-            "Platform and compilation modes:\n\n"
-            "- Ascend 950PR&950DT products supports SIMD, SIMT.",
-        ],
-        "example": "triton.language.extra.cann.libdevice.nan",
+        "example": "triton.language.extra.cann.libdevice.log1p",
     },
     "triton.language.extra.cann.libdevice.nearbyint": {
-        "constraints": [
-            "Platform and compilation modes:\n\n"
-            "- Atlas A2 products/Atlas A3 products supports SIMD.\n"
-            "- Ascend 950PR&950DT products supports SIMD, SIMT.",
-        ],
-        "example":
-        "triton.language.extra.cann.libdevice.nearbyint",
+        "example": "triton.language.extra.cann.libdevice.nearbyint",
     },
     "triton.language.extra.cann.libdevice.nextafter": {
-        "constraints": [
-            "Platform and compilation modes:\n\n"
-            "- Atlas A2 products/Atlas A3 products supports SIMD.\n"
-            "- Ascend 950PR&950DT products supports SIMD, SIMT.",
-        ],
-        "example":
-        "triton.language.extra.cann.libdevice.nextafter",
-    },
-    "triton.language.extra.cann.libdevice.norm3d": {
-        "constraints": [
-            "Platform and compilation modes:\n\n"
-            "- Ascend 950PR&950DT products supports SIMD, SIMT.",
-        ],
-        "example": "triton.language.extra.cann.libdevice.norm3d",
-    },
-    "triton.language.extra.cann.libdevice.norm4d": {
-        "constraints": [
-            "Platform and compilation modes:\n\n"
-            "- Ascend 950PR&950DT products supports SIMD, SIMT.",
-        ],
-        "example": "triton.language.extra.cann.libdevice.norm4d",
-    },
-    "triton.language.extra.cann.libdevice.normcdf": {
-        "constraints": [
-            "Platform and compilation modes:\n\n"
-            "- Ascend 950PR&950DT products supports SIMD, SIMT.",
-        ],
-        "example": "triton.language.extra.cann.libdevice.normcdf",
-    },
-    "triton.language.extra.cann.libdevice.normcdfinv": {
-        "constraints": [
-            "Platform and compilation modes:\n\n"
-            "- Ascend 950PR&950DT products supports SIMD, SIMT.",
-        ],
-        "example": "triton.language.extra.cann.libdevice.normcdfinv",
-    },
-    "triton.language.extra.cann.libdevice.popc": {
-        "constraints": [
-            "Platform and compilation modes:\n\n"
-            "- Ascend 950PR&950DT products supports SIMD, SIMT.",
-        ],
-        "example": "triton.language.extra.cann.libdevice.popc",
+        "example": "triton.language.extra.cann.libdevice.nextafter",
     },
     "triton.language.extra.cann.libdevice.pow": {
-        "constraints": [
-            "Platform and compilation modes:\n\n"
-            "- Atlas A2 products/Atlas A3 products supports SIMD.\n"
-            "- Ascend 950PR&950DT products supports SIMD, SIMT.",
-        ],
-        "example":
-        "triton.language.extra.cann.libdevice.pow",
-    },
-    "triton.language.extra.cann.libdevice.rcbrt": {
-        "constraints": [
-            "Platform and compilation modes:\n\n"
-            "- Ascend 950PR&950DT products supports SIMD, SIMT.",
-        ],
-        "example": "triton.language.extra.cann.libdevice.rcbrt",
-    },
-    "triton.language.extra.cann.libdevice.rcp_rd": {
-        "constraints": [
-            "Platform and compilation modes:\n\n"
-            "- Ascend 950PR&950DT products supports SIMD, SIMT.",
-        ],
-        "example": "triton.language.extra.cann.libdevice.rcp_rd",
-    },
-    "triton.language.extra.cann.libdevice.rcp_rn": {
-        "constraints": [
-            "Platform and compilation modes:\n\n"
-            "- Ascend 950PR&950DT products supports SIMD, SIMT.",
-        ],
-        "example": "triton.language.extra.cann.libdevice.rcp_rn",
-    },
-    "triton.language.extra.cann.libdevice.rcp_ru": {
-        "constraints": [
-            "Platform and compilation modes:\n\n"
-            "- Ascend 950PR&950DT products supports SIMD, SIMT.",
-        ],
-        "example": "triton.language.extra.cann.libdevice.rcp_ru",
-    },
-    "triton.language.extra.cann.libdevice.rcp_rz": {
-        "constraints": [
-            "Platform and compilation modes:\n\n"
-            "- Ascend 950PR&950DT products supports SIMD, SIMT.",
-        ],
-        "example": "triton.language.extra.cann.libdevice.rcp_rz",
+        "example": "triton.language.extra.cann.libdevice.pow",
     },
     "triton.language.extra.cann.libdevice.reciprocal": {
-        "constraints": [
-            "Platform and compilation modes:\n\n"
-            "- Atlas A2 products/Atlas A3 products supports SIMD.\n"
-            "- Ascend 950PR&950DT products supports SIMD, SIMT.",
-        ],
-        "example":
-        "triton.language.extra.cann.libdevice.reciprocal",
+        "example": "triton.language.extra.cann.libdevice.reciprocal",
     },
     "triton.language.extra.cann.libdevice.relu": {
-        "constraints": [
-            "Platform and compilation modes:\n\n"
-            "- Atlas A2 products/Atlas A3 products supports SIMD.\n"
-            "- Ascend 950PR&950DT products supports SIMD, SIMT.",
-        ],
-        "example":
-        "triton.language.extra.cann.libdevice.relu",
-    },
-    "triton.language.extra.cann.libdevice.remainder": {
-        "constraints": [
-            "Platform and compilation modes:\n\n"
-            "- Ascend 950PR&950DT products supports SIMD, SIMT.",
-        ],
-        "example": "triton.language.extra.cann.libdevice.remainder",
-    },
-    "triton.language.extra.cann.libdevice.rhadd": {
-        "constraints": [
-            "Platform and compilation modes:\n\n"
-            "- Ascend 950PR&950DT products supports SIMD, SIMT.",
-        ],
-        "example": "triton.language.extra.cann.libdevice.rhadd",
-    },
-    "triton.language.extra.cann.libdevice.rhypot": {
-        "constraints": [
-            "Platform and compilation modes:\n\n"
-            "- Ascend 950PR&950DT products supports SIMD, SIMT.",
-        ],
-        "example": "triton.language.extra.cann.libdevice.rhypot",
+        "example": "triton.language.extra.cann.libdevice.relu",
     },
     "triton.language.extra.cann.libdevice.rint": {
-        "constraints": [
-            "Platform and compilation modes:\n\n"
-            "- Atlas A2 products/Atlas A3 products supports SIMD.\n"
-            "- Ascend 950PR&950DT products supports SIMD, SIMT.",
-        ],
-        "example":
-        "triton.language.extra.cann.libdevice.rint",
-    },
-    "triton.language.extra.cann.libdevice.rnorm3d": {
-        "constraints": [
-            "Platform and compilation modes:\n\n"
-            "- Ascend 950PR&950DT products supports SIMD, SIMT.",
-        ],
-        "example": "triton.language.extra.cann.libdevice.rnorm3d",
-    },
-    "triton.language.extra.cann.libdevice.rnorm4d": {
-        "constraints": [
-            "Platform and compilation modes:\n\n"
-            "- Ascend 950PR&950DT products supports SIMD, SIMT.",
-        ],
-        "example": "triton.language.extra.cann.libdevice.rnorm4d",
+        "example": "triton.language.extra.cann.libdevice.rint",
     },
     "triton.language.extra.cann.libdevice.round": {
-        "constraints": [
-            "Platform and compilation modes:\n\n"
-            "- Atlas A2 products/Atlas A3 products supports SIMD.\n"
-            "- Ascend 950PR&950DT products supports SIMD, SIMT.",
-        ],
-        "example":
-        "triton.language.extra.cann.libdevice.round",
-    },
-    "triton.language.extra.cann.libdevice.rsqrt": {
-        "constraints": [
-            "Platform and compilation modes:\n\n"
-            "- Ascend 950PR&950DT products supports SIMD, SIMT.",
-        ],
-        "example": "triton.language.extra.cann.libdevice.rsqrt",
-    },
-    "triton.language.extra.cann.libdevice.rsqrt_rn": {
-        "constraints": [
-            "Platform and compilation modes:\n\n"
-            "- Ascend 950PR&950DT products supports SIMD, SIMT.",
-        ],
-        "example": "triton.language.extra.cann.libdevice.rsqrt_rn",
-    },
-    "triton.language.extra.cann.libdevice.sad": {
-        "constraints": [
-            "Platform and compilation modes:\n\n"
-            "- Ascend 950PR&950DT products supports SIMD, SIMT.",
-        ],
-        "example": "triton.language.extra.cann.libdevice.sad",
-    },
-    "triton.language.extra.cann.libdevice.saturatef": {
-        "constraints": [
-            "Platform and compilation modes:\n\n"
-            "- Ascend 950PR&950DT products supports SIMD, SIMT.",
-        ],
-        "example": "triton.language.extra.cann.libdevice.saturatef",
-    },
-    "triton.language.extra.cann.libdevice.scalbn": {
-        "constraints": [
-            "Platform and compilation modes:\n\n"
-            "- Ascend 950PR&950DT products supports SIMD, SIMT.",
-        ],
-        "example": "triton.language.extra.cann.libdevice.scalbn",
+        "example": "triton.language.extra.cann.libdevice.round",
     },
     "triton.language.extra.cann.libdevice.signbit": {
-        "constraints": [
-            "Platform and compilation modes:\n\n"
-            "- Atlas A2 products/Atlas A3 products supports SIMD.\n"
-            "- Ascend 950PR&950DT products supports SIMD, SIMT.",
-        ],
-        "example":
-        "triton.language.extra.cann.libdevice.signbit",
-    },
-    "triton.language.extra.cann.libdevice.sin": {
-        "constraints": [
-            "Platform and compilation modes:\n\n"
-            "- Ascend 950PR&950DT products supports SIMD, SIMT.",
-        ],
-        "example": "triton.language.extra.cann.libdevice.sin",
+        "example": "triton.language.extra.cann.libdevice.signbit",
     },
     "triton.language.extra.cann.libdevice.sinh": {
-        "constraints": [
-            "Platform and compilation modes:\n\n"
-            "- Atlas A2 products/Atlas A3 products supports SIMD.\n"
-            "- Ascend 950PR&950DT products supports SIMD, SIMT.",
-        ],
-        "example":
-        "triton.language.extra.cann.libdevice.sinh",
-    },
-    "triton.language.extra.cann.libdevice.sinpi": {
-        "constraints": [
-            "Platform and compilation modes:\n\n"
-            "- Ascend 950PR&950DT products supports SIMD, SIMT.",
-        ],
-        "example": "triton.language.extra.cann.libdevice.sinpi",
-    },
-    "triton.language.extra.cann.libdevice.sqrt": {
-        "constraints": [
-            "Platform and compilation modes:\n\n"
-            "- Ascend 950PR&950DT products supports SIMD, SIMT.",
-        ],
-        "example": "triton.language.extra.cann.libdevice.sqrt",
-    },
-    "triton.language.extra.cann.libdevice.sqrt_rd": {
-        "constraints": [
-            "Platform and compilation modes:\n\n"
-            "- Ascend 950PR&950DT products supports SIMD, SIMT.",
-        ],
-        "example": "triton.language.extra.cann.libdevice.sqrt_rd",
-    },
-    "triton.language.extra.cann.libdevice.sqrt_rn": {
-        "constraints": [
-            "Platform and compilation modes:\n\n"
-            "- Ascend 950PR&950DT products supports SIMD, SIMT.",
-        ],
-        "example": "triton.language.extra.cann.libdevice.sqrt_rn",
-    },
-    "triton.language.extra.cann.libdevice.sqrt_ru": {
-        "constraints": [
-            "Platform and compilation modes:\n\n"
-            "- Ascend 950PR&950DT products supports SIMD, SIMT.",
-        ],
-        "example": "triton.language.extra.cann.libdevice.sqrt_ru",
-    },
-    "triton.language.extra.cann.libdevice.sqrt_rz": {
-        "constraints": [
-            "Platform and compilation modes:\n\n"
-            "- Ascend 950PR&950DT products supports SIMD, SIMT.",
-        ],
-        "example": "triton.language.extra.cann.libdevice.sqrt_rz",
-    },
-    "triton.language.extra.cann.libdevice.sub_rd": {
-        "constraints": [
-            "Platform and compilation modes:\n\n"
-            "- Ascend 950PR&950DT products supports SIMD, SIMT.",
-        ],
-        "example": "triton.language.extra.cann.libdevice.sub_rd",
-    },
-    "triton.language.extra.cann.libdevice.sub_rn": {
-        "constraints": [
-            "Platform and compilation modes:\n\n"
-            "- Ascend 950PR&950DT products supports SIMD, SIMT.",
-        ],
-        "example": "triton.language.extra.cann.libdevice.sub_rn",
-    },
-    "triton.language.extra.cann.libdevice.sub_ru": {
-        "constraints": [
-            "Platform and compilation modes:\n\n"
-            "- Ascend 950PR&950DT products supports SIMD, SIMT.",
-        ],
-        "example": "triton.language.extra.cann.libdevice.sub_ru",
-    },
-    "triton.language.extra.cann.libdevice.sub_rz": {
-        "constraints": [
-            "Platform and compilation modes:\n\n"
-            "- Ascend 950PR&950DT products supports SIMD, SIMT.",
-        ],
-        "example": "triton.language.extra.cann.libdevice.sub_rz",
+        "example": "triton.language.extra.cann.libdevice.sinh",
     },
     "triton.language.extra.cann.libdevice.tan": {
-        "constraints": [
-            "Platform and compilation modes:\n\n"
-            "- Atlas A2 products/Atlas A3 products supports SIMD.\n"
-            "- Ascend 950PR&950DT products supports SIMD, SIMT.",
-        ],
-        "example":
-        "triton.language.extra.cann.libdevice.tan",
+        "example": "triton.language.extra.cann.libdevice.tan",
     },
     "triton.language.extra.cann.libdevice.tanh": {
-        "constraints": [
-            "Platform and compilation modes:\n\n"
-            "- Atlas A2 products/Atlas A3 products supports SIMD.\n"
-            "- Ascend 950PR&950DT products supports SIMD, SIMT.",
-        ],
-        "example":
-        "triton.language.extra.cann.libdevice.tanh",
-    },
-    "triton.language.extra.cann.libdevice.tgamma": {
-        "constraints": [
-            "Platform and compilation modes:\n\n"
-            "- Ascend 950PR&950DT products supports SIMD, SIMT.",
-        ],
-        "example": "triton.language.extra.cann.libdevice.tgamma",
+        "example": "triton.language.extra.cann.libdevice.tanh",
     },
     "triton.language.extra.cann.libdevice.trunc": {
+        "example": "triton.language.extra.cann.libdevice.trunc",
+    },
+    # ------------------------------------------------------------------
+    # TLA interfaces
+    # ------------------------------------------------------------------
+    # ------------------------------------------------------------------
+    # Core types
+    # ------------------------------------------------------------------
+    f"{_TLA_PREFIX}.buffer": {
         "constraints": [
-            "Platform and compilation modes:\n\n"
-            "- Atlas A2 products/Atlas A3 products supports SIMD.\n"
-            "- Ascend 950PR&950DT products supports SIMD, SIMT.",
+            "``buf[i0, i1, ...]`` 返回 ``buffer_access``，用作 ``simd.vlds`` / ``simd.vsts`` 的地址参数。",
+            "GM buffer 必须通过 ``tla.view`` 从内核指针获得，不能用 ``alloc`` 分配。",
         ],
         "example":
-        "triton.language.extra.cann.libdevice.trunc",
+        "buffer",
     },
-    "triton.language.extra.cann.libdevice.uint2float_rd": {
+    f"{_TLA_PREFIX}.buffer_type": {
         "constraints": [
-            "Platform and compilation modes:\n\n"
-            "- Ascend 950PR&950DT products supports SIMD, SIMT.",
+            "``shape`` / ``strides`` 必须是正的编译期整数，且 ``strides`` 的秩与 ``shape`` 一致。",
+            "``space`` 只能是 ``gm`` / ``ub`` / ``l1`` / ``l0a`` / ``l0b`` / ``l0c``。",
         ],
-        "example": "triton.language.extra.cann.libdevice.uint2float_rd",
+        "example":
+        "buffer",
     },
-    "triton.language.extra.cann.libdevice.uint2float_rn": {
+    f"{_TLA_PREFIX}.vector": {
         "constraints": [
-            "Platform and compilation modes:\n\n"
-            "- Ascend 950PR&950DT products supports SIMD, SIMT.",
+            "不支持隐式转换为 Triton tensor，也不能作为标量条件使用（``__bool__`` 会报错）。",
         ],
-        "example": "triton.language.extra.cann.libdevice.uint2float_rn",
+        "example": "buffer",
     },
-    "triton.language.extra.cann.libdevice.uint2float_ru": {
+    f"{_TLA_PREFIX}.vector_type": {
         "constraints": [
-            "Platform and compilation modes:\n\n"
-            "- Ascend 950PR&950DT products supports SIMD, SIMT.",
+            "``lanes`` 必须是正的编译期整数。",
+            "元素类型必须是标量整型或浮点型 dtype。",
         ],
-        "example": "triton.language.extra.cann.libdevice.uint2float_ru",
+        "example": "buffer",
     },
-    "triton.language.extra.cann.libdevice.uint2float_rz": {
+
+    # ------------------------------------------------------------------
+    # Allocation / view / copy
+    # ------------------------------------------------------------------
+    f"{_TLA_PREFIX}.alloc": {
         "constraints": [
-            "Platform and compilation modes:\n\n"
-            "- Ascend 950PR&950DT products supports SIMD, SIMT.",
+            "``space`` 默认 ``\"ub\"``，不能为 ``\"gm\"``；GM buffer 必须由内核指针经 ``tla.view`` 获得。",
+            "``versions`` 必须是正整数；``1`` 表示关闭多缓冲。",
         ],
-        "example": "triton.language.extra.cann.libdevice.uint2float_rz",
+        "example":
+        "buffer",
     },
-    "triton.language.extra.cann.libdevice.uint_as_float": {
+    f"{_TLA_PREFIX}.alloc_buffer": {
         "constraints": [
-            "Platform and compilation modes:\n\n"
-            "- Ascend 950PR&950DT products supports SIMD, SIMT.",
+            "``space`` 默认 ``\"ub\"``，不能为 ``\"gm\"``；GM buffer 必须由内核指针经 ``tla.view`` 获得。",
+            "``versions`` 必须是正整数；``1`` 表示关闭多缓冲。",
         ],
-        "example": "triton.language.extra.cann.libdevice.uint_as_float",
+        "example":
+        "buffer",
     },
-    "triton.language.extra.cann.libdevice.ull2float_rd": {
+    f"{_TLA_PREFIX}.annotate_buffer_versions": {
         "constraints": [
-            "Platform and compilation modes:\n\n"
-            "- Ascend 950PR&950DT products supports SIMD, SIMT.",
+            "``versions`` 必须是正整数，``1`` 表示关闭多缓冲。",
+            "版本数通过 ``hivm.multi_buffer`` 注解交给 NPU-IR 多缓冲 pass。",
         ],
-        "example": "triton.language.extra.cann.libdevice.ull2float_rd",
+        "example": "buffer",
     },
-    "triton.language.extra.cann.libdevice.ull2float_rn": {
+    f"{_TLA_PREFIX}.copy": {
         "constraints": [
-            "Platform and compilation modes:\n\n"
-            "- Ascend 950PR&950DT products supports SIMD, SIMT.",
+            "``src`` 和 ``dst`` 都必须是 ``tla.buffer``，不接受指针或 tensor。",
+            "源和目标元素类型必须一致。",
+            "支持的地址空间组合：``gm->ub``、``ub->gm``、``gm->l1``、``l0c->*``。",
+            "除 ``gm->l1`` 的 ND->NZ 和 ``l0c`` Fixpipe 的 fractal 关系外，源和目标形状必须一致。",
+            "其他地址空间组合会报错。",
         ],
-        "example": "triton.language.extra.cann.libdevice.ull2float_rn",
+        "example":
+        "copy",
     },
-    "triton.language.extra.cann.libdevice.ull2float_ru": {
+    f"{_TLA_PREFIX}.view": {
         "constraints": [
-            "Platform and compilation modes:\n\n"
-            "- Ascend 950PR&950DT products supports SIMD, SIMT.",
+            "指针入口：``src`` 必须是指针 tensor，``strides`` 为最终 memref 步长，默认行主序。",
+            "缓冲区切片：``src`` 必须是 ``tla.buffer``，``strides`` 相对于源视图，``space`` 必须保持默认值。",
+            "``strides`` / ``offsets`` 的秩必须与结果形状一致。",
+            "静态 offset 必须位于源 buffer 范围内。",
         ],
-        "example": "triton.language.extra.cann.libdevice.ull2float_ru",
+        "example":
+        "view",
     },
-    "triton.language.extra.cann.libdevice.ull2float_rz": {
+    f"{_TLA_PREFIX}.reshape": {
         "constraints": [
-            "Platform and compilation modes:\n\n"
-            "- Ascend 950PR&950DT products supports SIMD, SIMT.",
+            "只支持连续、行主序、无偏移的 buffer；带步长或偏移的切片请先使用 ``tla.view``。",
+            "元素总数必须保持不变。",
         ],
-        "example": "triton.language.extra.cann.libdevice.ull2float_rz",
+        "example": "reshape",
     },
-    "triton.language.extra.cann.libdevice.y0": {
+
+    # ------------------------------------------------------------------
+    # Core-mode scopes
+    # ------------------------------------------------------------------
+    f"{_TLA_PREFIX}.scope": {
         "constraints": [
-            "Platform and compilation modes:\n\n"
-            "- Ascend 950PR&950DT products supports SIMD, SIMT.",
+            "作用域在编译期确定核心类型，不需要运行时参数。",
+            "使用 ``with tla.scope.vector():`` / ``with tla.scope.simd():`` / ``with tla.scope.cube():``。",
         ],
-        "example": "triton.language.extra.cann.libdevice.y0",
+        "example":
+        "scope",
     },
-    "triton.language.extra.cann.libdevice.y1": {
+    f"{_TLA_PREFIX}.scope.vector": {
         "constraints": [
-            "Platform and compilation modes:\n\n"
-            "- Ascend 950PR&950DT products supports SIMD, SIMT.",
+            "承载 ``tla.copy``、控制流等非 SIMD 操作。",
+            "可以嵌套 ``tla.scope.simd()``。",
         ],
-        "example": "triton.language.extra.cann.libdevice.y1",
+        "example": "scope",
     },
-    "triton.language.extra.cann.libdevice.yn": {
+    f"{_TLA_PREFIX}.scope.simd": {
         "constraints": [
-            "Platform and compilation modes:\n\n"
-            "- Ascend 950PR&950DT products supports SIMD, SIMT.",
+            "SIMD 向量函数区域，编译器会 outline 为 ``hivm.vector_function``。",
+            "``tla.simd.*`` 只能操作 ``tla.vector``。",
         ],
-        "example": "triton.language.extra.cann.libdevice.yn",
+        "example": "scope",
+    },
+    f"{_TLA_PREFIX}.scope.cube": {
+        "constraints": [
+            "Cube 核区域当前保留，Cube 算子尚未通过该作用域暴露。",
+        ],
+        "example": "scope",
+    },
+
+    # ------------------------------------------------------------------
+    # SIMD load / store
+    # ------------------------------------------------------------------
+    f"{_TLA_PREFIX}.simd.vlds": {
+        "constraints": [
+            "``ptr`` 必须是 UB buffer 或 ``buf[i0, i1, ...]`` 形式的元素范围。",
+            "``dist`` 必须是 AVE load 分布字符串，默认 ``NORM``。",
+            "结果是一个满向量寄存器：2048 位；``i64`` / ``u64`` 使用 4096 位。",
+            "支持的元素类型：``i8`` / ``i16`` / ``i32`` / ``i64`` / ``fp8e4nv`` / ``f16`` / ``bf16`` / ``f32``。",
+        ],
+        "example":
+        "simd_load_store",
+    },
+    f"{_TLA_PREFIX}.simd.vsts": {
+        "constraints": [
+            "``ptr`` 必须是 UB buffer 或 ``buf[i0, i1, ...]`` 形式的元素范围。",
+            "``dist`` 默认 ``NORM_B32``，必须是 AVE store 分布字符串。",
+            "``mask`` 默认全真 ``pge <ALL>``；显式传入时 lane 数必须与值向量一致。",
+        ],
+        "example":
+        "simd_load_store",
+    },
+
+    # ------------------------------------------------------------------
+    # SIMD conversion / layout
+    # ------------------------------------------------------------------
+    f"{_TLA_PREFIX}.simd.vextf": {
+        "constraints": [
+            "当前只支持拓宽到 ``f32``，结果为 64 lane 满寄存器。",
+            "``part`` 只支持 ``part_even`` / ``part_odd``，不改变结果位宽。",
+        ],
+        "example": "simd_convert",
+    },
+    f"{_TLA_PREFIX}.simd.vtruncf": {
+        "constraints": [
+            "目标类型只支持 ``bf16`` / ``f16`` / ``fp8e4nv``。",
+            "总位宽保持不变，元素变窄后 lane 数相应增加。",
+            "``part`` 只支持 ``part_even`` / ``part_odd``。",
+        ],
+        "example":
+        "simd_convert",
+    },
+    f"{_TLA_PREFIX}.simd.vbitcast": {
+        "constraints": [
+            "源总位宽必须能被目标元素位宽整除。",
+            "结果 lane 数为 ``src_lanes * src_bits / dst_bits``。",
+        ],
+        "example": "simd_convert",
+    },
+    f"{_TLA_PREFIX}.simd.vintlv": {
+        "constraints": [
+            "两个源寄存器类型必须完全一致。",
+            "返回两个结果寄存器。",
+        ],
+        "example": "simd_convert",
+    },
+    f"{_TLA_PREFIX}.simd.vdintlv": {
+        "constraints": [
+            "两个源寄存器类型必须完全一致。",
+            "返回两个结果寄存器，是 ``vintlv`` 的逆操作。",
+        ],
+        "example": "simd_convert",
+    },
+
+    # ------------------------------------------------------------------
+    # SIMD arithmetic / unary
+    # ------------------------------------------------------------------
+    **{
+        f"{_TLA_PREFIX}.simd.{name}": {
+            "constraints": [
+                "两个操作数类型必须完全一致，不支持隐式类型提升。",
+                "使用全真 ``pge <ALL>`` 掩码。",
+            ],
+            "example": "simd_arith",
+        }
+        for name in ("vadd", "vmul", "vdiv", "vxor")
+    },
+    f"{_TLA_PREFIX}.simd.vmod": {
+        "constraints": [
+            "仅用于整数向量，两个操作数类型必须完全一致。",
+            "使用全真 ``pge <ALL>`` 掩码。",
+        ],
+        "example": "simd_arith",
+    },
+    f"{_TLA_PREFIX}.simd.vfma": {
+        "constraints": [
+            "``acc`` / ``lhs`` / ``rhs`` 类型必须完全一致，计算 ``acc + lhs * rhs``。",
+            "使用全真 ``pge <ALL>`` 掩码。",
+        ],
+        "example": "simd_arith",
+    },
+    **{
+        f"{_TLA_PREFIX}.simd.{name}": {
+            "constraints": [
+                "保持元素类型不变。",
+                "使用全真 ``pge <ALL>`` 掩码。",
+            ],
+            "example": "simd_arith",
+        }
+        for name in ("vneg", "vsqrt", "vrsqrt", "vexp")
+    },
+
+    # ------------------------------------------------------------------
+    # SIMD compare / select
+    # ------------------------------------------------------------------
+    f"{_TLA_PREFIX}.simd.vcmp": {
+        "constraints": [
+            "``cmp_type`` 支持 ``eq`` / ``ne`` / ``gt`` / ``ge`` / ``lt`` / ``le``。",
+            "两个操作数类型必须完全一致。",
+            "返回 ``int1`` 谓词向量，lane 数与输入一致。",
+        ],
+        "example":
+        "simd_compare",
+    },
+    f"{_TLA_PREFIX}.simd.vsel": {
+        "constraints": [
+            "``mask`` 的 lane 数必须与值向量一致。",
+            "``true_val`` 和 ``false_val`` 类型必须完全一致。",
+        ],
+        "example": "simd_compare",
+    },
+
+    # ------------------------------------------------------------------
+    # SIMD reduction / broadcast / constants / predicate
+    # ------------------------------------------------------------------
+    f"{_TLA_PREFIX}.simd.vreduce": {
+        "constraints": [
+            "``kind`` 为 ``add`` / ``min`` / ``max``。",
+            "结果放在 lane 0（AVE 规约语义）。",
+        ],
+        "example": "simd_reduce",
+    },
+    f"{_TLA_PREFIX}.simd.vreduce_sum": {
+        "constraints": [
+            "等价于 ``vreduce(src, \"add\")``，结果放在 lane 0。",
+        ],
+        "example": "simd_reduce",
+    },
+    f"{_TLA_PREFIX}.simd.vreduce_max": {
+        "constraints": [
+            "接受单个寄存器或寄存器列表，所有寄存器类型必须一致。",
+            "先做逐元素 ``max``，再水平规约并广播到所有 lane。",
+        ],
+        "example": "simd_reduce",
+    },
+    f"{_TLA_PREFIX}.simd.vreduce_min": {
+        "constraints": [
+            "接受单个寄存器或寄存器列表，所有寄存器类型必须一致。",
+            "先做逐元素 ``min``，再水平规约并广播到所有 lane。",
+        ],
+        "example": "simd_reduce",
+    },
+    f"{_TLA_PREFIX}.simd.vbroadcast": {
+        "constraints": [
+            "``low=True`` 广播低半部分，``low=False`` 广播高半部分。",
+            "结果 lane 数与源寄存器一致。",
+        ],
+        "example": "simd_reduce",
+    },
+    f"{_TLA_PREFIX}.simd.vfull": {
+        "constraints": [
+            "``lanes`` 必须是正的编译期整数。",
+            "``lanes`` 与元素位宽的乘积不能超过寄存器位宽。",
+        ],
+        "example": "simd_const",
+    },
+    f"{_TLA_PREFIX}.simd.vsplat": {
+        "constraints": [
+            "lane 数由 ``dtype`` 推导：``2048 // elem_bits``，``i64`` 使用 4096 位。",
+        ],
+        "example": "simd_const",
+    },
+    f"{_TLA_PREFIX}.simd.vci": {
+        "constraints": [
+            "固定为 ``int32`` / 64 lane。",
+            "``base`` 可以是编译期 int32，或标量 int32 tensor。",
+        ],
+        "example": "simd_const",
+    },
+    f"{_TLA_PREFIX}.simd.pge": {
+        "constraints": [
+            "``n`` 只支持 1 / 2 / 3 / 4 / 8 / 16 / 32 / 64 / 128。",
+            "``lanes`` 是 ``int1`` 谓词向量的 lane 数。",
+        ],
+        "example": "simd_const",
+    },
+    f"{_TLA_PREFIX}.simd.membar": {
+        "constraints": [
+            "``scope`` 支持 AVE membar 类型，例如 ``VV_ALL``、``VST_VLD``、``VLD_VST``。",
+            "完整取值：VV_ALL、VST_VLD、VLD_VST、VST_VST、VS_ALL、VST_LD、VLD_ST、VST_ST、"
+            "SV_ALL、ST_VLD、LD_VST、ST_VST、SS_ALL、ST_LD、LD_ST、ST_ST。",
+        ],
+        "example":
+        "simd_membar",
+    },
+
+    # ------------------------------------------------------------------
+    # Cube
+    # ------------------------------------------------------------------
+    f"{_TLA_PREFIX}.cube.mmad": {
+        "constraints": [
+            "``a`` / ``b`` 必须是 L1 buffer，``acc`` 必须是 L0C buffer。",
+            "``a`` 和 ``b`` 元素类型必须一致。",
+            "形状必须满足 ``a=(M, K)``、``b=(K, N)``、``acc=(M, N)``。",
+            "操作数可以是 2 维 ND 形状，也可以是等价的 4 维 zN 形状。",
+            "只暴露 ``transpose_b``；``transpose_a`` 可通过 GM->L1 拷贝调整布局实现。",
+        ],
+        "example":
+        "cube_mmad",
+    },
+
+    # ------------------------------------------------------------------
+    # Synchronization
+    # ------------------------------------------------------------------
+    f"{_TLA_PREFIX}.sync.barrier": {
+        "constraints": [
+            "``pipe`` 是编译期字符串，例如 ``\"V\"``、``\"MTE2\"`` 或 ``\"PIPE_V\"``。",
+            "``barrier(\"ALL\")`` 等价于 ``PIPE_ALL``。",
+        ],
+        "example":
+        "sync",
+    },
+    f"{_TLA_PREFIX}.sync.set_flag": {
+        "constraints": [
+            "``event_id`` 范围 ``[0, 7]``。",
+            "``pipe1`` / ``pipe2`` 是编译期流水字符串。",
+        ],
+        "example": "sync",
+    },
+    f"{_TLA_PREFIX}.sync.wait_flag": {
+        "constraints": [
+            "``event_id`` 范围 ``[0, 7]``，必须与对应的 ``set_flag`` 一致。",
+            "``pipe1`` / ``pipe2`` 是编译期流水字符串。",
+        ],
+        "example": "sync",
+    },
+    f"{_TLA_PREFIX}.sync.sync_all": {
+        "constraints": [
+            "``mode`` 必须是编译期 ``bool``。",
+            "``mode=False`` 同步 AIV 核，``mode=True`` 同步 AIC 和 AIV 全部核。",
+        ],
+        "example": "sync",
+    },
+    f"{_TLA_PREFIX}.sync.block_set_flag": {
+        "constraints": [
+            "``mode`` 取值：``0`` inter-block、``1`` inter-subblock、``2`` intra-block。",
+            "``flag`` 范围 ``[0, 15]``。",
+        ],
+        "example":
+        "sync",
+    },
+    f"{_TLA_PREFIX}.sync.block_wait_flag": {
+        "constraints": [
+            "``flag`` 范围 ``[0, 15]``，必须与对应的 ``block_set_flag`` 一致。",
+        ],
+        "example": "sync",
+    },
+
+    # ------------------------------------------------------------------
+    # Math / debug
+    # ------------------------------------------------------------------
+    f"{_TLA_PREFIX}.compensated_rstd": {
+        "constraints": [
+            "``square_sum`` 必须是 ``f32`` 向量寄存器，通常为广播到所有 lane 的值。",
+            "``hidden`` 必须是正的 Python / constexpr 标量。",
+            "``eps`` 必须不小于最小 FP32 正规数 ``2^-126``。",
+            "语义与 TileKernels ``rstd.py`` 的 ``make_rstd_impl`` 一致，不是普通 RMSNorm 公式。",
+        ],
+        "example":
+        "compensated_rstd",
+    },
+    f"{_TLA_PREFIX}.device_print": {
+        "constraints": [
+            "只允许在 ``tla.scope`` 外使用。",
+            "只支持 UB buffer、UB 元素范围和标量。",
+            "``prefix`` 必须是字符串。",
+        ],
+        "example": "device",
+    },
+    f"{_TLA_PREFIX}.device_assert": {
+        "constraints": [
+            "``cond`` 必须是标量 ``int1``，向量条件会被拒绝。",
+            "仅在开启 ``debug`` 选项时生效。",
+            "``msg`` 必须是字符串。",
+        ],
+        "example": "device",
     },
 }

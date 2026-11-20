@@ -38,6 +38,7 @@ add_triton_library(TritonToGraph
   ProgramGridTransform.cpp
   MergeConcatLoadBuffer.cpp
   Passes.cpp
+  RowLifting.cpp
   LegacyMemoryAccess/ChunkCoalescing.cpp
   LegacyMemoryAccess/RowCoalescing.cpp
   LegacyMemoryAccess/StridedAxisCoalescing.cpp
@@ -54,6 +55,10 @@ add_triton_library(TritonToGraph
   Rules/LoadStoreTransposeRule.cpp
   Rules/RowCoalescingRule.cpp
   Rules/DotRowCoalescing.cpp
+  Rules/QueryRowBatchingRule.cpp
+  Rules/SelectedBlockScanBuild.cpp
+  Rules/SelectedBlockScanMatch.cpp
+  Rules/SelectedBlockScanRule.cpp
   Rules/TransposePointwiseReorderRule.cpp
   Rules/StoreCoalescingRule.cpp
 

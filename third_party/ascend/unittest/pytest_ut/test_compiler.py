@@ -168,8 +168,8 @@ def test_get_simt_stack_limit_config_overrides_default(monkeypatch, tmp_path):
 
 def test_block_compile_context_preserves_hardware_inputs_and_identity(monkeypatch):
     backend = compiler.AscendBackend(GPUTarget('npu', 'Ascend950PR_9579', 32))
-    hardware = SimpleNamespace(get_aicore_num=lambda: 12, get_aivector_core_num=lambda: 24,
-                               has_device_limit=lambda: True)
+    hardware = SimpleNamespace(get_aicore_num=lambda: 12, get_aivector_core_num=lambda: 24, get_device_limit=lambda:
+                               (True, 12, 24))
     monkeypatch.setattr(compiler, 'NPUUtils', lambda: hardware)
     values = backend.prepare_block_compile_options(dict(block_batching_factor=2))
     assert values['block_compile_context'] == (backend.target.arch, 12, (True, 12, 24), None)
@@ -196,8 +196,8 @@ def test_block_compile_context_preserves_hardware_inputs_and_identity(monkeypatc
 def test_direct_compilation_preserves_device_queries(monkeypatch, compile_only, simt):
     from triton import knobs
     backend = compiler.AscendBackend(GPUTarget('npu', 'Ascend950PR_9579', 32))
-    hardware = SimpleNamespace(get_aicore_num=lambda: 12, get_aivector_core_num=lambda: 24,
-                               has_device_limit=lambda: True)
+    hardware = SimpleNamespace(get_aicore_num=lambda: 12, get_aivector_core_num=lambda: 24, get_device_limit=lambda:
+                               (True, 12, 24))
     monkeypatch.setattr(compiler, 'NPUUtils', lambda: hardware)
     with knobs.ascend.scope():
         knobs.ascend.compile_only = compile_only
@@ -277,6 +277,26 @@ def test_active_options_keep_explicit_values(backend):
     assert options.enable_mixed_cv is True
     assert options.enable_dynamic_cv_pipeline is False
     assert options.num_warps == 16
+
+
+@pytest.mark.parametrize(
+    "arch, requested, expected",
+    [
+        ("Ascend910_9581", None, True),
+        ("Ascend910_9581", False, False),
+        ("Ascend910_9691", None, False),
+        ("Ascend910_9691", True, False),
+        ("Ascend960", True, False),
+        ("Ascend910B1", None, False),
+    ],
+)
+def test_dynamic_cv_pipeline_is_enabled_only_on_a5(arch, requested, expected):
+    backend = compiler.AscendBackend(GPUTarget("npu", arch, 32))
+    raw = {} if requested is None else {"enable_dynamic_cv_pipeline": requested}
+
+    options = backend.parse_options(raw)
+
+    assert options.enable_dynamic_cv_pipeline is expected
 
 
 @pytest.mark.parametrize("dtype, deprecated", [

@@ -3,12 +3,9 @@ cmake
 sphinx
 matplotlib
 myst_parser
-sphinx_book_theme
-sphinx_copybutton
-sphinxcontrib-mermaid
+sphinx-rtd-theme
 pandas
 pytest
 sphinx-gallery
 sphinx-multiversion
 llnl-hatchet
-jieba

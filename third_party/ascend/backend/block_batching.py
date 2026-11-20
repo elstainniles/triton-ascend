@@ -17,8 +17,18 @@ IMPLEMENTATION_VERSION = 56
 
 
 # Requests and the execution state owned by each compiled candidate.
+def uses_grouping_policy(arch):
+    """Whether the target selects on TTIR legality and occupancy alone.
+
+    The A5 model prices individual instructions against an A5 register file
+    and unified buffer, so it does not transfer to the earlier generation.
+    A2 and A3 share that generation and therefore share the simpler policy.
+    """
+    return isinstance(arch, str) and arch.startswith(('Ascend910_93', 'Ascend910B'))
+
+
 def supports_target(arch):
-    return isinstance(arch, str) and arch.startswith(('Ascend950', 'Ascend910_95', 'Ascend910_93'))
+    return isinstance(arch, str) and (arch.startswith(('Ascend950', 'Ascend910_95')) or uses_grouping_policy(arch))
 
 
 def _is_cv_report(report):
@@ -95,15 +105,40 @@ def _argument(value):
     return dict(kind="unsupported")
 
 
-def prepare_launch(fn, args, kwargs, grid, warmup, device, backend):
+def prepare_launch(fn, args, kwargs, grid, warmup, device, backend, binding=None):
+    return _prepare_launch(fn, args, kwargs, grid, warmup, device, backend, binding=binding)[:2]
+
+
+def _generalize_data_arguments(arguments, names):
+    for name in names:
+        argument = arguments.get(name, {})
+        value = argument.get("value")
+        # Preserve common constant-folding cases; other data-only integers
+        # are scored as runtime operands, independent of first launch order.
+        if type(value) is int and value not in (-1, 0, 1):
+            del argument["value"]
+
+
+def _prepare_launch(fn, args, kwargs, grid, warmup, device, backend, binding=None):
+    """Resolve the automatic launch contract before the ordinary JIT lookup.
+
+    ``binding`` optionally collects the argument binding performed here. It is
+    taken before any option is injected, so it carries the ordinary cache
+    identity, and it stays empty on paths that must not bind, such as capture.
+    """
     if "block_batching_factor" in fn.arg_names or kwargs.get("block_batching_factor", "auto") != "auto":
-        return kwargs, grid
+        return kwargs, grid, None
     from .reuse.config import enabled as reuse_enabled
 
     def baseline():
-        result = dict(kwargs, block_batching_factor=1)
+        # Only an omitted or automatic factor reaches this point, and both mean
+        # the ordinary compilation. Dropping the key keeps that launch on the
+        # ordinary JIT cache identity instead of splitting it, while an omitted
+        # and an explicit "auto" factor still resolve to the same options.
+        result = dict(kwargs)
         result.pop("block_auto_contract", None)
-        return result, grid
+        result.pop("block_batching_factor", None)
+        return result, grid, None
 
     from triton.runtime.autotuner import _autotuning_kernel
     if "block_batching_factor" not in kwargs and _autotuning_kernel.get() is fn.fn:
@@ -111,10 +146,16 @@ def prepare_launch(fn, args, kwargs, grid, warmup, device, backend):
 
     # Dynamic reuse owns constexpr/tile adaptation and must receive the original
     # callable grid. A concrete auto contract would split its variant families.
+    # Compile-only runs have no device to resolve the selection inputs from, so
+    # an automatic launch there is an ordinary one rather than a hard error.
+    from triton import knobs
+
     if (reuse_enabled() or getattr(getattr(fn, "ASTSource", None), "frontend_kind", "triton") != "triton"
-            or not supports_target(backend.target.arch) or _capture_state() is not False):
+            or not supports_target(backend.target.arch) or _capture_state() is not False or knobs.ascend.compile_only):
         return baseline()
-    bound, specialization, _ = fn.device_caches[device][4](*args, **kwargs)
+    bound, specialization, raw_options = fn.device_caches[device][4](*args, **kwargs)
+    if binding is not None:
+        binding.update(specialization=specialization, options=raw_options)
     if callable(grid):
         grid = grid(bound)
     if not isinstance(grid, (tuple, list)) or not 1 <= len(grid) <= 3 or any(
@@ -134,9 +175,19 @@ def prepare_launch(fn, args, kwargs, grid, warmup, device, backend):
     # dtype-only warmup uses MockTensor, which has no real storage/layout.
     if warmup and any(value["kind"] == "unsupported" for value in arguments.values()):
         return baseline()
+    family = None
+    if any(type(arg.get("value")) is int for arg in arguments.values()):
+        # The input TTIR depends on the ordinary JIT specialization and
+        # compiler options. The decision below still includes grid and layout.
+        key = ("block_auto_data_arguments", fn.cache_key, tuple(specialization), str(raw_options))
+        known = fn.device_caches[device][1].get(key)
+        if known is None:
+            family = key
+        else:
+            _generalize_data_arguments(arguments, known)
     contract = dict(grid=extents, arguments=arguments, argument_order=list(arguments),
                     core_floor=os.getenv("TA_BLOCK_BATCHING_CORE_FLOOR"), device_limit=os.getenv("NPU_DEVICE_LIMIT"))
-    if str(backend.target.arch).startswith("Ascend910_93"):
+    if uses_grouping_policy(str(backend.target.arch)):
         contract["cv_empirical_short_batch"] = False
     # Inject the public default before JIT cache selection and the bundle hook.
     # Concrete compilation stages still receive numeric factors only.
@@ -147,8 +198,9 @@ def prepare_launch(fn, args, kwargs, grid, warmup, device, backend):
         for key, value in kwargs.items()
         if key not in ("block_batching_factor", "block_batching_grid", "block_auto_contract")
     }
-    return dict(result, block_batching_factor="auto", block_batching_grid=extents,
-                block_auto_contract=json.dumps(contract, sort_keys=True, separators=(",", ":"), allow_nan=False)), grid
+    result.update(block_batching_factor="auto", block_batching_grid=extents,
+                  block_auto_contract=json.dumps(contract, sort_keys=True, separators=(",", ":"), allow_nan=False))
+    return result, grid, family
 
 
 def _annotate_launch_grid(kwargs, grid, *, bind=None):
@@ -180,13 +232,17 @@ class _BatchLaunchHandler:
     """Block-batching policy behind the existing backend JIT continuation."""
 
     def run(self, fn, args, kwargs, grid, warmup, device, stream, backend, jit_tail):
-        kwargs, grid = prepare_launch(fn, args, kwargs, grid, warmup, device, backend)
+        binding = {}
+        kwargs, grid, family = _prepare_launch(fn, args, kwargs, grid, warmup, device, backend, binding=binding)
         # Preserve pre-run hooks, cache identity and single callback evaluation
         # without adding a hook to the common JIT frontend.
         bind = None if warmup else lambda: fn.device_caches[device][4](*args, **kwargs)[0]
         grid = _annotate_launch_grid(kwargs, grid, bind=bind)
+        # Both memos below are bookkeeping, not compiled kernels, so they live in
+        # the key cache rather than the kernel cache. Both device slots share one
+        # lifetime, while the kernel cache stays one entry per compiled kernel.
         if "block_batching_factor" not in fn.arg_names and kwargs.get("block_batching_factor", 1) != 1:
-            kwargs = backend.prepare_block_compile_options(kwargs, cache=fn.device_caches[device][0])
+            kwargs = backend.prepare_block_compile_options(kwargs, cache=fn.device_caches[device][1])
         from .reuse.config import enabled
 
         if enabled():
@@ -194,9 +250,21 @@ class _BatchLaunchHandler:
 
             return get_handler().run(fn, args, kwargs, grid, warmup, device, stream, backend, jit_tail)
         if kwargs.get("block_batching_factor") == "auto":
-            cache = fn.device_caches[device][0]
-            return jit_tail(args, kwargs, grid, warmup, device, stream,
-                            initialize=lambda kernel: initialize_auto_kernel(cache, kernel))
+            cache = fn.device_caches[device][1]
+            # The contract reaches compilation through the options, but it
+            # describes one launch, not the artifact. Keeping it out of the
+            # cache identity stops every new shape from re-entering compile().
+            memory_key = None
+            if binding:
+                from triton.runtime.jit import compute_cache_key
+
+                memory_key = compute_cache_key(fn.device_caches[device][1], binding["specialization"],
+                                               binding["options"])
+            kernel = jit_tail(args, kwargs, grid, warmup, device, stream, memory_key=memory_key,
+                              initialize=lambda kernel: initialize_auto_kernel(cache, kernel))
+            if family is not None and isinstance(kernel, BatchKernel) and hasattr(kernel, "block_auto_data_arguments"):
+                fn.device_caches[device][1][family] = kernel.block_auto_data_arguments
+            return kernel
         return jit_tail(args, kwargs, grid, warmup, device, stream)
 
 
@@ -300,15 +368,13 @@ class BatchKernel:
         self._lock = threading.RLock()
         self._ready = False
         self._local = threading.local()
-        self.hash = candidate.hash if candidate is not None else hashlib.sha256(
-            f"{baseline.hash}:block_batching:{request.factor}:{request.axis}:{IMPLEMENTATION_VERSION}".encode(
-            )).hexdigest()
         self._set_primary(candidate if candidate is not None else baseline)
         if publish_manifest:
             self.publish_manifest()
 
     def _set_primary(self, kernel):
         self._primary = kernel
+        self.hash = kernel.hash
         fields = dict(kernel.metadata._asdict(), block_batching=self.block_batching)
         self.metadata = namedtuple("BatchKernelMetadata", sorted(fields))(**fields)
 
@@ -319,7 +385,8 @@ class BatchKernel:
             self.candidate.hash if self.candidate is not None else None, "request":
             {"factor": self.request.factor, "axis": self.request.axis}, "report": self.block_batching
         }
-        get_cache_manager(self.hash).put(json.dumps(manifest, sort_keys=True), "block_batching.bundle.json")
+        identity = hashlib.sha256(json.dumps(manifest, sort_keys=True).encode()).hexdigest()
+        get_cache_manager(identity).put(json.dumps(manifest, sort_keys=True), "block_batching.bundle.json")
 
     def __getattr__(self, name):
         return getattr(self._primary, name)

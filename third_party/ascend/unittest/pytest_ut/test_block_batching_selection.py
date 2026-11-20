@@ -1,6 +1,7 @@
 # Copyright (c) Huawei Technologies Co., Ltd. 2026. All rights reserved.
 """TTIR scoring, isolated selection and bounded backend compilation; CPU-only."""
 from block_batching_test_utils import assign_npu  # noqa: F401 - CPU-only fixture
+from block_batching_test_utils import parse
 import importlib
 import json
 import hashlib
@@ -18,6 +19,52 @@ from triton._C.libtriton import ascend, ir
 from triton.backends.ascend import block_batching as batching
 from triton.backends.ascend.compiler import AscendBackend
 from triton.backends.compiler import GPUTarget
+
+
+def test_data_only_scalar_through_generator_arithmetic(tmp_path):
+    module = parse(
+        tmp_path, '''module {
+      tt.func public @gen(%out: !tt.ptr<i32>, %seed: i32) {
+        %r = tt.make_range {start = 0 : i32, end = 8 : i32} : tensor<8xi32>
+        %s = tt.splat %seed : i32 -> tensor<8xi32>
+        %v = arith.addi %s, %r : tensor<8xi32>
+        %bits = arith.muli %v, %v : tensor<8xi32>
+        %keep = arith.cmpi ult, %bits, %v : tensor<8xi32>
+        %data = arith.select %keep, %bits, %v : tensor<8xi1>, tensor<8xi32>
+        %p = tt.splat %out : !tt.ptr<i32> -> tensor<8x!tt.ptr<i32>>
+        %ptrs = tt.addptr %p, %r : tensor<8x!tt.ptr<i32>>, tensor<8xi32>
+        tt.store %ptrs, %data : tensor<8x!tt.ptr<i32>>
+        tt.return
+      }
+    }''')
+    assert list(ascend.block_data_only_arguments(module, 2)) == [1]
+    assert list(ascend.block_data_only_arguments(module, 3)) == []
+
+
+def test_address_mask_and_control_scalars_keep_their_values(tmp_path):
+    module = parse(
+        tmp_path, '''module {
+      tt.func public @mixed(%direct: i32, %data: i32, %out: !tt.ptr<i32>,
+                            %indirect: i32, %bound: i32, %count: index, %branch: i1,
+                            %slot: !tt.ptr<!tt.ptr<i32>>, %escaped: i32) {
+        %c0 = arith.constant 0 : index
+        %c1 = arith.constant 1 : index
+        %p = tt.addptr %out, %direct : !tt.ptr<i32>, i32
+        %offset = arith.addi %indirect, %indirect : i32
+        %q = tt.addptr %p, %offset : !tt.ptr<i32>, i32
+        %mask = arith.cmpi slt, %direct, %bound : i32
+        scf.for %i = %c0 to %count step %c1 {
+          scf.if %branch {
+            tt.store %q, %direct : !tt.ptr<i32>
+          }
+        }
+        %stored_ptr = tt.addptr %p, %escaped : !tt.ptr<i32>, i32
+        tt.store %slot, %stored_ptr : !tt.ptr<!tt.ptr<i32>>
+        tt.store %p, %data, %mask : !tt.ptr<i32>
+        tt.return
+      }
+    }''')
+    assert list(ascend.block_data_only_arguments(module, 9)) == [1]
 
 
 class TestTtirAnalysis(unittest.TestCase):
@@ -228,23 +275,26 @@ for _ in range(20):
         self.assertEqual(result["factor"], 1)
         self.assertFalse(result["model_complete"])
 
-    def test_a3_selects_a_proven_group_with_target_core_count(self):
+    def test_legacy_targets_select_a_proven_group_with_target_core_count(self):
         text = """module { tt.func public @kernel(%out: !tt.ptr<i32>) {
           %zero = arith.constant 0 : i32
           tt.store %out, %zero : !tt.ptr<i32>
           tt.return
         }}"""
-        rows = []
-        for factor in (1, 2, 4):
-            row = self.score(text, arch="Ascend910_9391", cores=20, factor=factor, axis=-1 if factor == 1 else 0,
-                             cv=False, merge_kind="vv")
-            self.assertEqual(row["model"], "ttir-a3-grouping-v1")
-            rows.append(row)
-        result = json.loads(
-            ascend.select_block_candidates(
-                json.dumps(dict(action="rank_ttir", contract=dict(grid=[256, 1, 1]), candidates=rows))))
-        self.assertEqual(result["factor"], 2)
-        self.assertEqual(result["candidates"]["a0_f2"]["cores"], 20)
+        # The A5 cost model does not transfer, so every SOC of the earlier
+        # generation scores on legality and occupancy instead.
+        for arch in ("Ascend910_9391", "Ascend910B1", "Ascend910B2", "Ascend910B3", "Ascend910B4"):
+            rows = []
+            for factor in (1, 2, 4):
+                row = self.score(text, arch=arch, cores=20, factor=factor, axis=-1 if factor == 1 else 0, cv=False,
+                                 merge_kind="vv")
+                self.assertEqual(row["model"], "ttir-legacy-grouping-v1", arch)
+                rows.append(row)
+            result = json.loads(
+                ascend.select_block_candidates(
+                    json.dumps(dict(action="rank_ttir", contract=dict(grid=[256, 1, 1]), candidates=rows))))
+            self.assertEqual(result["factor"], 2, arch)
+            self.assertEqual(result["candidates"]["a0_f2"]["cores"], 20, arch)
 
     def test_missing_target_resources_cannot_use_a5_defaults(self):
         result = self.score("module { tt.func public @kernel() { tt.return } }", cores=0)
@@ -318,18 +368,37 @@ class TestSelectionCache(unittest.TestCase):
         with self.assertRaises(self.auto._SelectionMiss):
             self.cache.restore_ttir(prepared, restored)
 
-    def test_incomplete_models_and_unaudited_refusals_are_not_cached(self):
-        for change in ("model", "failure", "candidate", "decline"):
+    def test_retryable_outcomes_and_unaudited_refusals_are_not_cached(self):
+        for change in ("failure", "candidate", "model_limit", "rejection", "decline"):
             report = selection_report(1)
-            if change == "model":
-                report["selection"]["model_complete"] = False
-            elif change == "failure":
+            candidate = report["selection"]["candidates"]["unmerged"]
+            if change == "failure":
                 report["selection"]["failure_kind"] = "Timeout"
             elif change == "candidate":
-                report["selection"]["candidates"]["unmerged"]["status"] = "TTIR_MODEL_UNSUPPORTED"
+                candidate["status"] = "TTIR_MODEL_UNSUPPORTED"
+            elif change == "model_limit":
+                candidate.update(status="TTIR_MODEL_UNSUPPORTED", error="analysis budget exhausted")
+            elif change == "rejection":
+                candidate.update(status="COMPILE_REJECTED", error="UNSUPPORTED_BATCH_OP")
             else:
                 report["plan"]["declines"] = [dict(axis=0, factor=2, stage="ttir", reason="UNSUPPORTED_BATCH_OP")]
-            self.assertFalse(self.auto._cacheable_selection(report))
+            with self.subTest(change=change):
+                report["selection"]["model_complete"] = False
+                self.assertFalse(self.auto._cacheable_selection(report))
+
+    def test_audited_deterministic_outcomes_are_cached_without_a_priced_baseline(self):
+        from triton.backends.ascend.block_batching_worker import _CACHEABLE_DECLINES, _DETERMINISTIC_MODEL_LIMITS
+        # A kernel the model cannot price reaches the same verdict every time,
+        # so the decision persists instead of being rediscovered per process.
+        report = selection_report(1)
+        report["selection"].update(model_complete=False, reason="TTIR_BASELINE_MODEL_UNSUPPORTED")
+        report["selection"]["candidates"]["unmerged"].update(status="TTIR_MODEL_UNSUPPORTED",
+                                                             error=sorted(_DETERMINISTIC_MODEL_LIMITS)[0])
+        report["selection"]["candidates"]["a0_f2"] = dict(factor=2, axis=0, requested_axis=0, status="COMPILE_REJECTED",
+                                                          error="UNSUPPORTED_BYTE_OPERATION")
+        report["plan"]["declines"] = [dict(axis=0, factor=2, stage="ttir", reason="UNSUPPORTED_BYTE_OPERATION")]
+        self.assertIn("UNSUPPORTED_BYTE_OPERATION", _CACHEABLE_DECLINES)
+        self.assertTrue(self.auto._cacheable_selection(report))
 
 
 class TestCompileContextCache(unittest.TestCase):
@@ -554,10 +623,12 @@ class TestRankedRecovery(unittest.TestCase):
         self.assertEqual(result["selected_factor"], 1)
         self.assertEqual(result["reason"], "BASELINE_AFTER_CANDIDATE_REJECTION")
 
-    def test_a3_uses_the_selection_worker(self):
-        result, events = self.run_selection(arch="Ascend910_9391", selected=2)
-        self.assertEqual(events, ["ttir", "f1", 2])
-        self.assertEqual(result["selected_factor"], 2)
+    def test_legacy_targets_use_the_selection_worker(self):
+        for arch in ("Ascend910_9391", "Ascend910B1", "Ascend910B4"):
+            with self.subTest(arch=arch):
+                result, events = self.run_selection(arch=arch, selected=2)
+                self.assertEqual(events, ["ttir", "f1", 2])
+                self.assertEqual(result["selected_factor"], 2)
 
     def test_abnormal_worker_exits_do_not_masquerade_as_declines(self):
         from triton.backends.ascend.block_batching_worker import BatchCompileError
@@ -627,8 +698,8 @@ class TestHostIntegration(unittest.TestCase):
         self.addCleanup(capture.stop)
         self.backend = SimpleNamespace(target=SimpleNamespace(arch="Ascend950"),
                                        prepare_block_compile_options=lambda values, **_: dict(values))
-        self.fn = SimpleNamespace(fn=lambda: None, arg_names=["x", "size", "BLOCK"],
-                                  device_caches={0: [{}, None, None, None, self.bind]})
+        self.fn = SimpleNamespace(fn=lambda: None, cache_key="test-kernel", arg_names=["x", "size", "BLOCK"],
+                                  device_caches={0: [{}, {}, None, None, self.bind]})
         self.kwargs = dict(block_batching_factor="auto", BLOCK=512)
         self.result = object()
 
@@ -644,6 +715,41 @@ class TestHostIntegration(unittest.TestCase):
     def run_handler(self, grid=(256, ), warmup=False):
         return self.batching.get_launch_handler().run(self.fn, (Tensor(), 131072), self.kwargs, grid, warmup, 0, 42,
                                                       self.backend, self.tail)
+
+    def test_cached_proof_shares_data_values_only_within_one_abi(self):
+
+        def bind(output, seed, offset, **options):
+            # A kernel that disables alignment specialization for these runtime integers.
+            seed_type = "i32" if seed < 2**31 else "u32"
+            return dict(output=output, seed=seed, offset=offset), [("*fp32", None), (seed_type, None),
+                                                                   ("i32", None)], options
+
+        self.fn.arg_names = ["output", "seed", "offset"]
+        self.fn.device_caches[0][4] = bind
+        kernel = Mock(spec=self.batching.BatchKernel)
+        kernel.block_auto_data_arguments = ("seed", )
+        seen = []
+
+        def tail(args, kwargs, *more, **hooks):
+            seen.append((args[1:], json.loads(kwargs["block_auto_contract"])["arguments"]))
+            return kernel
+
+        def launch(seed, offset=32):
+            args = (Tensor(), seed, offset)
+            self.batching.get_launch_handler().run(self.fn, args, {}, (256, ), False, 0, 42, self.backend, tail)
+            self.assertEqual(seen[-1][0], (seed, offset))
+            return seen[-1][1]
+
+        self.assertEqual(launch(8)["seed"]["value"], 8)  # A cold family needs the native TTIR proof.
+        shared = launch(8)
+        self.assertNotIn("value", shared["seed"])
+        self.assertEqual(launch(16), shared)
+        self.assertEqual(launch(16, 64)["offset"]["value"], 64)
+        for value in (-1, 0, 1):
+            self.assertEqual(launch(value)["seed"]["value"], value)
+        self.assertEqual(launch(2**31)["seed"]["value"], 2**31)  # A new ABI needs its own proof.
+        self.fn.cache_key = "different-source"
+        self.assertEqual(launch(8)["seed"]["value"], 8)
 
     def test_auto_contract_resolves_grid_once_and_excludes_constexpr(self):
 
@@ -680,7 +786,9 @@ class TestHostIntegration(unittest.TestCase):
 
         def launch(*args, grid, **options):
             prepared, _ = self.dispatch.prepare_launch(self.fn, args, options, grid, False, 0, self.backend)
-            seen.append(prepared["block_batching_factor"])
+            # An omitted factor is the ordinary compilation, which the option
+            # default already spells as 1, so the key stays out of the options.
+            seen.append(prepared.get("block_batching_factor", 1))
             return prepared
 
         def bench(fn, quantiles):
@@ -748,7 +856,7 @@ class TestHostIntegration(unittest.TestCase):
                 self.assertEqual(self.calls[-1][0][1]["block_batching_factor"], "auto")
             self.assertIs(autotuner._autotuning_kernel.get(), self.fn.fn)
             self.run_handler()
-            self.assertEqual(self.calls[-1][0][1]["block_batching_factor"], 1)
+            self.assertNotIn("block_batching_factor", self.calls[-1][0][1])
             self.fn.arg_names.append("block_batching_factor")
             options, _ = self.dispatch.prepare_launch(self.fn, (), self.kwargs, (256, ), True, 0, self.backend)
             self.assertIs(options, self.kwargs)  # A kernel argument is not a compiler option.
@@ -783,7 +891,7 @@ class TestHostIntegration(unittest.TestCase):
             else:
                 self.assertEqual(self.calls[0][0][1], dict(self.kwargs, block_compile_context=context))
                 self.backend.prepare_block_compile_options.assert_called_once_with(self.kwargs,
-                                                                                   cache=self.fn.device_caches[0][0])
+                                                                                   cache=self.fn.device_caches[0][1])
 
     def test_warmup_uses_the_same_contract_as_launch(self):
         self.kwargs.pop("block_batching_factor")
@@ -795,7 +903,7 @@ class TestHostIntegration(unittest.TestCase):
         incomplete = SimpleNamespace(dtype="fp32", shape=(1, ), stride=lambda: (1, ))
         options, _ = self.dispatch.prepare_launch(self.fn, (incomplete, 131072), self.kwargs, (256, ), True, 0,
                                                   self.backend)
-        self.assertEqual(options["block_batching_factor"], 1)
+        self.assertNotIn("block_batching_factor", options)
         self.assertNotIn("block_auto_contract", options)
 
     def test_capture_uses_baseline_without_binding_or_grid_evaluation(self):
@@ -810,23 +918,27 @@ class TestHostIntegration(unittest.TestCase):
             self.run_handler(unavailable, warmup)
             self.assertEqual(len(self.calls), 1)
             values, _ = self.calls[0]
-            self.assertEqual(values[1]["block_batching_factor"], 1)
+            self.assertNotIn("block_batching_factor", values[1])
             self.assertIs(values[2], unavailable)
 
     def test_non_a5_and_invalid_grid_keep_baseline(self):
         self.kwargs.pop("block_batching_factor")
-        for target, grid in (("Ascend910B", (256, )), ("Ascend950", (0, ))):
+        for target, grid in (("Ascend310B4", (256, )), ("Ascend950", (0, ))):
             self.backend.target.arch = target
             self.calls.clear()
             self.run_handler(grid)
-            self.assertEqual(self.calls[-1][0][1]["block_batching_factor"], 1)
+            self.assertNotIn("block_batching_factor", self.calls[-1][0][1])
 
-    def test_a3_enters_auto_without_a5_empirical_override(self):
-        self.backend.target.arch = "Ascend910_9391"
-        self.run_handler()
-        options = self.calls[-1][0][1]
-        self.assertEqual(options["block_batching_factor"], "auto")
-        self.assertFalse(json.loads(options["block_auto_contract"])["cv_empirical_short_batch"])
+    def test_legacy_targets_enter_auto_without_a5_empirical_override(self):
+        # A5 calibrated the short-batch heuristic; the earlier generation
+        # admits the same automatic launches but scores them without it.
+        for target in ("Ascend910_9391", "Ascend910B1", "Ascend910B2", "Ascend910B3", "Ascend910B4"):
+            self.backend.target.arch = target
+            self.calls.clear()
+            self.run_handler()
+            options = self.calls[-1][0][1]
+            self.assertEqual(options["block_batching_factor"], "auto", target)
+            self.assertFalse(json.loads(options["block_auto_contract"])["cv_empirical_short_batch"], target)
 
     def test_single_program_keeps_normal_cache_without_contract(self):
         for grid, axis in (((1, ), -1), ((1, 1, 1), -1), ((8, 1), 1)):
@@ -834,7 +946,7 @@ class TestHostIntegration(unittest.TestCase):
             self.calls.clear()
             self.run_handler(grid)
             options = self.calls[-1][0][1]
-            self.assertEqual(options["block_batching_factor"], 1)
+            self.assertNotIn("block_batching_factor", options)
             self.assertNotIn("block_auto_contract", options)
 
     def test_other_frontends_keep_their_original_compilation_path(self):
@@ -842,7 +954,7 @@ class TestHostIntegration(unittest.TestCase):
         self.kwargs.pop("block_batching_factor")
         self.run_handler()
         self.assertEqual(len(self.calls), 1)
-        self.assertEqual(self.calls[0][0][1]["block_batching_factor"], 1)
+        self.assertNotIn("block_batching_factor", self.calls[0][0][1])
 
     def test_shape_and_scalar_values_are_part_of_jit_option_identity(self):
         first, _ = self.dispatch.prepare_launch(self.fn, (Tensor(), 131072), self.kwargs, (256, ), False, 0,
@@ -858,7 +970,7 @@ class TestHostIntegration(unittest.TestCase):
         def reuse(fn, args, kwargs, grid, warmup, device, stream, backend, tail):
             self.assertIs(fn, self.fn)
             self.assertNotIn("block_auto_contract", kwargs)
-            self.assertEqual(kwargs["block_batching_factor"], 1)
+            self.assertNotIn("block_batching_factor", kwargs)
             return tail(args, kwargs, grid, warmup, device, stream)
 
         with patch.dict(sys.modules,

@@ -97,6 +97,7 @@ struct ArgLayout {
   std::vector<ArgSlot> args;
   size_t inputCount = 0;
   size_t ffts = absent, lock = absent, workspace = absent;
+  size_t profile = absent;
   size_t originalGrid = absent, grid = absent, debug = absent, total = 0;
 
   size_t reserve(size_t size, size_t alignment) {
@@ -154,6 +155,8 @@ struct ArgLayout {
       args.push_back(
           {i, kind, types[i].dtype, reserve(size, size == 8 ? 8 : 4), size});
     }
+    if (spec.profile_scratch_size && !(spec.flags & TRITON_NPU_PURE_SIMT))
+      profile = reserve(8, 8);
     if (spec.gridContractVersion == 3)
       originalGrid = reserve(3 * sizeof(uint32_t), 4);
     else if (spec.flags &
@@ -161,8 +164,8 @@ struct ArgLayout {
       originalGrid = reserve(2 * sizeof(uint32_t), 4);
     grid = reserve(3 * sizeof(int32_t), 4);
     if (spec.flags & TRITON_NPU_PURE_SIMT) {
-      reserve(8, 8); // global scratch
-      reserve(8, 8); // profile scratch
+      reserve(8, 8);           // global scratch
+      profile = reserve(8, 8); // profile scratch
     }
     debug = reserve(8, 8); // present even when device print is disabled
   }
@@ -186,8 +189,11 @@ struct ArgLayout {
 inline void validateSpec(const TritonNpuLaunchSpecV1 &spec) {
   if (spec.version != 1 || spec.struct_size != sizeof(spec))
     throw std::invalid_argument("unsupported launcher spec ABI");
-  if (spec.flags & ~uint64_t(2047))
+  if (spec.flags & ~uint64_t(4095))
     throw std::invalid_argument("unknown launcher flags");
+  if ((spec.flags & TRITON_NPU_IAT64) &&
+      (!(spec.flags & TRITON_NPU_IAT) || (spec.flags & TRITON_NPU_PTSM)))
+    throw std::invalid_argument("IAT64 requires standalone IAT");
   if (!spec.coalesce_factor || spec.coalesce_axis < -1 ||
       spec.coalesce_axis > 2)
     throw std::invalid_argument("invalid launcher coalescing configuration");
@@ -212,8 +218,8 @@ inline void validateSpec(const TritonNpuLaunchSpecV1 &spec) {
 }
 
 inline LaunchSpec decodeSpecV2(const TritonNpuLaunchSpecV2 &spec) {
-  static_assert(sizeof(TritonNpuLaunchSpecV1) == 80);
-  static_assert(sizeof(TritonNpuLaunchSpecV2) == 104);
+  static_assert(sizeof(TritonNpuLaunchSpecV1) == 88);
+  static_assert(sizeof(TritonNpuLaunchSpecV2) == 112);
   static_assert(offsetof(TritonNpuLaunchSpecV2, base) == 8);
   static_assert(offsetof(TritonNpuLaunchSpecV2, grid_contract_version) ==
                 8 + sizeof(TritonNpuLaunchSpecV1));
@@ -237,7 +243,8 @@ inline LaunchSpec decodeSpecV2(const TritonNpuLaunchSpecV2 &spec) {
 
 struct LaunchGrid {
   std::array<int32_t, 3> grid;
-  uint32_t logicalBlocks, physicalBlocks;
+  uint64_t logicalBlocks;
+  uint32_t physicalBlocks;
 };
 
 inline LaunchGrid prepareGrid(const LaunchSpec &spec, const int32_t *input) {
@@ -254,8 +261,10 @@ inline LaunchGrid prepareGrid(const LaunchSpec &spec, const int32_t *input) {
     result.grid[spec.batchAxis] =
         (int64_t(input[spec.batchAxis]) + spec.batchFactor - 1) /
         spec.batchFactor;
-  if (spec.flags & TRITON_NPU_IAT)
-    result.grid[1] = (int64_t(input[1]) + 15) / 16;
+  if (spec.flags & TRITON_NPU_IAT) {
+    const uint32_t factor = (spec.flags & TRITON_NPU_IAT64) ? 64 : 16;
+    result.grid[1] = (int64_t(input[1]) + factor - 1) / factor;
+  }
   if (spec.flags & TRITON_NPU_PTSM) {
     const uint32_t factor = (spec.flags & TRITON_NPU_IAT) ? 4 : 64;
     const uint64_t otherPrograms =
@@ -279,16 +288,20 @@ inline LaunchGrid prepareGrid(const LaunchSpec &spec, const int32_t *input) {
   }
   uint64_t blocks = checkedMultiply(
       checkedMultiply(result.grid[0], result.grid[1]), result.grid[2]);
-  if (blocks > std::numeric_limits<uint32_t>::max())
-    throw std::overflow_error("launch grid exceeds uint32 block count");
+  // logicalBlocks keeps the full 64-bit program count: workspace sizing needs
+  // the true total and must not inherit the 32-bit block_dim limit.
   if (spec.gridContractVersion == 3 && blocks > INT32_MAX)
     throw std::overflow_error(
         "block batching exceeds the G0 signed i32 task domain");
   result.logicalBlocks = blocks;
-  result.physicalBlocks =
+  // physicalBlocks is the value handed to CANN as block_dim and stays 32-bit.
+  const uint64_t physical =
       (spec.flags & TRITON_NPU_AUTO_MAP)
-          ? std::min(result.logicalBlocks, spec.physical_blocks)
+          ? std::min(result.logicalBlocks, uint64_t{spec.physical_blocks})
           : result.logicalBlocks;
+  if (physical > std::numeric_limits<uint32_t>::max())
+    throw std::overflow_error("launch grid exceeds uint32 block count");
+  result.physicalBlocks = static_cast<uint32_t>(physical);
   return result;
 }
 

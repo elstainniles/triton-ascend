@@ -1,13 +1,28 @@
 // RUN: split-file %s %t
-// RUN: triton-opt --pass-pipeline='any(triton-control-flow-opt,triton-to-structured{enable-mask-fallback-conversion=false optimize-dynamic-offset=false},discrete-mask-access-conversion{compile-mode=simd_simt_template compile-on-910-95=true},triton-to-annotation,triton-to-unstructure{compile-mode=simd_simt_template compile-on-910-95=true})' --verify-each %t/masked_scalar_like_load.mlir | FileCheck %s --check-prefix=SCALAR --implicit-check-not=tt.load
+// RUN: triton-opt --pass-pipeline='any(triton-control-flow-opt,triton-to-structured{enable-mask-fallback-conversion=false optimize-dynamic-offset=false},discrete-mask-access-conversion{compile-mode=simd_simt_template compile-on-910-95=true},triton-to-annotation,triton-to-unstructure{compile-mode=simd_simt_template compile-on-910-95=true})' --verify-each %t/masked_scalar_like_load.mlir | FileCheck %s --check-prefix=INDIRECT --implicit-check-not=tt.load
+// RUN: triton-opt %t/masked_scalar_like_load.mlir --triton-to-unstructure --verify-each | FileCheck %s --check-prefix=SCALAR --implicit-check-not=tt.load
 // RUN: triton-opt %t/prefix_zero_load.mlir --triton-to-unstructure --verify-each | FileCheck %s --check-prefix=PREFIX
+// RUN: sed 's/, hacc.block_mapping_owner = "block_batching"//' %t/prefix_zero_load.mlir | triton-opt --triton-to-unstructure --verify-each | FileCheck %s --check-prefix=UNBATCHED --implicit-check-not=linalg.fill
 
 //--- masked_scalar_like_load.mlir
+// The SIMT pipeline must preserve the original mask and padding on the actual
+// indirect access, without an unconditional scalar load of the invalid address.
+// INDIRECT-LABEL: tt.func public @block_batching_memory(
+// INDIRECT-SAME: %[[INPUT:[^:]+]]: !tt.ptr<f32>
+// INDIRECT: %[[OFFSET:.*]] = arith.constant dense<1099511627776> : tensor<4xi64>
+// INDIRECT: %[[OTHER:.*]] = arith.constant dense<7.000000e+00> : tensor<4xf32>
+// INDIRECT: %[[ENABLED:.*]] = arith.cmpi slt,
+// INDIRECT: %[[MASK:.*]] = tt.splat %[[ENABLED]] : i1 -> tensor<4xi1>
+// INDIRECT: %[[VALUE:.*]] = ascend.indirect_load %[[INPUT]] : <f32>, %[[OFFSET]] : tensor<4xi64>, %[[MASK]] : tensor<4xi1>, %[[OTHER]] : tensor<4xf32>
+// INDIRECT: tt.store %{{.*}}, %[[VALUE]] : tensor<4x!tt.ptr<f32>>
+// INDIRECT: tt.return
+
 // SCALAR-LABEL: tt.func public @block_batching_memory(
 // SCALAR-SAME: %[[INPUT:[^:]+]]: !tt.ptr<f32>
 // The scalar fallback must bound the load loop by the original predicate.
 // A false predicate gives zero iterations; the final select restores other=7.
 // No load may escape the loop, even when followed by a select.
+// SCALAR: %[[PAD:.*]] = arith.constant 7.000000e+00 : f32
 // SCALAR: %[[OFFSET:.*]] = arith.constant 1099511627776 : i64
 // SCALAR: %[[ZERO:.*]] = arith.constant 0 : index
 // SCALAR: %[[ONE:.*]] = arith.constant 1 : index
@@ -20,7 +35,8 @@
 // SCALAR: %[[BOUND:.*]] = arith.minsi %[[COUNT]], %[[FOUR]] : index
 // SCALAR: %[[RESULT:.*]] = scf.for %[[IV:.*]] = %[[ZERO]] to %[[BOUND]] step %[[ONE]] iter_args(%[[ACC:.*]] = %{{.*}}) -> (tensor<4xf32>) {
 // SCALAR-NEXT: %[[PTR:.*]] = tt.addptr %[[INPUT]], %[[OFFSET]] : !tt.ptr<f32>, i64
-// SCALAR-NEXT: %[[VALUE:.*]] = tt.load %[[PTR]] {DiscreteMemAccess} : !tt.ptr<f32>
+// SCALAR-NEXT: %[[LANE_MASK:.*]] = tensor.extract %[[MASK]][%[[IV]]] {DiscreteMemAccess} : tensor<4xi1>
+// SCALAR-NEXT: %[[VALUE:.*]] = tt.load %[[PTR]], %[[LANE_MASK]], %[[PAD]] {DiscreteMemAccess} : !tt.ptr<f32>
 // SCALAR-NEXT: %[[INSERTED:.*]] = tensor.insert %[[VALUE]] into %[[ACC]][%[[IV]]] : tensor<4xf32>
 // SCALAR-NEXT: scf.yield {DiscreteMemAccess} %[[INSERTED]] : tensor<4xf32>
 // SCALAR-NEXT: } {ExtractedLoadOrStore}
@@ -60,9 +76,15 @@ module {
 // PREFIX: tt.load %{{[^,]+}}, %{{[^,]+}}, %{{[^ ]+}} {DiscreteMemAccess}
 // PREFIX-NOT: arith.select
 // PREFIX: tt.return
+// UNBATCHED-LABEL: tt.func public @prefix_zero_load
+// UNBATCHED: scf.for
+// UNBATCHED: tt.load %{{[^,]+}}, %{{[^ ,]+}} {DiscreteMemAccess}
+// UNBATCHED: arith.select
+// UNBATCHED: tt.return
 // Zero padding must be installed in the final loop destination. Retained
 // axes still require a masked load with other=0, including empty prefixes.
-module attributes {hacc.target = #hacc.target<"Ascend950PR_9579">} {
+// Unbatched kernels retain the outer select instead of destination prefill.
+module attributes {hacc.target = #hacc.target<"Ascend950PR_9579">, hacc.block_mapping_owner = "block_batching"} {
   tt.func public @prefix_zero_load(%input: !tt.ptr<f32>, %output: !tt.ptr<f32>, %rows: i32, %lower: i32, %upper: i32) {
     %x = tt.make_range {start = 0 : i32, end = 3 : i32} : tensor<3xi32>
     %r = tt.make_range {start = 0 : i32, end = 32 : i32} : tensor<32xi32>

@@ -38,6 +38,7 @@
 #include "mlir/Pass/Pass.h"
 #include "mlir/Pass/PassManager.h"
 #include "triton/Dialect/Triton/IR/Dialect.h"
+#include "llvm/ADT/SetVector.h"
 #include <optional>
 
 namespace mlir {
@@ -52,6 +53,13 @@ struct TransferPipeConfig {
   hivm::TCoreTypeAttr dstCoreAttr;
   llvm::StringRef srcCoreType;
   llvm::StringRef dstCoreType;
+};
+
+struct TransferSyncInsertPoint {
+  mlir::Operation *prodStart = nullptr;
+  mlir::Operation *prodEnd = nullptr;
+  mlir::Operation *consStart = nullptr;
+  mlir::Operation *consEnd = nullptr;
 };
 
 // Information found while matching a VECTOR to_tensor yielded from an SCF op.
@@ -110,8 +118,8 @@ private:
   llvm::DenseMap<mlir::Value, mlir::Value> ndnzValueMapping;
   SSBufferManager ssbufferManager;
 
-  void analyzeLoopInclusion();
-  void moveStartEndSync(mlir::OpBuilder &builder);
+  Operation *loopStartBound = nullptr;
+  Operation *loopEndBound = nullptr;
 
   mlir::LogicalResult
   processDependencies(FlagIdManager &flagManager,
@@ -124,8 +132,9 @@ private:
   handleCubeToVector(mlir::OpBuilder &builder, DependencyInfo &dep,
                      FlagIdManager &flagManager,
                      FlagIdReuseManager &flagIdReuseManager);
-  mlir::LogicalResult handleCubeToCube(mlir::OpBuilder &builder,
-                                       DependencyInfo &dep);
+  mlir::LogicalResult
+  handleCubeToCube(mlir::OpBuilder &builder, DependencyInfo &dep,
+                   llvm::SmallSetVector<Operation *, 4> &foldedCasts);
   mlir::LogicalResult handleMemoryDependency(
       mlir::OpBuilder &builder, DependencyInfo &dep, size_t depIndex,
       llvm::SmallVector<DependencyInfo> memDependencies,
@@ -133,6 +142,7 @@ private:
 
   std::pair<mlir::Operation *, mlir::Operation *>
   getBlockStartEnd(int blockId, mlir::ModuleOp module);
+  void findLoopRange(ModuleOp module);
   std::pair<mlir::Operation *, mlir::Operation *>
   getSubBlockStartEnd(mlir::Operation *defOp);
   bool
@@ -164,8 +174,8 @@ private:
   std::pair<mlir::Operation *, mlir::Operation *>
   createTransferAllocs(mlir::OpBuilder &builder, mlir::Location loc,
                        llvm::ArrayRef<int64_t> shape, mlir::Type elemType,
-                       hivm::AddressSpace addrSpace, mlir::Operation *prodEndOp,
-                       mlir::Operation *consStartOp, int prodBlockId,
+                       hivm::AddressSpace addrSpace,
+                       TransferSyncInsertPoint &insertPoint, int prodBlockId,
                        int consBlockId, llvm::StringRef prodTag,
                        llvm::StringRef consTag, int transferIndex);
   mlir::Operation *analyzeConsumerReadInsertPoint(Value srcValue,
@@ -180,31 +190,26 @@ private:
   void AnalyzeSplittedIf(DependencyInfo &dep);
   mlir::Operation *insertVectorToCubeTransfer(
       mlir::OpBuilder &builder, mlir::Value srcValue,
-      mlir::Value normalizedValue, mlir::Operation *vectorEndOp,
-      mlir::Operation *cubeStartOp, mlir::Location loc, int transferIndex,
-      DependencyInfo &dep, bool is1DTensor,
-      mlir::Operation **consumedDataOp = nullptr);
+      mlir::Value normalizedValue, TransferSyncInsertPoint &insertPoint,
+      mlir::Location loc, int transferIndex, DependencyInfo &dep,
+      bool is1DTensor, mlir::Operation **consumedDataOp = nullptr);
   mlir::Operation *
   insertCubeToVectorTransfer(mlir::OpBuilder &builder, mlir::Value srcValue,
-                             mlir::Operation *cubeEndOp,
-                             mlir::Operation *vectorStartOp, mlir::Location loc,
-                             int transferIndex, DependencyInfo &dep,
+                             TransferSyncInsertPoint &insertPoint,
+                             mlir::Location loc, int transferIndex,
+                             DependencyInfo &dep,
                              mlir::Operation **consumedDataOp = nullptr);
   TransferPipeConfig getTransferPipeConfig(Operation *transferOp,
                                            bool isStoreDirectly = false);
   void insertInterCoreSync(mlir::OpBuilder &builder,
-                           mlir::Operation *transferOp,
-                           mlir::Operation *consumerStartOp,
-                           mlir::Operation *consumerEndOp, int flag,
+                           mlir::Operation *transferOp, DependencyInfo &dep,
+                           TransferSyncInsertPoint &insertPoint, int flag,
                            mlir::Location loc, int transferIndex,
                            FlagIdReuseManager &flagIdReuseManager,
                            mlir::Operation *consumedDataOp = nullptr,
                            bool isStoreDirectly = false);
-  void insertMemDepSync(mlir::OpBuilder &builder,
-                        mlir::Operation *producerStartOp,
-                        mlir::Operation *producerEndOp,
-                        mlir::Operation *consumerStartOp,
-                        mlir::Operation *consumerEndOp, int flag,
+  void insertMemDepSync(mlir::OpBuilder &builder, DependencyInfo &dep,
+                        TransferSyncInsertPoint &insertPoint, int flag,
                         mlir::Location loc, bool isCubeToVector,
                         FlagIdReuseManager &flagIdReuseManager);
   // Match the CUBE -> VECTOR direct-store pattern inside the given SCF op:
@@ -222,8 +227,6 @@ private:
   // Remove VECTOR add-from-matmul pseudo-ops so the SCF yield points at the
   // real data source.
   void removeVectorPseudoOps();
-  void sortDependencies(llvm::SmallVector<DependencyInfo> &dependencies,
-                        mlir::ModuleOp module);
   llvm::SmallVector<mlir::Operation *>
   insertAnalyzeFlagRelations(mlir::ModuleOp module,
                              FlagIdReuseManager &flagIdReuseManager);
