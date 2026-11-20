@@ -74,7 +74,7 @@ from triton.backends.ascend.utils import (
 from triton.backends.ascend.driver import (NPUUtils)
 from triton.backends.ascend.compiler_capabilities import optimized_metaop_options
 from triton.backends.ascend.block_batching import BatchRequest, IMPLEMENTATION_VERSION
-from triton.backends.ascend.block_batching_worker import BatchCompileError, BatchDecline, _active_attempt, analyze_request
+from triton.backends.ascend.block_batching_worker import BatchCompileError, BatchDecline, _active_attempt
 from triton.backends.ascend.block_batching_report import memory_compile_options as batching_memory_compile_options
 from triton.backends.ascend.block_batching_report import vv_layout_refusal as batching_vv_layout_refusal
 from triton.backends.ascend.block_batching_report import vv_computation_refusal as batching_vv_computation_refusal
@@ -343,6 +343,7 @@ def _compile_device_limit(opt):
 
 @functools.lru_cache(maxsize=128)
 def _batching_backend_file_hash(path, size, mtime):
+    # Size and mtime are cache-key inputs even though only path is read here.
     return hashlib.sha256(Path(path).read_bytes()).hexdigest()
 
 
@@ -827,7 +828,7 @@ def _full_row_copy_compile_options(metadata, compiler_path):
     return []
 
 
-def _masked_batch_compile_options(metadata, compiler_path):
+def _masked_batch_compile_options(metadata):
     report = metadata.get("block_batching", {})
     if report.get("cv_lowering") not in CV_MASKED_BATCH_LOWERINGS:
         return []
@@ -835,8 +836,8 @@ def _masked_batch_compile_options(metadata, compiler_path):
     # Its current batch libcall does not initialize extra fractal blocks when
     # trimming a rectangle shrinks that footprint (e.g. f32 K32 -> K23).
     # A vector-ND2NZ option alone does not fix this. Keep source masks and
-    # Require unchanged 32-byte padding quanta in both axes as well as the
-    # allocation footprint: physical 16-row NZ extents alone do not suffice
+    # require unchanged 32-byte padding quanta in both axes as well as the
+    # allocation footprint. Physical 16-row NZ extents alone do not suffice
     # for transposed f32 K tails on the packaged batch-DMA implementation.
     if (not metadata["target"].arch.startswith("Ascend950")
             or report.get("guard", {}).get("require_same_fractal_bounds") is not True):
@@ -893,7 +894,7 @@ def _dump_kernel_binary(metadata_hash: str, bin_path: str):
     dump_manager.put(Path(bin_path).read_bytes(), os.path.basename(bin_path), binary=True)
 
 
-def _finish_batch_compilation(metadata, opt, npu_compiler_path, bin_path, save_temps):
+def _finish_batch_compilation(metadata, opt, npu_compiler_path, bin_path):
     if "block_batching" in metadata:
         if _batching_backend_revision(npu_compiler_path) != opt.block_batching_backend_revision:
             raise BatchCompileError("BACKEND_CHANGED_DURING_COMPILE", stage="npubin")
@@ -1141,10 +1142,10 @@ def linalg_to_bin_enable_npu_compile_910_95(linalg: str, metadata, opt):
             _compile_option_list += [f"--plan-memory-strategy={plan_memory_strategy}"]
 
         if opt.debug:
-            save_temps = _get_save_temps_dir(metadata["hash"]) if opt.debug else tmpdir
+            save_temps = _get_save_temps_dir(metadata["hash"])
             _compile_option_list += [f"--save-temps={save_temps}"]
 
-        masked_options = _masked_batch_compile_options(metadata, npu_compiler_path)
+        masked_options = _masked_batch_compile_options(metadata)
         if isinstance(masked_options, BatchDecline):
             return masked_options
         _compile_option_list += masked_options
@@ -1177,7 +1178,7 @@ def linalg_to_bin_enable_npu_compile_910_95(linalg: str, metadata, opt):
         if Path(callback_path).is_file():
             __load_metadata_by_callback(callback_path, metadata)
 
-        return _finish_batch_compilation(metadata, opt, npu_compiler_path, bin_path, save_temps if opt.debug else None)
+        return _finish_batch_compilation(metadata, opt, npu_compiler_path, bin_path)
 
 
 def linalg_to_bin_enable_npu_compile_A2_A3(linalg: str, metadata, opt):
@@ -1345,11 +1346,11 @@ def linalg_to_bin_enable_npu_compile_A2_A3(linalg: str, metadata, opt):
             _compile_option_list += ["--mlir-print-ir-after-failure"]
             _compile_option_list += ["--mlir-print-stacktrace-on-diagnostic"]
 
-        save_temps = _get_save_temps_dir(metadata["hash"]) if opt.debug else tmpdir
         if opt.debug:
+            save_temps = _get_save_temps_dir(metadata["hash"])
             _compile_option_list += [f"--save-temps={save_temps}"]
 
-        masked_options = _masked_batch_compile_options(metadata, npu_compiler_path)
+        masked_options = _masked_batch_compile_options(metadata)
         if isinstance(masked_options, BatchDecline):
             return masked_options
         _compile_option_list += masked_options
@@ -1384,7 +1385,7 @@ def linalg_to_bin_enable_npu_compile_A2_A3(linalg: str, metadata, opt):
         if Path(callback_path).is_file():
             __load_metadata_by_callback(callback_path, metadata)
 
-        return _finish_batch_compilation(metadata, opt, npu_compiler_path, bin_path, save_temps)
+        return _finish_batch_compilation(metadata, opt, npu_compiler_path, bin_path)
 
 
 def get_libdevice(arch: str):

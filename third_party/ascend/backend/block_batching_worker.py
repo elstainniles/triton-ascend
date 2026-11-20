@@ -1,5 +1,5 @@
 # Copyright (c) Huawei Technologies Co., Ltd. 2026. All rights reserved.
-"""One candidate per interpreter. The parent alone binds and publishes artifacts."""
+"""Isolated compilation workers. The parent alone binds and publishes artifacts."""
 from contextlib import ExitStack
 from contextvars import ContextVar
 from dataclasses import dataclass
@@ -15,6 +15,8 @@ import sys
 import tempfile
 import time
 from uuid import uuid4
+
+I32_MAX = (1 << 31) - 1
 
 _PROTOCOL = 2
 _TIMEOUT = 600
@@ -731,9 +733,9 @@ def analyze_request(mod, request, binding=None, *, report_listener=None):
             "report_version": 1, "compile_status": "DISABLED", "requested_factor": 1, "requested_axis": request.axis,
             "applied_factor": 1, "owner": "none", "reason": "DISABLED"
         }
-    # MLIR shapes and the future native launch contract use signed i32 extents.
+    # MLIR shapes and the native launch contract use signed i32 extents.
     # A positive Python integer outside that capability is not a config error.
-    if request.factor > 2147483647:
+    if request.factor > I32_MAX:
         return {
             "report_version": 1, "compile_status": "REJECTED", "requested_factor": request.factor, "requested_axis":
             request.axis, "applied_factor": 1, "owner": "none", "reason": "FACTOR_OUT_OF_RANGE"
@@ -761,7 +763,7 @@ def analyze_request(mod, request, binding=None, *, report_listener=None):
 
 
 def probe_request(mod, request, layout_policy='semantic_only', cv_batch_matmul=False):
-    if request.factor == 1 or request.factor > 2147483647:
+    if request.factor == 1 or request.factor > I32_MAX:
         return analyze_request(mod, request)
     return isolated_report('probe', str(mod), request.factor, request.axis, layout_policy, cv_batch_matmul)
 

@@ -15,6 +15,8 @@ from __future__ import annotations
 import json
 from typing import Any, Mapping, Sequence
 
+I32_MAX = (1 << 31) - 1
+
 PROGRAM_GRID_TRANSFORMS_ATTR = "hacc.program_grid_transforms"
 PROGRAM_GRID_TRANSFORMS_VERSION = 2
 
@@ -169,7 +171,7 @@ def normalize_program_grid_transforms(raw: Any) -> dict[str, Any]:
         persistent = _boolean(transform["persistent_coverage"], f"transforms[{expected_order}].persistent_coverage")
         grid_stride = _boolean(transform["grid_stride_abi_verified"],
                                f"transforms[{expected_order}].grid_stride_abi_verified")
-        if batch and (factor > 2147483647 or persistent or grid_stride):
+        if batch and (factor > I32_MAX or persistent or grid_stride):
             raise ProgramGridContractError("v3 requires one non-persistent i32 ceil-div transform")
         if persistent != grid_stride:
             raise ProgramGridContractError("persistent coverage and grid-stride ABI verification must agree")
@@ -220,7 +222,7 @@ def apply_program_grid_transforms(
     normalized = normalize_program_grid_transforms(contract)
     batch = normalized["version"] == 3
     launch_grid = [_integer(value, f"grid[{axis}]", minimum=0 if batch else 1) for axis, value in enumerate(grid)]
-    if batch and any(extent > 2147483647 for extent in launch_grid):
+    if batch and any(extent > I32_MAX for extent in launch_grid):
         raise ProgramGridContractError("v3 original grid extent exceeds i32")
     for transform in normalized["transforms"]:
         axis = transform["axis"]
@@ -234,6 +236,6 @@ def apply_program_grid_transforms(
             if other_axis != axis:
                 other_programs *= extent
         launch_grid[axis] = min(launch_grid[axis], max(1, cores // max(1, other_programs)))
-    if batch and launch_grid[0] * launch_grid[1] * launch_grid[2] > 2147483647:
+    if batch and launch_grid[0] * launch_grid[1] * launch_grid[2] > I32_MAX:
         raise ProgramGridContractError("v3 batch grid exceeds G0 i32 task count")
     return tuple(launch_grid)
