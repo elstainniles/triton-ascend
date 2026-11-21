@@ -742,7 +742,8 @@ std::string scoreBlockTtir(ModuleOp module, llvm::StringRef request) {
     StringRef arch = input.getString("arch").value_or("");
     // Keep target admission in step with supports_target in block_batching.py.
     check(arch.starts_with("Ascend950") || arch.starts_with("Ascend910_95") ||
-              arch.starts_with("Ascend910_93") || arch.starts_with("Ascend910B"),
+              arch.starts_with("Ascend910_93") ||
+              arch.starts_with("Ascend910B"),
           "unsupported automatic selection target");
     Profile profile(cv);
     auto specialized = specializeTtir(module, input);

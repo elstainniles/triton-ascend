@@ -285,8 +285,7 @@ for _ in range(20):
             expected = [self.score(text, cores=cores, factor=f, axis=-1 if f == 1 else 0) for f in (1, 2, 4)]
             for arch in ("Ascend950PR_9579", "Ascend910_9589", "Ascend910_9391", "Ascend910B1", "Ascend910B2",
                          "Ascend910B3", "Ascend910B4"):
-                rows = [self.score(text, arch=arch, cores=cores, factor=f, axis=-1 if f == 1 else 0)
-                        for f in (1, 2, 4)]
+                rows = [self.score(text, arch=arch, cores=cores, factor=f, axis=-1 if f == 1 else 0) for f in (1, 2, 4)]
                 self.assertEqual(rows, expected, arch)
                 self.assertTrue(all(row["status"] == "TTIR_COST_ESTIMATED" for row in rows), arch)
                 self.assertTrue(all(row["model"] == "ttir-relative-v3" for row in rows), arch)
@@ -303,13 +302,16 @@ for _ in range(20):
           tt.return
         }}'''
         for arch in ("Ascend950", "Ascend910_9391", "Ascend910B2"):
-            rows = [self.score(text, arch=arch, cores=48, factor=f, axis=-1 if f == 1 else 2,
-                               contract=dict(grid=[1, 1, 256])) for f in (1, 2, 4)]
+            rows = [
+                self.score(text, arch=arch, cores=48, factor=f, axis=-1 if f == 1 else 2,
+                           contract=dict(grid=[1, 1, 256])) for f in (1, 2, 4)
+            ]
             for row in rows:
                 self.assertEqual(row["status"], "TTIR_MODEL_UNSUPPORTED", arch)
                 self.assertIn("unsupported TTIR cost operation: math.ceil", row["error"], arch)
-            result = json.loads(ascend.select_block_candidates(
-                json.dumps(dict(action="rank_ttir", contract=dict(grid=[1, 1, 256]), candidates=rows))))
+            result = json.loads(
+                ascend.select_block_candidates(
+                    json.dumps(dict(action="rank_ttir", contract=dict(grid=[1, 1, 256]), candidates=rows))))
             self.assertEqual(result["factor"], 1, arch)
             self.assertEqual(result["reason"], "TTIR_BASELINE_MODEL_UNSUPPORTED", arch)
 
